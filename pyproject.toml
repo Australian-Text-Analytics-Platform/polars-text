@@ -1,0 +1,23 @@
+[project]
+name = "polars-text"
+version = "0.1.0"
+description = "Polars expression plugins for text analysis"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+	"polars>=1.12.0",
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "."
+module-name = "polars_text._internal"
+
+[dependency-groups]
+dev = [
+	"maturin>=1.0,<2.0",
+	"pytest>=7.4.0",
+]
