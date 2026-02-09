@@ -231,3 +231,25 @@ fn list_string_output(input_fields: &[Field]) -> PolarsResult<Field> {
         DataType::List(Box::new(DataType::String)),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_text_value_normalizes() {
+        let cleaned = clean_text_value("Hello, World! 123");
+        assert_eq!(cleaned, "hello world");
+
+        let cleaned = clean_text_value("  Hi--there\t42 ");
+        assert_eq!(cleaned, "hi there");
+    }
+
+    #[test]
+    fn test_list_string_output_type() -> PolarsResult<()> {
+        let field = Field::new(PlSmallStr::from("text"), DataType::String);
+        let output = list_string_output(&[field])?;
+        assert_eq!(output.dtype(), &DataType::List(Box::new(DataType::String)));
+        Ok(())
+    }
+}

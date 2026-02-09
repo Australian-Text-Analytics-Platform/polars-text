@@ -159,3 +159,27 @@ pub fn struct_series_from_matches(matches: Vec<Series>) -> Series {
         .expect("struct build should succeed")
         .into_series()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_byte_to_char_idx_multibyte() {
+        let text = "café";
+        let byte_idx = text.find('é').expect("é should be found");
+        assert_eq!(byte_to_char_idx(text, byte_idx), 3);
+
+        let text = "hi 🙂 there";
+        let byte_idx = text.find('🙂').expect("emoji should be found");
+        assert_eq!(byte_to_char_idx(text, byte_idx), 3);
+    }
+
+    #[test]
+    fn test_detokenize() {
+        assert_eq!(detokenize(&[]), "");
+
+        let tokens = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(detokenize(&tokens), "hello world");
+    }
+}
