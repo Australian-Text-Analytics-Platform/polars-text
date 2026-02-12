@@ -17,6 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde_json;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+use crate::tokenizer::tokenize_plain_text;
 
 const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 const DEFAULT_REVISION: &str = "main";
@@ -223,13 +224,8 @@ fn cluster_embeddings(
     Ok((labels, normalized, eps_value))
 }
 
-fn tokenize_terms(bundle: &CandleBundle, text: &str) -> Result<Vec<String>> {
-    let encoding = bundle
-        .tokenizer
-        .encode(text, true)
-        .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
-    let mut tokens: Vec<String> = encoding.get_tokens().iter().cloned().collect();
-    tokens.retain(|tok| tok.chars().any(|ch| ch.is_alphanumeric()));
+fn tokenize_terms(_bundle: &CandleBundle, text: &str) -> Result<Vec<String>> {
+    let tokens = tokenize_plain_text(text, true, true);
     Ok(tokens)
 }
 

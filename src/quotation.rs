@@ -134,8 +134,22 @@ fn quote_verbs() -> &'static HashSet<String> {
     })
 }
 
+/// Convert a byte offset to a character (code-point) index.
+/// Clamps to the nearest valid char boundary so it never panics.
 fn byte_to_char_idx(text: &str, byte_idx: usize) -> i64 {
-    text[..byte_idx].chars().count() as i64
+    let safe_idx = clamp_to_char_boundary(text, byte_idx);
+    text[..safe_idx].chars().count() as i64
+}
+
+/// Return the largest valid char boundary <= `idx`, clamped to `text.len()`.
+fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
+    let idx = idx.min(text.len());
+    // Walk backwards (at most 3 bytes for UTF-8) to find a char boundary.
+    let mut i = idx;
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn prepare_tokens_and_sentences(text: &str) -> (Vec<TokenInfo>, Vec<SentenceInfo>) {
@@ -174,7 +188,12 @@ fn prepare_tokens_and_sentences(text: &str) -> (Vec<TokenInfo>, Vec<SentenceInfo
         if start >= text.len() || end > text.len() || start >= end {
             continue;
         }
-        let token_text = text[start..end].to_string();
+        // Use .get() to avoid panicking on non-char-boundary byte offsets
+        // (common with emoji, accented characters, and other multi-byte UTF-8).
+        let token_text = match text.get(start..end) {
+            Some(s) => s.to_string(),
+            None => continue, // skip tokens with misaligned byte offsets
+        };
         let char_start = byte_to_char_idx(text, start) as i64;
         let char_end = byte_to_char_idx(text, end) as i64;
         let sentence_index = sentences
@@ -196,16 +215,22 @@ fn prepare_tokens_and_sentences(text: &str) -> (Vec<TokenInfo>, Vec<SentenceInfo
 fn detect_quote_spans(text: &str) -> Vec<(i64, i64)> {
     let quote_re = Regex::new("[\\\"\\u{201C}\\u{201D}\\u{00AB}\\u{00BB}\\u{201E}\\u{201F}']")
         .expect("quote regex");
-    let mut indices: Vec<usize> = quote_re.find_iter(text).map(|m| m.start()).collect();
-    indices.sort();
+    // Collect (byte_start, byte_end) for each match so we use the actual
+    // match end instead of `start + 1`, which can land mid-character for
+    // multi-byte quote symbols like \u{201C} (3 bytes in UTF-8).
+    let mut match_bounds: Vec<(usize, usize)> = quote_re
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    match_bounds.sort_by_key(|&(s, _)| s);
     let mut spans = Vec::new();
-    let mut iter = indices.into_iter();
-    while let Some(start) = iter.next() {
-        if let Some(end) = iter.next() {
-            if end >= start {
+    let mut iter = match_bounds.into_iter();
+    while let Some((open_start, _open_end)) = iter.next() {
+        if let Some((_close_start, close_end)) = iter.next() {
+            if close_end >= open_start {
                 spans.push((
-                    byte_to_char_idx(text, start),
-                    byte_to_char_idx(text, end + 1),
+                    byte_to_char_idx(text, open_start),
+                    byte_to_char_idx(text, close_end),
                 ));
             }
         }
@@ -594,11 +619,12 @@ pub fn quotation_for_text(text: &str) -> Result<Vec<Series>> {
     Ok(build_struct_series(records))
 }
 
-pub fn struct_series_from_matches(matches: Vec<Series>) -> Series {
+pub fn struct_series_from_matches(matches: Vec<Series>) -> PolarsResult<Series> {
     if matches.is_empty() {
-        return Series::new_empty(PlSmallStr::EMPTY, &quotation_struct_type());
+        return Ok(Series::new_empty(PlSmallStr::EMPTY, &quotation_struct_type()));
     }
-    StructChunked::from_series(PlSmallStr::EMPTY, matches[0].len(), matches.iter())
-        .expect("struct build should succeed")
-        .into_series()
+    Ok(
+        StructChunked::from_series(PlSmallStr::EMPTY, matches[0].len(), matches.iter())?
+            .into_series(),
+    )
 }

@@ -128,7 +128,13 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
             }
         };
 
-        let tokens = tokenize_text(tokenizer, text, kwargs.lowercase, kwargs.remove_punct)
+            let tokens = tokenize_text(
+                tokenizer,
+                text,
+                false,
+                kwargs.lowercase,
+                kwargs.remove_punct,
+            )
             .map_err(|e| {
                 PolarsError::ComputeError(
                     format!("Tokenization failed: {e}").into(),
@@ -207,7 +213,7 @@ pub fn quotation(inputs: &[Series]) -> PolarsResult<Series> {
         if matches.is_empty() {
             builder.append_empty();
         } else {
-            let struct_series = quotation_struct_series(matches);
+            let struct_series = quotation_struct_series(matches)?;
             builder.append_series(&struct_series).map_err(|e| {
                 PolarsError::ComputeError(format!("Quotation failed: {e}").into())
             })?;

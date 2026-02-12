@@ -4,7 +4,7 @@ use regex::RegexBuilder;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::tokenizer::tokenize_text;
+use crate::tokenizer::tokenize_plain_text;
 
 #[derive(Deserialize)]
 pub struct ConcordanceKwargs {
@@ -61,7 +61,7 @@ fn detokenize(tokens: &[String]) -> String {
 }
 
 pub fn concordance_for_text(
-    tokenizer: &Tokenizer,
+    _tokenizer: &Tokenizer,
     text: &str,
     kwargs: &ConcordanceKwargs,
 ) -> Result<Vec<Series>> {
@@ -96,8 +96,8 @@ pub fn concordance_for_text(
         let left_text = &text[..start_byte];
         let right_text = &text[end_byte..];
 
-        let left_tokens = tokenize_text(tokenizer, left_text, false, false)?;
-        let right_tokens = tokenize_text(tokenizer, right_text, false, false)?;
+        let left_tokens = tokenize_plain_text(left_text, false, false);
+        let right_tokens = tokenize_plain_text(right_text, false, false);
 
         let left_take = kwargs.num_left_tokens.max(0) as usize;
         let right_take = kwargs.num_right_tokens.max(0) as usize;
