@@ -278,6 +278,7 @@ fn topic_modeling_inner(
 
         let mut topic_labels = build_topic_labels(bundle, &texts_by_topic, max_terms)?;
         topic_labels.insert(-1, "noise".to_string());
+
         Ok((topic_labels, labels))
     })
 }
