@@ -94,8 +94,8 @@ out = df.select(quotes)
 Compute corpus token counts and compare corpora with standard statistics.
 
 ```python
-series_0 = pl.Series("text", ["hello world", "hello again"]) 
-series_1 = pl.Series("text", ["goodbye world"]) 
+series_0 = pl.Series("text", ["hello world", "hello again"])
+series_1 = pl.Series("text", ["goodbye world"])
 
 freqs_0 = pt.token_frequencies(series_0)
 freqs_1 = pt.token_frequencies(series_1)
@@ -153,6 +153,8 @@ The initial call may take longer while models download and cache.
 ## Development
 
 Build the extension locally with maturin and then import as `polars_text`.
+
+For release and publishing procedures, see `PUBLISH.md`.
 
 ```bash
 make build
