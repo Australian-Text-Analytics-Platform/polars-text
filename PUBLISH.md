@@ -12,6 +12,10 @@ standard split used by mature Rust-backed Python packages:
 - publish tagged releases to PyPI
 - use TestPyPI only for explicit manual dry runs
 
+Regular development validation lives in `.github/workflows/ci.yml`, which
+builds the package and runs `pytest` on Linux, macOS, and Windows for branch
+pushes and pull requests.
+
 It uses `maturin` directly in CI. That is the normal path for PyO3 packages,
 and it matches both the official `maturin-action` examples and `maturin
 generate-ci` output.
@@ -25,12 +29,12 @@ pinning an exact `maturin-version`.
 
 The workflow treats versions as follows:
 
-- Branch pushes and pull requests: build and validate artifacts only, no upload
+- Pull requests: build and validate artifacts only, no upload
 - Tagged releases such as `v0.2.0`, `v0.2.0rc1`, or `v0.2.0b1`: publish to PyPI
 - Manual `workflow_dispatch` runs can publish the selected ref to TestPyPI
 
 This avoids the common problem of repeatedly uploading the same version from
-branch builds.
+branch builds and keeps release publication tied to explicit version tags.
 
 ## One-time setup
 
@@ -111,17 +115,28 @@ path with the current workflow.
 
 ## What the workflow does
 
-On every pull request and on pushes to `main` or `dev`, the workflow:
+On every pull request, the release workflow:
 
-- builds Linux, macOS Intel, macOS Apple Silicon, and Windows wheels
+- builds Linux, macOS Apple Silicon, and Windows wheels
 - builds an `sdist`
 - runs `twine check --strict` on the built artifacts
+
+Full `pytest` coverage runs in the separate `CI` workflow on every branch push
+and pull request instead of being duplicated in the release workflow.
 
 On tags:
 
 - any tag matching `v*` publishes to PyPI
 - prerelease versions remain prereleases because the package version itself uses
   PEP 440 markers such as `rc`, `b`, or `a`
+
+There is no automatic publish path from a plain branch push. A `main` or `dev`
+push without a matching `v*` tag would only publish if you added a branch push
+trigger and separately changed the publish job conditions.
+
+That split is the mainstream setup: CI workflows do build-and-test work on
+normal development events, while release workflows stay focused on packaging and
+publishing versioned artifacts.
 
 On manual dispatch:
 

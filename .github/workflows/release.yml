@@ -3,9 +3,6 @@ name: Package And Release
 "on":
     pull_request:
     push:
-        branches:
-            - main
-            - dev
         tags:
             - "v*"
     workflow_dispatch:
@@ -38,9 +35,7 @@ jobs:
                       os: ubuntu-latest
                       target: x86_64-unknown-linux-gnu
                       manylinux: "2_28"
-                    - name: macos-x86_64
-                      os: macos-13
-                      target: x86_64-apple-darwin
+                      before-script-linux: dnf install -y openssl-devel && dnf clean all
                     - name: macos-arm64
                       os: macos-14
                       target: aarch64-apple-darwin
@@ -63,6 +58,7 @@ jobs:
               with:
                   target: ${{ matrix.target }}
                   manylinux: ${{ matrix.manylinux || '' }}
+                  before-script-linux: ${{ matrix.before-script-linux || '' }}
                   args: --release --out dist --interpreter 3.14 --compatibility pypi
 
             - name: Verify wheel metadata
