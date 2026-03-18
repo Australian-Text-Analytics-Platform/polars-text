@@ -16,6 +16,11 @@ It uses `maturin` directly in CI. That is the normal path for PyO3 packages,
 and it matches both the official `maturin-action` examples and `maturin
 generate-ci` output.
 
+The workflow intentionally tracks the latest `v1` release of
+`PyO3/maturin-action` and `pypa/gh-action-pypi-publish`, and it lets
+`maturin-action` install its default latest `maturin` release instead of
+pinning an exact `maturin-version`.
+
 ## Release policy
 
 The workflow treats versions as follows:
