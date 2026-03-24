@@ -16,24 +16,24 @@ def test_concordance_expr_schema() -> None:
     )
     dtype = out.schema["concordance"]
     assert dtype == pl.List(
-        pl.Struct([
-            pl.Field("left_context", pl.String),
-            pl.Field("matched_text", pl.String),
-            pl.Field("right_context", pl.String),
-            pl.Field("start_idx", pl.Int64),
-            pl.Field("end_idx", pl.Int64),
-            pl.Field("l1", pl.String),
-            pl.Field("r1", pl.String),
-        ])
+        pl.Struct(
+            [
+                pl.Field("left_context", pl.String),
+                pl.Field("matched_text", pl.String),
+                pl.Field("right_context", pl.String),
+                pl.Field("start_idx", pl.Int64),
+                pl.Field("end_idx", pl.Int64),
+                pl.Field("l1", pl.String),
+                pl.Field("r1", pl.String),
+            ]
+        )
     )
 
 
 def test_concordance_namespace_explode_unnest() -> None:
     df = pl.DataFrame({"text": ["Hello world, hello again."]})
     expr = (
-        pl
-        .col("text")
-        .text.concordance("hello", num_left_tokens=1, num_right_tokens=1)
+        pt.concordance(pl.col("text"), "hello", num_left_tokens=1, num_right_tokens=1)
         .list.explode()
         .struct.unnest()
     )
