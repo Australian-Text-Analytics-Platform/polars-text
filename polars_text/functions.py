@@ -46,17 +46,6 @@ def concordance(
     )
 
 
-def quotation(
-    expr: IntoExpr,
-) -> pl.Expr:
-    return register_plugin_function(
-        plugin_path=PLUGIN_PATH,
-        function_name="quotation",
-        args=expr,
-        is_elementwise=True,
-    )
-
-
 def clean_text(expr: IntoExpr) -> pl.Expr:
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
@@ -96,7 +85,6 @@ def sentence_count(expr: IntoExpr) -> pl.Expr:
 __all__ = [
     "tokenize",
     "concordance",
-    "quotation",
     "clean_text",
     "word_count",
     "char_count",

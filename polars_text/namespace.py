@@ -33,13 +33,6 @@ class TextNamespace:
             case_sensitive=case_sensitive,
         )
 
-    def quotation(
-        self,
-    ) -> pl.Expr:
-        return functions.quotation(
-            self._expr,
-        )
-
     def clean_text(self) -> pl.Expr:
         return functions.clean_text(self._expr)
 

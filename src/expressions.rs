@@ -3,17 +3,8 @@ use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
 
 use crate::concordance::{
-    concordance_for_text,
-    concordance_struct_type,
-    list_struct_output,
+    concordance_for_text, concordance_struct_type, list_struct_output, struct_series_from_matches,
     ConcordanceKwargs,
-    struct_series_from_matches,
-};
-use crate::quotation::{
-    quotation_list_output,
-    quotation_for_text,
-    quotation_struct_type,
-    struct_series_from_matches as quotation_struct_series,
 };
 use crate::tokenizer::{ensure_tokenizer, tokenize_text};
 
@@ -114,9 +105,8 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
 #[polars_expr(output_type_func=list_string_output)]
 pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let tokenizer = ensure_tokenizer().map_err(|e| {
-        PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into())
-    })?;
+    let tokenizer = ensure_tokenizer()
+        .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
     let mut out: Vec<Option<Series>> = Vec::with_capacity(ca.len());
     for opt_text in ca.into_iter() {
@@ -128,18 +118,14 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
             }
         };
 
-            let tokens = tokenize_text(
-                tokenizer,
-                text,
-                false,
-                kwargs.lowercase,
-                kwargs.remove_punct,
-            )
-            .map_err(|e| {
-                PolarsError::ComputeError(
-                    format!("Tokenization failed: {e}").into(),
-                )
-            })?;
+        let tokens = tokenize_text(
+            tokenizer,
+            text,
+            false,
+            kwargs.lowercase,
+            kwargs.remove_punct,
+        )
+        .map_err(|e| PolarsError::ComputeError(format!("Tokenization failed: {e}").into()))?;
         out.push(Some(Series::new(PlSmallStr::EMPTY, tokens)));
     }
 
@@ -151,9 +137,8 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
 #[polars_expr(output_type_func=list_struct_output)]
 pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let tokenizer = ensure_tokenizer().map_err(|e| {
-        PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into())
-    })?;
+    let tokenizer = ensure_tokenizer()
+        .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
     let mut builder = AnonymousOwnedListBuilder::new(
         PlSmallStr::EMPTY,
@@ -170,52 +155,14 @@ pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult
             }
         };
 
-        let matches = concordance_for_text(tokenizer, text, &kwargs).map_err(|e| {
-            PolarsError::ComputeError(format!("Concordance failed: {e}").into())
-        })?;
+        let matches = concordance_for_text(tokenizer, text, &kwargs)
+            .map_err(|e| PolarsError::ComputeError(format!("Concordance failed: {e}").into()))?;
         if matches.is_empty() {
             builder.append_empty();
         } else {
             let struct_series = struct_series_from_matches(matches);
             builder.append_series(&struct_series).map_err(|e| {
                 PolarsError::ComputeError(format!("Concordance failed: {e}").into())
-            })?;
-        }
-    }
-
-    let mut list = builder.finish();
-    list.rename(ca.name().clone());
-    Ok(list.into_series())
-}
-
-#[polars_expr(output_type_func=quotation_list_output)]
-pub fn quotation(inputs: &[Series]) -> PolarsResult<Series> {
-    let ca = inputs[0].str()?;
-
-    let mut builder = AnonymousOwnedListBuilder::new(
-        PlSmallStr::EMPTY,
-        ca.len(),
-        Some(quotation_struct_type()),
-    );
-
-    for opt_text in ca.into_iter() {
-        let text = match opt_text {
-            Some(value) => value,
-            None => {
-                builder.append_empty();
-                continue;
-            }
-        };
-
-        let matches = quotation_for_text(text).map_err(|e| {
-            PolarsError::ComputeError(format!("Quotation failed: {e}").into())
-        })?;
-        if matches.is_empty() {
-            builder.append_empty();
-        } else {
-            let struct_series = quotation_struct_series(matches)?;
-            builder.append_series(&struct_series).map_err(|e| {
-                PolarsError::ComputeError(format!("Quotation failed: {e}").into())
             })?;
         }
     }
