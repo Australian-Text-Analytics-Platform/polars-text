@@ -1,78 +1,78 @@
 name: CI
 
 on:
-    push:
-        branches:
-            - "**"
-    pull_request:
-    workflow_dispatch:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
 
 concurrency:
-    group: polars-text-ci-${{ github.ref }}
-    cancel-in-progress: true
+  group: polars-text-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
-    contents: read
+  contents: read
 
 jobs:
-    test:
-        name: Test ${{ matrix.name }}
-        runs-on: ${{ matrix.os }}
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - name: linux-x86_64
-                      os: ubuntu-latest
-                      target: x86_64-unknown-linux-gnu
-                    - name: macos-arm64
-                      os: macos-14
-                      target: aarch64-apple-darwin
-                    - name: windows-x86_64
-                      os: windows-latest
-                      target: x86_64-pc-windows-msvc
-                      python-architecture: x64
+  test:
+    name: Test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            python-architecture: x64
 
-        steps:
-            - name: Check out repository
-              uses: actions/checkout@v6
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-            - name: Set up Python
-              uses: actions/setup-python@v6
-              with:
-                  python-version: "3.14"
-                  architecture: ${{ matrix.python-architecture || 'x64' }}
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          architecture: ${{ matrix.python-architecture || 'x64' }}
 
-            - name: Cache Cargo build artifacts
-              uses: Swatinem/rust-cache@v2
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2
 
-            - name: Cache Hugging Face downloads
-              uses: actions/cache@v5
-              with:
-                  path: ~/.cache/huggingface
-                  key: huggingface-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-                  restore-keys: |
-                      huggingface-${{ runner.os }}-
+      - name: Cache Hugging Face downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            huggingface-${{ runner.os }}-
 
-            - name: Install Linux build dependencies
-              if: runner.os == 'Linux'
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y pkg-config libssl-dev
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
 
-            - name: Build wheel
-              uses: PyO3/maturin-action@v1
-              with:
-                  target: ${{ matrix.target }}
-                  container: off
-                  args: --release --out dist --interpreter 3.14
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          container: off
+          args: --release --out dist --interpreter 3.14
 
-            - name: Install test dependencies
-              shell: bash
-              run: |
-                  python -m pip install --upgrade pip pytest
-                  python -m pip install --force-reinstall --find-links dist polars-text
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pip install --force-reinstall --find-links dist polars-text
 
-            - name: Run pytest
-              shell: bash
-              run: pytest -q
+      - name: Run pytest
+        shell: bash
+        run: pytest -q

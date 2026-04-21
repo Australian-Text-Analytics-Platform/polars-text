@@ -17,19 +17,25 @@ linfa = "0.8"
 linfa-clustering = "0.8"
 ndarray = "0.16"
 once_cell = "1"
-polars = { version = "0.53.0", default-features = false, features = [
+# Keep all polars crates on the exact source tree used by Python polars 1.40.0.
+# Building this crate standalone in CI must not rely on an outer workspace patch,
+# otherwise Cargo mixes crates.io polars 0.53.0 with git-tagged pyo3-polars and
+# the resolver breaks on transitive dependencies like chrono.
+polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", default-features = false, features = [
     "fmt",
     "dtype-struct",
 ] }
-polars-plan = { version = "0.53.0", features = [
+polars-plan = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", features = [
     "serde",
     "parquet",
     "ipc",
     "csv",
     "json",
 ] }
-polars-utils = { version = "0.53.0", features = ["serde"] }
-polars-buffer = { version = "0.53.0" }
+polars-utils = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", features = [
+    "serde",
+] }
+polars-buffer = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0" }
 pyo3 = "0.28"
 pyo3-polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", features = [
     "derive",
