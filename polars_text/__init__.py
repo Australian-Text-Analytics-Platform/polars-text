@@ -9,6 +9,7 @@ from .functions import (
     tokenize,
     word_count,
 )
+from .plan_paths import list_source_paths, replace_source_paths
 from .token_frequencies import token_frequencies, token_frequency_stats
 from .topic_modeling import topic_modeling
 
@@ -22,4 +23,6 @@ __all__ = [
     "topic_modeling",
     "token_frequencies",
     "token_frequency_stats",
+    "list_source_paths",
+    "replace_source_paths",
 ]
