@@ -59,6 +59,10 @@ jobs:
                   target: ${{ matrix.target }}
                   manylinux: ${{ matrix.manylinux || '' }}
                   before-script-linux: ${{ matrix.before-script-linux || '' }}
+                  # polars-plan's `nightly` feature uses `#![feature(...)]`,
+                  # so the build must use the Rust nightly toolchain. See
+                  # rust-toolchain.toml for the same pin in local dev.
+                  rust-toolchain: nightly
                   args: --release --out dist --interpreter 3.14 --compatibility pypi
 
             - name: Verify wheel metadata
@@ -90,6 +94,7 @@ jobs:
               uses: PyO3/maturin-action@v1
               with:
                   command: sdist
+                  rust-toolchain: nightly
                   args: --out dist
 
             - name: Verify source distribution metadata

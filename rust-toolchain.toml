@@ -1,0 +1,10 @@
+# Nightly Rust is required because polars-plan's `nightly` Cargo feature
+# (which gates `StringFunction::Titlecase` and a handful of other DSL
+# variants) uses `#![feature(...)]` attributes. Python `polars` wheels are
+# always built with this feature enabled, so any plan that contains
+# `.str.to_titlecase()` (or other nightly-gated ops) fails to deserialize
+# in `polars-text` unless this crate is also built with nightly.
+[toolchain]
+channel = "nightly"
+profile = "minimal"
+components = ["rustc", "cargo", "rust-std"]

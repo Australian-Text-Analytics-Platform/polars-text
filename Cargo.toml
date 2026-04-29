@@ -1,6 +1,6 @@
 [package]
 name = "polars_text"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [lib]
@@ -31,6 +31,12 @@ polars-plan = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0"
     "ipc",
     "csv",
     "json",
+    # `nightly` gates extra DslPlan variants (e.g. StringFunction::Titlecase).
+    # Python polars wheels are always built with this feature, so any plan
+    # containing `.str.to_titlecase()` (or other nightly-gated ops) fails to
+    # deserialize here without it: serde reports
+    # `unknown variant 'Titlecase', expected one of ...`.
+    "nightly",
     # Expression namespaces (each gates its own serde variant in DslPlan).
     # Without these, DslPlan::deserialize fails with
     # `unknown variant 'StringExpr'/'TemporalExpr'/...` whenever a workspace
