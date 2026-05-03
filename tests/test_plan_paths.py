@@ -50,6 +50,25 @@ def test_list_source_paths_through_transforms(
     assert Path(paths[0]).resolve() == parquet_dataset.resolve()
 
 
+def test_list_source_paths_with_random_sample(
+    parquet_dataset: Path, tmp_path: Path
+) -> None:
+    """Plans containing `.sample()` emit a `FunctionExpr::Random` variant, which
+    is gated behind the `random` Cargo feature in polars-plan. Without it,
+    `DslPlan::deserialize_versioned` fails with `unknown variant 'Random'` and
+    the entire workspace save/load path breaks. This test guards that feature.
+    """
+
+    plbin = tmp_path / "plans" / "node.plbin"
+    sample_indices = pl.int_range(pl.len()).sample(fraction=0.5, seed=7)
+    lf = pl.scan_parquet(parquet_dataset).select(pl.all().gather(sample_indices))
+    _serialize_lazy(lf, plbin)
+
+    paths = list_source_paths(plbin)
+    assert len(paths) == 1
+    assert Path(paths[0]).resolve() == parquet_dataset.resolve()
+
+
 def test_replace_source_paths_round_trip(parquet_dataset: Path, tmp_path: Path) -> None:
     plbin = tmp_path / "workspace_a" / "data" / "node.plbin"
     lf = pl.scan_parquet(parquet_dataset)

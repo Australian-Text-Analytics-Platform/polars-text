@@ -89,7 +89,7 @@ wheels = [
 
 [[package]]
 name = "polars-text"
-version = "0.1.6"
+version = "0.1.7"
 source = { editable = "." }
 dependencies = [
     { name = "polars" },
