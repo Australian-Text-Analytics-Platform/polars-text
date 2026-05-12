@@ -55,6 +55,59 @@ impl TokenizerBackend {
         }
         Ok(tokens)
     }
+
+    /// Tokenize and emit `(token, start, end)` triples where `start` and `end`
+    /// are **character** offsets (1 char per Hanzi, not 3 bytes), into the
+    /// `lowercase`-applied processed text. Used by Phase 2's persisted tokens
+    /// column so downstream tools can locate each token's span in the source.
+    pub fn tokenize_text_with_offsets(
+        &self,
+        text: &str,
+        lowercase: bool,
+        remove_punctuation: bool,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        let processed = if lowercase {
+            text.to_lowercase()
+        } else {
+            text.to_string()
+        };
+
+        let raw: Vec<(String, i64, i64)> = match self {
+            TokenizerBackend::HuggingFace(tokenizer) => {
+                let encoding = tokenizer
+                    .encode(processed.as_str(), false)
+                    .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
+                let toks = encoding.get_tokens();
+                let offsets = encoding.get_offsets();
+                toks.iter()
+                    .zip(offsets.iter())
+                    .map(|(tok, (b_start, b_end))| {
+                        let cs = byte_to_char_idx(&processed, *b_start) as i64;
+                        let ce = byte_to_char_idx(&processed, *b_end) as i64;
+                        (tok.clone(), cs, ce)
+                    })
+                    .collect()
+            }
+            TokenizerBackend::Jieba(jb) => jb
+                .tokenize(&processed, jieba_rs::TokenizeMode::Default, true)
+                .into_iter()
+                .map(|t| (t.word.to_string(), t.start as i64, t.end as i64))
+                .collect(),
+        };
+
+        let result: Vec<(String, i64, i64)> = raw
+            .into_iter()
+            .filter(|(tok, _, _)| {
+                !remove_punctuation || tok.chars().any(|ch| ch.is_alphanumeric())
+            })
+            .collect();
+
+        Ok(result)
+    }
+}
+
+fn byte_to_char_idx(text: &str, byte_idx: usize) -> usize {
+    text.char_indices().take_while(|(b, _)| *b < byte_idx).count()
 }
 
 static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<TokenizerBackend>>>> = OnceCell::new();
@@ -191,5 +244,28 @@ mod tests {
     #[test]
     fn test_jieba_model_id_constant() {
         assert_eq!(JIEBA_MODEL_ID, "jieba");
+    }
+
+    #[test]
+    fn test_jieba_offsets_reconstruct_chinese() {
+        let jb = jieba_rs::Jieba::new();
+        let backend = TokenizerBackend::Jieba(jb);
+        let text = "我爱中国";
+        let toks = backend
+            .tokenize_text_with_offsets(text, false, false)
+            .unwrap();
+        for (tok, start, end) in &toks {
+            // Char-slice the text using the (start, end) char positions and
+            // verify it equals the emitted token string.
+            let extracted: String = text
+                .chars()
+                .skip(*start as usize)
+                .take((*end - *start) as usize)
+                .collect();
+            assert_eq!(
+                *tok, extracted,
+                "Jieba offset mismatch for {tok:?} ({start}..{end})"
+            );
+        }
     }
 }

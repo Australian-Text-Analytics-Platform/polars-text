@@ -24,6 +24,20 @@ class TextNamespace:
             model=model,
         )
 
+    def tokenize_with_offsets(
+        self,
+        *,
+        lowercase: bool = True,
+        remove_punct: bool = True,
+        model: str | None = None,
+    ) -> pl.Expr:
+        return functions.tokenize_with_offsets(
+            self._expr,
+            lowercase=lowercase,
+            remove_punct=remove_punct,
+            model=model,
+        )
+
     def concordance(
         self,
         search_word: str,

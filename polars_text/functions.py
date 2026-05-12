@@ -29,6 +29,34 @@ def tokenize(
     )
 
 
+def tokenize_with_offsets(
+    expr: IntoExpr,
+    *,
+    lowercase: bool = True,
+    remove_punct: bool = True,
+    model: str | None = None,
+) -> pl.Expr:
+    """Tokenize and emit a list of ``{token, start, end}`` structs per row.
+
+    ``start`` / ``end`` are character offsets into the (lowercased, if
+    ``lowercase=True``) text. This is the schema Phase 2 persists as a
+    tokens column on derived nodes.
+    """
+    kwargs: dict[str, object] = {
+        "lowercase": lowercase,
+        "remove_punct": remove_punct,
+    }
+    if model is not None:
+        kwargs["model_id"] = model
+    return register_plugin_function(
+        plugin_path=PLUGIN_PATH,
+        function_name="tokenize_with_offsets",
+        args=expr,
+        kwargs=kwargs,
+        is_elementwise=True,
+    )
+
+
 def concordance(
     expr: IntoExpr,
     search_word: str,
@@ -91,6 +119,7 @@ def sentence_count(expr: IntoExpr) -> pl.Expr:
 
 __all__ = [
     "tokenize",
+    "tokenize_with_offsets",
     "concordance",
     "clean_text",
     "word_count",

@@ -180,6 +180,81 @@ fn list_string_output(input_fields: &[Field]) -> PolarsResult<Field> {
     ))
 }
 
+fn token_offset_struct_type() -> DataType {
+    DataType::Struct(vec![
+        Field::new("token".into(), DataType::String),
+        Field::new("start".into(), DataType::Int64),
+        Field::new("end".into(), DataType::Int64),
+    ])
+}
+
+fn list_token_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
+    Ok(Field::new(
+        input_fields[0].name().clone(),
+        DataType::List(Box::new(token_offset_struct_type())),
+    ))
+}
+
+fn struct_series_from_tokens(tokens: Vec<(String, i64, i64)>) -> Series {
+    let mut tok_col: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut start_col: Vec<i64> = Vec::with_capacity(tokens.len());
+    let mut end_col: Vec<i64> = Vec::with_capacity(tokens.len());
+    for (t, s, e) in tokens {
+        tok_col.push(t);
+        start_col.push(s);
+        end_col.push(e);
+    }
+    let n = tok_col.len();
+    let fields = vec![
+        Series::new("token".into(), tok_col),
+        Series::new("start".into(), start_col),
+        Series::new("end".into(), end_col),
+    ];
+    StructChunked::from_series(PlSmallStr::EMPTY, n, fields.iter())
+        .expect("struct build should succeed")
+        .into_series()
+}
+
+#[polars_expr(output_type_func=list_token_struct_output)]
+pub fn tokenize_with_offsets(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
+    let ca = inputs[0].str()?;
+    let backend = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
+        .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
+
+    let mut builder = AnonymousOwnedListBuilder::new(
+        PlSmallStr::EMPTY,
+        ca.len(),
+        Some(token_offset_struct_type()),
+    );
+
+    for opt_text in ca.into_iter() {
+        let text = match opt_text {
+            Some(value) => value,
+            None => {
+                builder.append_empty();
+                continue;
+            }
+        };
+
+        let tokens = backend
+            .tokenize_text_with_offsets(text, kwargs.lowercase, kwargs.remove_punct)
+            .map_err(|e| PolarsError::ComputeError(format!("Tokenize with offsets failed: {e}").into()))?;
+
+        if tokens.is_empty() {
+            builder.append_empty();
+        } else {
+            let struct_series = struct_series_from_tokens(tokens);
+            builder.append_series(&struct_series).map_err(|e| {
+                PolarsError::ComputeError(format!("List builder failed: {e}").into())
+            })?;
+        }
+    }
+
+    let mut list = builder.finish();
+    list.rename(ca.name().clone());
+    Ok(list.into_series())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
