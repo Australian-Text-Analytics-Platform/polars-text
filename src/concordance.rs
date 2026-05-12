@@ -2,8 +2,6 @@ use anyhow::Result;
 use polars::prelude::*;
 use regex::RegexBuilder;
 use serde::Deserialize;
-use tokenizers::Tokenizer;
-
 use crate::tokenizer::tokenize_plain_text;
 
 #[derive(Deserialize)]
@@ -61,7 +59,6 @@ fn detokenize(tokens: &[String]) -> String {
 }
 
 pub fn concordance_for_text(
-    _tokenizer: &Tokenizer,
     text: &str,
     kwargs: &ConcordanceKwargs,
 ) -> Result<Vec<Series>> {

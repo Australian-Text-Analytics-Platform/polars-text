@@ -25,17 +25,20 @@ from ._internal import (
 #:
 #: - ``en`` is the historical default and what the EN goldens were built
 #:   against; do not change without regenerating Phase 0.2 goldens.
-#: - ``zh`` uses BERT-Chinese, which is character-level (each Hanzi is one
-#:   token). For word-level Chinese, switch to Jieba in Phase 5.
-#: - ``ja`` uses cl-tohoku's MeCab-aware Japanese BERT — better than mBERT
-#:   for Japanese morphology.
+#: - ``zh`` uses Jieba (word-level Chinese segmentation, via jieba-rs).
+#:   Character-level Chinese (``bert-base-chinese``) is intentionally NOT
+#:   the default because per-character tokens have little linguistic
+#:   meaning in practice. Users can still opt into ``bert-base-chinese``
+#:   explicitly via ``model="bert-base-chinese"``.
+#: - ``ja`` currently uses cl-tohoku's MeCab-aware Japanese BERT (sub-word
+#:   tokens). Phase 5 will introduce Lindera for full morpheme segmentation.
 #: - ``multi`` is XLM-R, the recommended multilingual default (broader and
 #:   stronger than mBERT for most downstream tasks).
 #: - ``fallback`` is mBERT, kept as an explicit second-tier choice for
 #:   users who specifically want it.
 RECOMMENDED_TOKENIZERS: Final[dict[str, str]] = {
     "en": "bert-base-uncased",
-    "zh": "bert-base-chinese",
+    "zh": "jieba",
     "ja": "cl-tohoku/bert-base-japanese-v3",
     "multi": "xlm-roberta-base",
     "fallback": "bert-base-multilingual-cased",

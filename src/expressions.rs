@@ -6,7 +6,7 @@ use crate::concordance::{
     concordance_for_text, concordance_struct_type, list_struct_output, struct_series_from_matches,
     ConcordanceKwargs,
 };
-use crate::tokenizer::{ensure_tokenizer_for_model, tokenize_text};
+use crate::tokenizer::ensure_tokenizer_for_model;
 
 fn string_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), DataType::String))
@@ -105,7 +105,7 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
 #[polars_expr(output_type_func=list_string_output)]
 pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let tokenizer = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
+    let backend = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
         .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
     let mut out: Vec<Option<Series>> = Vec::with_capacity(ca.len());
@@ -118,14 +118,9 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
             }
         };
 
-        let tokens = tokenize_text(
-            &tokenizer,
-            text,
-            false,
-            kwargs.lowercase,
-            kwargs.remove_punct,
-        )
-        .map_err(|e| PolarsError::ComputeError(format!("Tokenization failed: {e}").into()))?;
+        let tokens = backend
+            .tokenize_text(text, false, kwargs.lowercase, kwargs.remove_punct)
+            .map_err(|e| PolarsError::ComputeError(format!("Tokenization failed: {e}").into()))?;
         out.push(Some(Series::new(PlSmallStr::EMPTY, tokens)));
     }
 
@@ -137,8 +132,6 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
 #[polars_expr(output_type_func=list_struct_output)]
 pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let tokenizer = ensure_tokenizer_for_model(None)
-        .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
     let mut builder = AnonymousOwnedListBuilder::new(
         PlSmallStr::EMPTY,
@@ -155,7 +148,7 @@ pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult
             }
         };
 
-        let matches = concordance_for_text(&tokenizer, text, &kwargs)
+        let matches = concordance_for_text(text, &kwargs)
             .map_err(|e| PolarsError::ComputeError(format!("Concordance failed: {e}").into()))?;
         if matches.is_empty() {
             builder.append_empty();
