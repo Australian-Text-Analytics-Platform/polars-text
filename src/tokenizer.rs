@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Context, Result};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
@@ -5,30 +8,55 @@ use once_cell::sync::OnceCell;
 use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
 use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer};
 
-const DEFAULT_TOKENIZER_MODEL: &str = "bert-base-uncased";
+pub const DEFAULT_TOKENIZER_MODEL: &str = "bert-base-uncased";
 const DEFAULT_TOKENIZER_REVISION: &str = "main";
 
-static TOKENIZER: OnceCell<Tokenizer> = OnceCell::new();
+static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<Tokenizer>>>> = OnceCell::new();
 
 const SPECIAL_TOKENS: &[&str] = &["[CLS]", "[SEP]", "[PAD]", "[UNK]", "[MASK]"];
 
-pub fn ensure_tokenizer() -> Result<&'static Tokenizer> {
-    TOKENIZER.get_or_try_init(|| {
-        let api = ApiBuilder::from_env()
-            .build()
-            .context("Failed to initialize hf-hub client")?;
-        let repo = Repo::with_revision(
-            DEFAULT_TOKENIZER_MODEL.to_string(),
-            RepoType::Model,
-            DEFAULT_TOKENIZER_REVISION.to_string(),
-        );
-        let api = api.repo(repo);
-        let tokenizer_path = api
-            .get("tokenizer.json")
-            .context("Failed to fetch tokenizer.json")?;
-        Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))
-    })
+fn registry() -> &'static RwLock<HashMap<String, Arc<Tokenizer>>> {
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<Tokenizer>> {
+    let key = model_id.unwrap_or(DEFAULT_TOKENIZER_MODEL);
+
+    if let Some(tok) = registry().read().unwrap().get(key) {
+        return Ok(Arc::clone(tok));
+    }
+
+    let mut map = registry().write().unwrap();
+    if let Some(tok) = map.get(key) {
+        return Ok(Arc::clone(tok));
+    }
+    let tokenizer = load_tokenizer_from_hub(key)?;
+    let arc = Arc::new(tokenizer);
+    map.insert(key.to_string(), Arc::clone(&arc));
+    Ok(arc)
+}
+
+fn load_tokenizer_from_hub(model_id: &str) -> Result<Tokenizer> {
+    let api = ApiBuilder::from_env()
+        .build()
+        .context("Failed to initialize hf-hub client")?;
+    let repo = Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        DEFAULT_TOKENIZER_REVISION.to_string(),
+    );
+    let api = api.repo(repo);
+    let tokenizer_path = api
+        .get("tokenizer.json")
+        .with_context(|| format!("Failed to fetch tokenizer.json for {model_id}"))?;
+    Tokenizer::from_file(tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer {model_id}: {e}"))
+}
+
+pub fn loaded_model_ids() -> Vec<String> {
+    let mut ids: Vec<String> = registry().read().unwrap().keys().cloned().collect();
+    ids.sort();
+    ids
 }
 
 pub fn tokenize_text(
@@ -97,12 +125,22 @@ pub fn tokenize_plain_text(
 
 #[cfg(test)]
 mod tests {
-    use super::tokenize_plain_text;
+    use super::{loaded_model_ids, tokenize_plain_text};
 
     #[test]
     fn test_tokenize_plain_text_drops_special_tokens() {
         let input = "[CLS] hello [SEP] [PAD] [UNK]";
         let tokens = tokenize_plain_text(input, true, true);
         assert_eq!(tokens, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_loaded_model_ids_returns_sorted_vec() {
+        // Without forcing a load, the registry may be empty or populated by other
+        // tests in this binary. Just verify the call shape and ordering invariant.
+        let ids = loaded_model_ids();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
     }
 }
