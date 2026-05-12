@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use candle_core::{Device, Module, Tensor};
@@ -11,7 +11,7 @@ use once_cell::sync::OnceCell;
 use serde::Deserialize;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 
-const POS_MODEL_ID: &str = "vblagoje/bert-english-uncased-finetuned-pos";
+pub const DEFAULT_POS_MODEL: &str = "vblagoje/bert-english-uncased-finetuned-pos";
 const POS_MODEL_REVISION: &str = "main";
 const TOKENIZER_MODEL_ID: &str = "bert-base-uncased";
 
@@ -22,7 +22,7 @@ pub struct PosToken {
     pub end: i64,
 }
 
-struct PosBundle {
+pub struct PosBundle {
     model: BertModel,
     classifier: candle_nn::Linear,
     tokenizer: Tokenizer,
@@ -30,7 +30,11 @@ struct PosBundle {
     id2label: HashMap<i64, String>,
 }
 
-static POS_BUNDLE: OnceCell<Mutex<PosBundle>> = OnceCell::new();
+static POS_REGISTRY: OnceCell<RwLock<HashMap<String, Arc<Mutex<PosBundle>>>>> = OnceCell::new();
+
+fn registry() -> &'static RwLock<HashMap<String, Arc<Mutex<PosBundle>>>> {
+    POS_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 #[derive(Deserialize)]
 struct PosConfig {
@@ -54,20 +58,22 @@ fn load_tokenizer() -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))
 }
 
-fn build_pos_bundle() -> Result<PosBundle> {
+fn build_pos_bundle(pos_model_id: &str) -> Result<PosBundle> {
     let device = Device::Cpu;
     let api = ApiBuilder::from_env().build().context("Failed to init hf-hub")?;
     let repo = Repo::with_revision(
-        POS_MODEL_ID.to_string(),
+        pos_model_id.to_string(),
         RepoType::Model,
         POS_MODEL_REVISION.to_string(),
     );
     let api = api.repo(repo);
 
-    let config_path = api.get("config.json").context("Failed to fetch config.json")?;
+    let config_path = api
+        .get("config.json")
+        .with_context(|| format!("Failed to fetch config.json for {pos_model_id}"))?;
     let weights_path = api
         .get("model.safetensors")
-        .context("Failed to fetch model.safetensors")?;
+        .with_context(|| format!("Failed to fetch model.safetensors for {pos_model_id}"))?;
 
     let config_contents = std::fs::read_to_string(config_path)
         .context("Failed to read config.json")?;
@@ -77,6 +83,11 @@ fn build_pos_bundle() -> Result<PosBundle> {
     let pos_config: PosConfig = serde_json::from_str(&config_contents)
         .context("Failed to parse POS config.json")?;
 
+    // NOTE: the tokenizer is still pinned to bert-base-uncased here because
+    // that is what the default English POS model (vblagoje/bert-…-finetuned-pos)
+    // was trained against. Phase 3.2 (POS language→model registry) will route
+    // tokenizer selection per language; for Phase 1.4 we only refactor the
+    // singleton into a model-keyed registry.
     let tokenizer = load_tokenizer()?;
 
     let vb = unsafe {
@@ -104,16 +115,29 @@ fn build_pos_bundle() -> Result<PosBundle> {
     })
 }
 
-fn with_pos_bundle<F, R>(f: F) -> Result<R>
-where
-    F: FnOnce(&mut PosBundle) -> Result<R>,
-{
-    let mutex = POS_BUNDLE
-        .get_or_try_init(|| build_pos_bundle().map(Mutex::new))?;
-    let mut guard = mutex
-        .lock()
-        .map_err(|_| anyhow::anyhow!("POS bundle mutex poisoned"))?;
-    f(&mut *guard)
+pub fn ensure_pos_bundle_for_model(
+    pos_model_id: Option<&str>,
+) -> Result<Arc<Mutex<PosBundle>>> {
+    let key = pos_model_id.unwrap_or(DEFAULT_POS_MODEL);
+
+    if let Some(b) = registry().read().unwrap().get(key) {
+        return Ok(Arc::clone(b));
+    }
+
+    let mut map = registry().write().unwrap();
+    if let Some(b) = map.get(key) {
+        return Ok(Arc::clone(b));
+    }
+    let bundle = build_pos_bundle(key)?;
+    let arc = Arc::new(Mutex::new(bundle));
+    map.insert(key.to_string(), Arc::clone(&arc));
+    Ok(arc)
+}
+
+pub fn loaded_pos_model_ids() -> Vec<String> {
+    let mut ids: Vec<String> = registry().read().unwrap().keys().cloned().collect();
+    ids.sort();
+    ids
 }
 
 fn decode_tags(logits: Tensor) -> Result<Vec<i64>> {
@@ -133,66 +157,73 @@ fn decode_tags(logits: Tensor) -> Result<Vec<i64>> {
     Ok(tags)
 }
 
-pub fn pos_tags_for_text(text: &str) -> Result<Vec<PosToken>> {
+pub fn pos_tags_for_text(
+    text: &str,
+    pos_model_id: Option<&str>,
+) -> Result<Vec<PosToken>> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
 
-    with_pos_bundle(|bundle| {
-        let device = &bundle.device;
-        let mut tokenizer = bundle.tokenizer.clone();
+    let bundle = ensure_pos_bundle_for_model(pos_model_id)?;
+    let mut guard = bundle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("POS bundle mutex poisoned"))?;
+    let bundle = &mut *guard;
 
-        if let Some(pp) = tokenizer.get_padding_mut() {
-            pp.strategy = PaddingStrategy::BatchLongest;
-        } else {
-            let pp = PaddingParams {
-                strategy: PaddingStrategy::BatchLongest,
-                ..Default::default()
-            };
-            tokenizer.with_padding(Some(pp));
+    let device = &bundle.device;
+    let mut tokenizer = bundle.tokenizer.clone();
+
+    if let Some(pp) = tokenizer.get_padding_mut() {
+        pp.strategy = PaddingStrategy::BatchLongest;
+    } else {
+        let pp = PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            ..Default::default()
+        };
+        tokenizer.with_padding(Some(pp));
+    }
+
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
+
+    let ids = Tensor::new(encoding.get_ids(), device)?;
+    let attention = Tensor::new(encoding.get_attention_mask(), device)?;
+    let token_type = ids.zeros_like()?;
+
+    let ids = ids.unsqueeze(0)?;
+    let attention = attention.unsqueeze(0)?;
+    let token_type = token_type.unsqueeze(0)?;
+
+    let embeddings = bundle
+        .model
+        .forward(&ids, &token_type, Some(&attention))
+        .context("POS model forward failed")?;
+
+    let logits = bundle.classifier.forward(&embeddings)?;
+    let logits = logits.squeeze(0)?;
+
+    let tag_ids = decode_tags(logits)?;
+    let offsets = encoding.get_offsets();
+    let tokens = encoding.get_tokens();
+
+    let mut results = Vec::new();
+    for ((_, (start, end)), tag_id) in tokens.iter().zip(offsets.iter()).zip(tag_ids) {
+        if *start == 0 && *end == 0 {
+            continue;
         }
+        let label = bundle
+            .id2label
+            .get(&tag_id)
+            .cloned()
+            .unwrap_or_else(|| "X".to_string());
+        results.push(PosToken {
+            tag: label,
+            start: *start as i64,
+            end: *end as i64,
+        });
+    }
 
-        let encoding = tokenizer
-            .encode(text, true)
-            .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
-
-        let ids = Tensor::new(encoding.get_ids(), device)?;
-        let attention = Tensor::new(encoding.get_attention_mask(), device)?;
-        let token_type = ids.zeros_like()?;
-
-        let ids = ids.unsqueeze(0)?;
-        let attention = attention.unsqueeze(0)?;
-        let token_type = token_type.unsqueeze(0)?;
-
-        let embeddings = bundle
-            .model
-            .forward(&ids, &token_type, Some(&attention))
-            .context("POS model forward failed")?;
-
-        let logits = bundle.classifier.forward(&embeddings)?;
-        let logits = logits.squeeze(0)?;
-
-        let tag_ids = decode_tags(logits)?;
-        let offsets = encoding.get_offsets();
-        let tokens = encoding.get_tokens();
-
-        let mut results = Vec::new();
-        for ((_, (start, end)), tag_id) in tokens.iter().zip(offsets.iter()).zip(tag_ids) {
-            if *start == 0 && *end == 0 {
-                continue;
-            }
-            let label = bundle
-                .id2label
-                .get(&tag_id)
-                .cloned()
-                .unwrap_or_else(|| "X".to_string());
-            results.push(PosToken {
-                tag: label,
-                start: *start as i64,
-                end: *end as i64,
-            });
-        }
-
-        Ok(results)
-    })
+    Ok(results)
 }
