@@ -12,12 +12,19 @@ def tokenize(
     *,
     lowercase: bool = True,
     remove_punct: bool = True,
+    model: str | None = None,
 ) -> pl.Expr:
+    kwargs: dict[str, object] = {
+        "lowercase": lowercase,
+        "remove_punct": remove_punct,
+    }
+    if model is not None:
+        kwargs["model_id"] = model
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
         function_name="tokenize",
         args=expr,
-        kwargs={"lowercase": lowercase, "remove_punct": remove_punct},
+        kwargs=kwargs,
         is_elementwise=True,
     )
 

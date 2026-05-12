@@ -105,7 +105,7 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
 #[polars_expr(output_type_func=list_string_output)]
 pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let tokenizer = ensure_tokenizer_for_model(None)
+    let tokenizer = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
         .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
     let mut out: Vec<Option<Series>> = Vec::with_capacity(ca.len());
@@ -176,6 +176,8 @@ pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult
 struct TokenizeKwargs {
     lowercase: bool,
     remove_punct: bool,
+    #[serde(default)]
+    model_id: Option<String>,
 }
 
 fn list_string_output(input_fields: &[Field]) -> PolarsResult<Field> {

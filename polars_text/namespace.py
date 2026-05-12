@@ -10,9 +10,18 @@ class TextNamespace:
     def __init__(self, expr: pl.Expr) -> None:
         self._expr = expr
 
-    def tokenize(self, *, lowercase: bool = True, remove_punct: bool = True) -> pl.Expr:
+    def tokenize(
+        self,
+        *,
+        lowercase: bool = True,
+        remove_punct: bool = True,
+        model: str | None = None,
+    ) -> pl.Expr:
         return functions.tokenize(
-            self._expr, lowercase=lowercase, remove_punct=remove_punct
+            self._expr,
+            lowercase=lowercase,
+            remove_punct=remove_punct,
+            model=model,
         )
 
     def concordance(
