@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
@@ -19,34 +19,41 @@ use serde_json;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use crate::tokenizer::tokenize_plain_text;
 
-const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+pub const DEFAULT_EMBEDDER_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 const DEFAULT_REVISION: &str = "main";
 
-struct CandleBundle {
+pub struct CandleBundle {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
 }
 
-static CANDLE_BUNDLE: OnceCell<Mutex<CandleBundle>> = OnceCell::new();
+static CANDLE_REGISTRY: OnceCell<RwLock<HashMap<String, Arc<Mutex<CandleBundle>>>>> =
+    OnceCell::new();
 
-fn build_candle_bundle() -> Result<CandleBundle> {
+fn registry() -> &'static RwLock<HashMap<String, Arc<Mutex<CandleBundle>>>> {
+    CANDLE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn build_candle_bundle(model_id: &str) -> Result<CandleBundle> {
     let device = Device::Cpu;
     let api = ApiBuilder::from_env().build().context("Failed to initialize hf-hub client")?;
     let repo = Repo::with_revision(
-        DEFAULT_MODEL_ID.to_string(),
+        model_id.to_string(),
         RepoType::Model,
         DEFAULT_REVISION.to_string(),
     );
     let api = api.repo(repo);
 
-    let config_path = api.get("config.json").context("Failed to fetch config.json")?;
+    let config_path = api
+        .get("config.json")
+        .with_context(|| format!("Failed to fetch config.json for {model_id}"))?;
     let tokenizer_path = api
         .get("tokenizer.json")
-        .context("Failed to fetch tokenizer.json")?;
+        .with_context(|| format!("Failed to fetch tokenizer.json for {model_id}"))?;
     let weights_path = api
         .get("model.safetensors")
-        .context("Failed to fetch model.safetensors")?;
+        .with_context(|| format!("Failed to fetch model.safetensors for {model_id}"))?;
 
     let config_contents = std::fs::read_to_string(config_path)
         .context("Failed to read config.json")?;
@@ -69,16 +76,40 @@ fn build_candle_bundle() -> Result<CandleBundle> {
     })
 }
 
-fn with_candle_bundle<F, R>(f: F) -> Result<R>
+pub fn ensure_candle_bundle_for_model(
+    model_id: Option<&str>,
+) -> Result<Arc<Mutex<CandleBundle>>> {
+    let key = model_id.unwrap_or(DEFAULT_EMBEDDER_MODEL);
+
+    if let Some(b) = registry().read().unwrap().get(key) {
+        return Ok(Arc::clone(b));
+    }
+
+    let mut map = registry().write().unwrap();
+    if let Some(b) = map.get(key) {
+        return Ok(Arc::clone(b));
+    }
+    let bundle = build_candle_bundle(key)?;
+    let arc = Arc::new(Mutex::new(bundle));
+    map.insert(key.to_string(), Arc::clone(&arc));
+    Ok(arc)
+}
+
+pub fn loaded_embedder_model_ids() -> Vec<String> {
+    let mut ids: Vec<String> = registry().read().unwrap().keys().cloned().collect();
+    ids.sort();
+    ids
+}
+
+fn with_candle_bundle<F, R>(model_id: Option<&str>, f: F) -> Result<R>
 where
     F: FnOnce(&CandleBundle) -> Result<R>,
 {
-    let mutex = CANDLE_BUNDLE
-        .get_or_try_init(|| build_candle_bundle().map(Mutex::new))?;
-    let mut guard = mutex
+    let bundle = ensure_candle_bundle_for_model(model_id)?;
+    let guard = bundle
         .lock()
         .map_err(|_| anyhow::anyhow!("Candle model mutex poisoned"))?;
-    f(&mut *guard)
+    f(&*guard)
 }
 
 fn normalize_l2(v: &Tensor) -> Result<Tensor> {
@@ -261,7 +292,7 @@ fn topic_modeling_inner(
     eps: Option<f32>,
     max_terms: usize,
 ) -> Result<(HashMap<i32, String>, Vec<i32>)> {
-    with_candle_bundle(|bundle| {
+    with_candle_bundle(None, |bundle| {
         let embeddings = embed_with_candle(bundle, texts)?;
         let (labels, _normalized, _eps_used) =
             cluster_embeddings(embeddings, min_points.max(2), eps)?;

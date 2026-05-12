@@ -9,6 +9,12 @@ from .functions import (
     tokenize,
     word_count,
 )
+from .models import (
+    RECOMMENDED_TOKENIZERS,
+    list_loaded_models,
+    prefetch_model,
+    recommended_tokenizer_for,
+)
 from .plan_paths import list_source_paths, replace_source_paths
 from .token_frequencies import token_frequencies, token_frequency_stats
 from .topic_modeling import topic_modeling
@@ -25,4 +31,8 @@ __all__ = [
     "token_frequency_stats",
     "list_source_paths",
     "replace_source_paths",
+    "RECOMMENDED_TOKENIZERS",
+    "list_loaded_models",
+    "prefetch_model",
+    "recommended_tokenizer_for",
 ]
