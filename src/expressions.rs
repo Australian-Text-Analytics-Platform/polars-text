@@ -57,13 +57,51 @@ pub fn clean_text(inputs: &[Series]) -> PolarsResult<Series> {
     Ok(Series::new(ca.name().clone(), out))
 }
 
+/// Heuristic test for "writing-system characters that are their own word
+/// boundary" — covers Han ideographs (used by Chinese and parts of
+/// Japanese/Korean), Hiragana, Katakana, and Hangul syllables. Punctuation
+/// and spaces are intentionally excluded because they aren't words.
+fn is_cjk_word_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF      // CJK Unified Ideographs
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x20000..=0x2A6DF // CJK Extension B
+            | 0x3040..=0x309F // Hiragana
+            | 0x30A0..=0x30FF // Katakana
+            | 0xAC00..=0xD7AF // Hangul Syllables
+    )
+}
+
 #[polars_expr(output_type_func=int_output)]
 pub fn word_count(inputs: &[Series]) -> PolarsResult<Series> {
+    // Phase 3.4: ``split_whitespace`` returns 1 for pure-CJK text because
+    // CJK orthography has no inter-word whitespace. Detect that case and
+    // count each CJK character as one word — a coarse heuristic that gives
+    // a meaningful non-zero count on Chinese / Japanese corpora without a
+    // tokenizer round-trip. For real word-level counts post-Tokenise, use
+    // ``pl.col(derived_tokens_col).list.len()``. English / whitespace-
+    // tokenised flows are byte-identical: any text with internal whitespace
+    // still goes through ``split_whitespace``.
     let ca = inputs[0].str()?;
     let mut out: Vec<i64> = Vec::with_capacity(ca.len());
     for opt_text in ca.into_iter() {
         let count = match opt_text {
-            Some(text) => text.split_whitespace().count() as i64,
+            Some(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    0
+                } else if trimmed.chars().any(|c| c.is_whitespace()) {
+                    trimmed.split_whitespace().count() as i64
+                } else if trimmed.chars().all(is_cjk_word_char) {
+                    trimmed.chars().count() as i64
+                } else {
+                    // Mixed CJK + non-CJK with no whitespace (e.g. CJK
+                    // followed by Latin punctuation): treat the whole run
+                    // as one word, matching the existing semantics.
+                    1
+                }
+            }
             None => 0,
         };
         out.push(count);
@@ -85,14 +123,33 @@ pub fn char_count(inputs: &[Series]) -> PolarsResult<Series> {
     Ok(Series::new(ca.name().clone(), out))
 }
 
+/// Sentence terminators covered by ``sentence_count``. ASCII ``. ! ?``
+/// plus the full-width variants used in Chinese and Japanese writing, plus
+/// a few common non-Latin terminators we've seen in real corpora. Add
+/// future scripts here rather than at the call site so the contract stays
+/// in one place.
+fn is_sentence_terminator(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | '!' | '?'           // ASCII
+            | '。' | '！' | '？'    // CJK full-width (Chinese, Japanese)
+            | '۔'                  // Arabic full stop
+            | '؟'                  // Arabic question mark
+            | '।' | '॥'             // Devanagari danda / double danda
+    )
+}
+
 #[polars_expr(output_type_func=int_output)]
 pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
+    // Phase 3.3: terminator set is Unicode-aware. EN flows are byte-identical
+    // because the ASCII terminators are still in the set; CJK now splits on
+    // ``。！？`` correctly instead of returning 1 for an entire paragraph.
     let ca = inputs[0].str()?;
     let mut out: Vec<i64> = Vec::with_capacity(ca.len());
     for opt_text in ca.into_iter() {
         let count = match opt_text {
             Some(text) => text
-                .split(|c| c == '.' || c == '!' || c == '?')
+                .split(is_sentence_terminator)
                 .filter(|segment| !segment.trim().is_empty())
                 .count() as i64,
             None => 0,
