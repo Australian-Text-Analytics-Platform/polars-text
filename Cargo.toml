@@ -95,6 +95,17 @@ polars-plan = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0"
     # `.shuffle()`, and `pl.int_range(pl.len()).sample(seed=...)`.
     "random",
 
+    # ---- FFI plugins --------------------------------------------------------
+    # `ffi_plugin` gates the `FunctionExpr::FfiPlugin` DslPlan variant. Every
+    # Python call to `polars.plugins.register_plugin_function` emits this
+    # variant in the lazy plan — including this very crate's
+    # `polars_text.tokenize_with_offsets`. Without the feature, walking a
+    # persisted plan that contains a tokenise expression (e.g. on workspace
+    # save/load) fails with `unknown variant 'FfiPlugin'`. We never actually
+    # load plugins at runtime from `list_source_paths`, but the deserializer
+    # still needs the enum variant to exist.
+    "ffi_plugin",
+
     # ---- Predicates & comparisons ------------------------------------------
     "is_in",
     "is_between",
@@ -193,8 +204,6 @@ polars-plan = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0"
     #   cloud                     Pulls AWS/Azure/GCS SDKs (~30 MB binary
     #                             growth, runtime auth concerns). We never
     #                             scan remote URIs in plan introspection.
-    #   ffi_plugin                Adds `libloading` + plugin runtime loading.
-    #                             We don't load runtime polars plugins.
     #   python                    Registers a SECOND set of pyo3 bindings
     #                             inside polars-plan; collides with our
     #                             top-level pyo3-polars binding.
