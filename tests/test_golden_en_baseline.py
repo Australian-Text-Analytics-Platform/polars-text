@@ -5,6 +5,11 @@ Re-runs `polars_text.token_frequencies` and `text.concordance` against
 golden CSVs. Any drift (refactor change, polars dep update, fixture
 edit) makes the test fail loudly.
 
+Fixtures live in the parent ``ldaca_web_app`` repo, NOT this submodule,
+so the test auto-skips when polars-text is checked out standalone (CI
+on this repo) — it only runs when polars-text is mounted as a submodule
+of ldaca_web_app.
+
 To regenerate the goldens after an intentional change:
 
     cd polars-text && uv run python tests/test_golden_en_baseline.py
@@ -15,11 +20,22 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+import pytest
+
 import polars_text as pt
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_EN = REPO_ROOT / "tests" / "fixtures" / "multilingual" / "literary" / "en.csv"
 GOLDEN_DIR = REPO_ROOT / "tests" / "fixtures" / "multilingual" / "golden"
+
+# Skip the whole module when run standalone (no parent ldaca_web_app fixtures).
+pytestmark = pytest.mark.skipif(
+    not FIXTURE_EN.is_file(),
+    reason=(
+        "EN literary fixture lives in the parent ldaca_web_app repo; "
+        "test only runs when polars-text is mounted as a submodule."
+    ),
+)
 
 CONCORDANCE_KEYWORD = "time"
 TOP_K = 50
