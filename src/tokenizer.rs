@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
+use lindera::tokenizer::Tokenizer as LinderaTokenizer;
 use once_cell::sync::OnceCell;
 use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
 use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer};
@@ -11,15 +12,25 @@ use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer
 pub const DEFAULT_TOKENIZER_MODEL: &str = "bert-base-uncased";
 const DEFAULT_TOKENIZER_REVISION: &str = "main";
 pub const JIEBA_MODEL_ID: &str = "jieba";
+/// Opaque model IDs for the three Lindera dict variants. Phase 5 routes
+/// these through `load_backend` to a downloader (lindera_dict.rs) that
+/// fetches the binary dict on first use; subsequent calls hit the
+/// in-memory REGISTRY. The frontend selector surfaces JA's IPADIC vs
+/// UniDic choice; KO has only ko-dic so it's a single ID.
+pub const LINDERA_JA_IPADIC_MODEL_ID: &str = "lindera-ja-ipadic";
+pub const LINDERA_JA_UNIDIC_MODEL_ID: &str = "lindera-ja-unidic";
+pub const LINDERA_KO_DIC_MODEL_ID: &str = "lindera-ko-dic";
 
 const SPECIAL_TOKENS: &[&str] = &["[CLS]", "[SEP]", "[PAD]", "[UNK]", "[MASK]"];
 
-/// A model-specific tokenizer fronting either a HuggingFace tokenizer
-/// (BERT-family WordPiece, XLM-R SentencePiece, etc.) or `jieba-rs`
-/// for word-level Chinese segmentation.
+/// A model-specific tokenizer fronting one of:
+/// - a HuggingFace tokenizer (BERT-family WordPiece, XLM-R SentencePiece, etc.)
+/// - `jieba-rs` for word-level Chinese segmentation
+/// - Lindera for morpheme-level Japanese (IPADIC / UniDic) or Korean (ko-dic)
 pub enum TokenizerBackend {
     HuggingFace(Tokenizer),
     Jieba(jieba_rs::Jieba),
+    Lindera(LinderaTokenizer),
 }
 
 impl TokenizerBackend {
@@ -47,6 +58,12 @@ impl TokenizerBackend {
                 .cut(&processed, true)
                 .into_iter()
                 .map(|s| s.to_string())
+                .collect(),
+            TokenizerBackend::Lindera(tok) => tok
+                .tokenize(&processed)
+                .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?
+                .into_iter()
+                .map(|t| t.surface.to_string())
                 .collect(),
         };
 
@@ -93,6 +110,21 @@ impl TokenizerBackend {
                 .into_iter()
                 .map(|t| (t.word.to_string(), t.start as i64, t.end as i64))
                 .collect(),
+            TokenizerBackend::Lindera(tok) => {
+                let toks = tok
+                    .tokenize(&processed)
+                    .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?;
+                // Lindera emits byte offsets; the rest of polars-text speaks in
+                // char offsets (matches Jieba + the HF arm above), so translate
+                // through the same helper before handing back to the caller.
+                toks.into_iter()
+                    .map(|t| {
+                        let cs = byte_to_char_idx(&processed, t.byte_start) as i64;
+                        let ce = byte_to_char_idx(&processed, t.byte_end) as i64;
+                        (t.surface.to_string(), cs, ce)
+                    })
+                    .collect()
+            }
         };
 
         let result: Vec<(String, i64, i64)> = raw
@@ -135,9 +167,21 @@ pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<Tokenize
 
 fn load_backend(model_id: &str) -> Result<TokenizerBackend> {
     if model_id == JIEBA_MODEL_ID {
-        Ok(TokenizerBackend::Jieba(jieba_rs::Jieba::new()))
-    } else {
-        load_hf_tokenizer(model_id).map(TokenizerBackend::HuggingFace)
+        return Ok(TokenizerBackend::Jieba(jieba_rs::Jieba::new()));
+    }
+    if let Some(kind) = lindera_dict_for_model_id(model_id) {
+        let tok = crate::lindera_dict::ensure_lindera_tokenizer(kind)?;
+        return Ok(TokenizerBackend::Lindera(tok));
+    }
+    load_hf_tokenizer(model_id).map(TokenizerBackend::HuggingFace)
+}
+
+fn lindera_dict_for_model_id(model_id: &str) -> Option<crate::lindera_dict::LinderaDict> {
+    match model_id {
+        LINDERA_JA_IPADIC_MODEL_ID => Some(crate::lindera_dict::LinderaDict::JaIpadic),
+        LINDERA_JA_UNIDIC_MODEL_ID => Some(crate::lindera_dict::LinderaDict::JaUnidic),
+        LINDERA_KO_DIC_MODEL_ID => Some(crate::lindera_dict::LinderaDict::KoDic),
+        _ => None,
     }
 }
 

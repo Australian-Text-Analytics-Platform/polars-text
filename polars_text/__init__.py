@@ -11,6 +11,7 @@ from .functions import (
     word_count,
 )
 from .models import (
+    RECOMMENDED_JA_DICTS,
     RECOMMENDED_TOKENIZERS,
     list_loaded_models,
     prefetch_model,
@@ -33,6 +34,7 @@ __all__ = [
     "token_frequency_stats",
     "list_source_paths",
     "replace_source_paths",
+    "RECOMMENDED_JA_DICTS",
     "RECOMMENDED_TOKENIZERS",
     "list_loaded_models",
     "prefetch_model",

@@ -30,11 +30,16 @@ from ._internal import (
 #:   the default because per-character tokens have little linguistic
 #:   meaning in practice. Users can still opt into ``bert-base-chinese``
 #:   explicitly via ``model="bert-base-chinese"``.
-#: - ``ja`` currently uses cl-tohoku's MeCab-aware Japanese BERT (sub-word
-#:   tokens). Phase 5 will introduce Lindera for full morpheme segmentation.
-#: - ``ko`` uses KLUE BERT, the de facto Korean BERT baseline. Same
-#:   BertWordPiece tokenizer family as the EN/JA defaults, so the existing
-#:   HuggingFace backend loads it without any new wiring.
+#: - ``ja`` uses Lindera + IPADIC (morpheme-level segmentation). The dict
+#:   is downloaded on first use to ``~/.cache/ldaca/lindera/``. UniDic is
+#:   available as an opt-in alternate via ``model="lindera-ja-unidic"``;
+#:   see :data:`RECOMMENDED_JA_DICTS` for the surface shown by the frontend
+#:   dict selector. The previous default (``cl-tohoku/bert-base-japanese-v3``)
+#:   is removed because it has no ``tokenizer.json`` on HF Hub and depends
+#:   on Python ``BertJapaneseTokenizer`` + MeCab.
+#: - ``ko`` uses Lindera + ko-dic (morpheme-level Korean). Same on-demand
+#:   download path as JA. Replaces the previous ``klue/bert-base`` pick,
+#:   which worked but only produced sub-word tokens.
 #: - ``multi`` is XLM-R, the recommended multilingual default (broader and
 #:   stronger than mBERT for most downstream tasks).
 #: - ``fallback`` is mBERT, kept as an explicit second-tier choice for
@@ -42,11 +47,25 @@ from ._internal import (
 RECOMMENDED_TOKENIZERS: Final[dict[str, str]] = {
     "en": "bert-base-uncased",
     "zh": "jieba",
-    "ja": "cl-tohoku/bert-base-japanese-v3",
-    "ko": "klue/bert-base",
+    "ja": "lindera-ja-ipadic",
+    "ko": "lindera-ko-dic",
     "multi": "xlm-roberta-base",
     "fallback": "bert-base-multilingual-cased",
 }
+
+
+#: Per-language dict choices surfaced by the frontend selector. Languages
+#: with a single canonical dict (zh→jieba, ko→ko-dic) deliberately have no
+#: entry here so the selector hides itself for them. JA is the only entry
+#: today; UniDic is opt-in because it adds ~100 MB to first-use download.
+#:
+#: Shape: ``{language: [(model_id, human_label), ...]}``. The first entry
+#: in each list is the default (matches the corresponding
+#: ``RECOMMENDED_TOKENIZERS`` value).
+RECOMMENDED_JA_DICTS: Final[tuple[tuple[str, str], ...]] = (
+    ("lindera-ja-ipadic", "IPADIC (recommended, ~25 MB)"),
+    ("lindera-ja-unidic", "UniDic (more accurate, ~100 MB)"),
+)
 
 
 def recommended_tokenizer_for(language: str) -> str:
@@ -74,6 +93,7 @@ def list_loaded_models() -> list[str]:
 
 
 __all__ = [
+    "RECOMMENDED_JA_DICTS",
     "RECOMMENDED_TOKENIZERS",
     "list_loaded_models",
     "prefetch_model",

@@ -14,6 +14,25 @@ candle-nn = "0.10"
 candle-transformers = "0.10"
 hf-hub = "0.5"
 jieba-rs = "0.9"
+# Phase-5 dict download support: `dirs` resolves the per-OS cache dir
+# cross-platform (Mac/Linux/Windows) and `tar` + the already-present
+# `flate2` extract the prebuilt Lindera dict tarballs we host on HF.
+dirs = "5"
+flate2 = "1"
+tar = "0.4"
+# Lindera — morpheme-level segmentation for Japanese (IPADIC / UniDic) and
+# Korean (ko-dic). Per Phase 5 of docs/pluggable-tokeniser/PLAN.md we
+# deliberately do NOT enable any `embed-*` feature: dicts are downloaded
+# on first use to ~/.cache/ldaca/lindera/ via the lindera_dict module so
+# the wheel stays slim. The `lindera-ipadic` / `lindera-ko-dic` /
+# `lindera-unidic` features pull in the per-dict loader code paths only
+# — the actual dict binaries are not bundled.
+lindera = { version = "3", default-features = false, features = [
+    "mmap",
+    "lindera-ipadic",
+    "lindera-ko-dic",
+    "lindera-unidic",
+] }
 linfa = "0.8"
 linfa-clustering = "0.8"
 ndarray = "0.16"
