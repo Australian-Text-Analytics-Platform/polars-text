@@ -250,7 +250,12 @@ pub fn tokenize_plain_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{loaded_model_ids, tokenize_plain_text, TokenizerBackend, JIEBA_MODEL_ID};
+    use super::{
+        lindera_dict_for_model_id, loaded_model_ids, tokenize_plain_text,
+        TokenizerBackend, JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID,
+        LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID,
+    };
+    use crate::lindera_dict::LinderaDict;
 
     #[test]
     fn test_tokenize_plain_text_drops_special_tokens() {
@@ -311,5 +316,36 @@ mod tests {
                 "Jieba offset mismatch for {tok:?} ({start}..{end})"
             );
         }
+    }
+
+    #[test]
+    fn test_lindera_model_id_constants_match_dict_kinds() {
+        // Phase 5: the three Lindera model IDs route to the matching
+        // LinderaDict variant in load_backend. Catches a copy-paste
+        // mistake where two ids map to the same kind.
+        assert_eq!(
+            lindera_dict_for_model_id(LINDERA_JA_IPADIC_MODEL_ID),
+            Some(LinderaDict::JaIpadic)
+        );
+        assert_eq!(
+            lindera_dict_for_model_id(LINDERA_JA_UNIDIC_MODEL_ID),
+            Some(LinderaDict::JaUnidic)
+        );
+        assert_eq!(
+            lindera_dict_for_model_id(LINDERA_KO_DIC_MODEL_ID),
+            Some(LinderaDict::KoDic)
+        );
+    }
+
+    #[test]
+    fn test_lindera_dict_for_unknown_model_id_returns_none() {
+        // Anything that isn't one of the three opaque ids falls through
+        // to the HF path in load_backend — verified here by asserting
+        // None for plausible adjacent strings.
+        assert_eq!(lindera_dict_for_model_id("lindera-ja"), None);
+        assert_eq!(lindera_dict_for_model_id("ja-ipadic"), None);
+        assert_eq!(lindera_dict_for_model_id("bert-base-uncased"), None);
+        assert_eq!(lindera_dict_for_model_id("jieba"), None);
+        assert_eq!(lindera_dict_for_model_id(""), None);
     }
 }
