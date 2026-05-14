@@ -12,7 +12,7 @@ from polars_text.models import (
 
 
 def test_recommended_tokenizers_has_core_languages() -> None:
-    for lang in ("en", "zh", "ja", "multi", "fallback"):
+    for lang in ("en", "zh", "ja", "ko", "multi", "fallback"):
         assert lang in RECOMMENDED_TOKENIZERS
         assert RECOMMENDED_TOKENIZERS[lang], (
             f"empty tokenizer id for language {lang!r}"
@@ -22,6 +22,7 @@ def test_recommended_tokenizers_has_core_languages() -> None:
 def test_recommended_tokenizer_for_known_languages() -> None:
     assert recommended_tokenizer_for("en") == "bert-base-uncased"
     assert recommended_tokenizer_for("zh") == "jieba"
+    assert recommended_tokenizer_for("ko") == "klue/bert-base"
 
 
 def test_recommended_tokenizer_for_unknown_falls_back_to_multi() -> None:

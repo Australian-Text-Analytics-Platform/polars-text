@@ -32,6 +32,9 @@ from ._internal import (
 #:   explicitly via ``model="bert-base-chinese"``.
 #: - ``ja`` currently uses cl-tohoku's MeCab-aware Japanese BERT (sub-word
 #:   tokens). Phase 5 will introduce Lindera for full morpheme segmentation.
+#: - ``ko`` uses KLUE BERT, the de facto Korean BERT baseline. Same
+#:   BertWordPiece tokenizer family as the EN/JA defaults, so the existing
+#:   HuggingFace backend loads it without any new wiring.
 #: - ``multi`` is XLM-R, the recommended multilingual default (broader and
 #:   stronger than mBERT for most downstream tasks).
 #: - ``fallback`` is mBERT, kept as an explicit second-tier choice for
@@ -40,6 +43,7 @@ RECOMMENDED_TOKENIZERS: Final[dict[str, str]] = {
     "en": "bert-base-uncased",
     "zh": "jieba",
     "ja": "cl-tohoku/bert-base-japanese-v3",
+    "ko": "klue/bert-base",
     "multi": "xlm-roberta-base",
     "fallback": "bert-base-multilingual-cased",
 }
