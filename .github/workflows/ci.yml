@@ -74,13 +74,12 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip pytest
-          # --no-index forces pip to resolve polars-text from the freshly-built
-          # wheel in dist/, never falling back to PyPI. Without this the
-          # resolver can silently pick a published version that pre-dates
-          # newly added pure-Python modules (e.g. polars_text.models), and
-          # tests then fail with ModuleNotFoundError despite the local build
-          # being correct.
-          python -m pip install --force-reinstall --no-index --find-links dist polars-text
+          # Install the freshly-built wheel by file path so pip cannot
+          # silently substitute a published PyPI version (avoids the
+          # ModuleNotFoundError class of failures where the local build
+          # added a pure-Python module the index version doesn't have).
+          # Transitive deps (polars==1.40.0) still resolve from PyPI.
+          python -m pip install --force-reinstall dist/polars_text-*.whl
 
       - name: Run pytest
         shell: bash
