@@ -1,14 +1,14 @@
 //! On-demand Lindera dictionary downloader.
 //!
 //! Phase 5 (Lindera JA + KO) ships three prebuilt morpheme dicts:
-//! IPADIC (~25 MB) and UniDic (~100 MB) for Japanese, ko-dic (~12 MB) for
-//! Korean. Per `docs/pluggable-tokeniser/PLAN.md` they are NOT bundled in
-//! the polars-text wheel — instead the first JA/KO tokenize call lands
-//! here, fetches the matching tarball from the HuggingFace dataset
-//! `ldaca/lindera-dicts` (overridable via `LDACA_LINDERA_DICT_REPO` for
-//! testing), extracts into the per-OS cache dir, and hands the loaded
-//! `Tokenizer` back to `tokenizer.rs` for memoization in the existing
-//! `REGISTRY`.
+//! IPADIC (~15 MB gzipped) and UniDic (~50 MB gzipped) for Japanese,
+//! ko-dic (~34 MB gzipped) for Korean. Per `docs/pluggable-tokeniser/PLAN.md`
+//! they are NOT bundled in the polars-text wheel — instead the first
+//! JA/KO tokenize call lands here, fetches the matching tarball from
+//! the HuggingFace dataset `SIH/lindera-dicts` (overridable via
+//! `LDACA_LINDERA_DICT_REPO` for testing), extracts into the per-OS
+//! cache dir, and hands the loaded `Tokenizer` back to `tokenizer.rs`
+//! for memoization in the existing `REGISTRY`.
 //!
 //! Cache layout:
 //!   <cache-dir>/ldaca/lindera/
@@ -31,7 +31,7 @@ use lindera::tokenizer::Tokenizer as LinderaTokenizer;
 
 /// HF dataset repo hosting the prebuilt Lindera dicts. Tests + CI can
 /// point at a fixture repo by setting this env var.
-const DEFAULT_DICT_REPO: &str = "ldaca/lindera-dicts";
+const DEFAULT_DICT_REPO: &str = "SIH/lindera-dicts";
 const DICT_REPO_ENV: &str = "LDACA_LINDERA_DICT_REPO";
 
 /// Which prebuilt dict to fetch. Mirrors the model-id constants in

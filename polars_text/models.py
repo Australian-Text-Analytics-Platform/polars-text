@@ -63,8 +63,8 @@ RECOMMENDED_TOKENIZERS: Final[dict[str, str]] = {
 #: in each list is the default (matches the corresponding
 #: ``RECOMMENDED_TOKENIZERS`` value).
 RECOMMENDED_JA_DICTS: Final[tuple[tuple[str, str], ...]] = (
-    ("lindera-ja-ipadic", "IPADIC (recommended, ~25 MB)"),
-    ("lindera-ja-unidic", "UniDic (more accurate, ~100 MB)"),
+    ("lindera-ja-ipadic", "IPADIC (recommended, ~15 MB)"),
+    ("lindera-ja-unidic", "UniDic (more accurate, ~50 MB)"),
 )
 
 
