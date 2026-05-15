@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -36,6 +37,26 @@ pub enum TokenizerBackend {
 }
 
 impl TokenizerBackend {
+    /// Whether `to_lowercase()` is a semantically meaningful preprocessing step.
+    /// Jieba (zh) and Lindera (ja/ko) operate on scripts with no case, so
+    /// running the full Unicode case-fold table walk + heap allocation per row
+    /// is pure waste. The Python wrapper also defaults to `lowercase=False`
+    /// for CJK models — this is a safety net for any caller that forgets.
+    fn case_aware(&self) -> bool {
+        matches!(self, TokenizerBackend::HuggingFace(_))
+    }
+
+    /// Apply the requested case-folding only when meaningful. Returns a
+    /// `Cow<str>` so that the no-op branch borrows the original text
+    /// (zero allocations) instead of paying for a `text.to_string()` clone.
+    fn preprocess<'a>(&self, text: &'a str, lowercase: bool) -> Cow<'a, str> {
+        if lowercase && self.case_aware() {
+            Cow::Owned(text.to_lowercase())
+        } else {
+            Cow::Borrowed(text)
+        }
+    }
+
     pub fn tokenize_text(
         &self,
         text: &str,
@@ -43,26 +64,22 @@ impl TokenizerBackend {
         lowercase: bool,
         remove_punctuation: bool,
     ) -> Result<Vec<String>> {
-        let processed = if lowercase {
-            text.to_lowercase()
-        } else {
-            text.to_string()
-        };
+        let processed = self.preprocess(text, lowercase);
 
         let mut tokens: Vec<String> = match self {
             TokenizerBackend::HuggingFace(tokenizer) => {
                 let encoding = tokenizer
-                    .encode(processed, add_special_tokens)
+                    .encode(processed.as_ref(), add_special_tokens)
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
                 encoding.get_tokens().iter().cloned().collect()
             }
             TokenizerBackend::Jieba(jb) => jb
-                .cut(&processed, true)
+                .cut(processed.as_ref(), true)
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
             TokenizerBackend::Lindera(tok) => tok
-                .tokenize(&processed)
+                .tokenize(processed.as_ref())
                 .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?
                 .into_iter()
                 .map(|t| t.surface.to_string())
@@ -85,21 +102,18 @@ impl TokenizerBackend {
         lowercase: bool,
         remove_punctuation: bool,
     ) -> Result<Vec<(String, i64, i64)>> {
-        let processed = if lowercase {
-            text.to_lowercase()
-        } else {
-            text.to_string()
-        };
+        let processed = self.preprocess(text, lowercase);
+        let processed_ref: &str = processed.as_ref();
 
         let raw: Vec<(String, i64, i64)> = match self {
             TokenizerBackend::HuggingFace(tokenizer) => {
                 let encoding = tokenizer
-                    .encode(processed.as_str(), false)
+                    .encode(processed_ref, false)
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
                 let toks = encoding.get_tokens();
                 let offsets = encoding.get_offsets();
                 let char_spans = byte_spans_to_char_spans(
-                    &processed,
+                    processed_ref,
                     offsets.iter().map(|(s, e)| (*s, *e)),
                 );
                 toks.iter()
@@ -108,13 +122,13 @@ impl TokenizerBackend {
                     .collect()
             }
             TokenizerBackend::Jieba(jb) => jb
-                .tokenize(&processed, jieba_rs::TokenizeMode::Default, true)
+                .tokenize(processed_ref, jieba_rs::TokenizeMode::Default, true)
                 .into_iter()
                 .map(|t| (t.word.to_string(), t.start as i64, t.end as i64))
                 .collect(),
             TokenizerBackend::Lindera(tok) => {
                 let toks = tok
-                    .tokenize(&processed)
+                    .tokenize(processed_ref)
                     .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?;
                 // Lindera emits byte offsets; the rest of polars-text speaks in
                 // char offsets (matches Jieba + the HF arm above), so translate
@@ -122,7 +136,7 @@ impl TokenizerBackend {
                 // Single forward sweep over char_indices — O(C + N) instead of
                 // the prior O(C·N) per-token byte_to_char_idx walk.
                 let char_spans = byte_spans_to_char_spans(
-                    &processed,
+                    processed_ref,
                     toks.iter().map(|t| (t.byte_start, t.byte_end)),
                 );
                 toks.into_iter()
@@ -336,6 +350,36 @@ mod tests {
             lindera_dict_for_model_id(LINDERA_KO_DIC_MODEL_ID),
             Some(LinderaDict::KoDic)
         );
+    }
+
+    #[test]
+    fn test_jieba_lowercase_flag_is_noop_for_cjk() {
+        // CJK has no case, so the lowercase flag must produce the same
+        // tokens whether on or off. Before the case_aware() guard, the
+        // backend paid a full to_lowercase() Unicode walk + heap clone
+        // per row for nothing; now it short-circuits to a borrow.
+        let jb = jieba_rs::Jieba::new();
+        let backend = TokenizerBackend::Jieba(jb);
+        let text = "今天天气很好";
+        let tokens_lower = backend.tokenize_text(text, false, true, false).unwrap();
+        let tokens_plain = backend.tokenize_text(text, false, false, false).unwrap();
+        assert_eq!(tokens_lower, tokens_plain);
+
+        let offsets_lower = backend
+            .tokenize_text_with_offsets(text, true, false)
+            .unwrap();
+        let offsets_plain = backend
+            .tokenize_text_with_offsets(text, false, false)
+            .unwrap();
+        assert_eq!(offsets_lower, offsets_plain);
+    }
+
+    #[test]
+    fn test_case_aware_flag() {
+        // Pin the backend-classification contract so future additions
+        // (e.g. a fastText backend for CJK) explicitly opt in or out.
+        let jb = jieba_rs::Jieba::new();
+        assert!(!TokenizerBackend::Jieba(jb).case_aware());
     }
 
     #[test]
