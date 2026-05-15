@@ -2,6 +2,7 @@ use anyhow::Result;
 use polars::prelude::*;
 use regex::RegexBuilder;
 use serde::Deserialize;
+use crate::offsets::byte_spans_to_char_spans;
 use crate::tokenizer::tokenize_plain_text;
 
 #[derive(Deserialize)]
@@ -47,10 +48,6 @@ fn empty_struct_series() -> Series {
         .into_series()
 }
 
-fn byte_to_char_idx(text: &str, byte_idx: usize) -> i64 {
-    text[..byte_idx].chars().count() as i64
-}
-
 fn detokenize(tokens: &[String]) -> String {
     if tokens.is_empty() {
         return String::new();
@@ -84,11 +81,25 @@ pub fn concordance_for_text(
     let mut l1_vals = Vec::new();
     let mut r1_vals = Vec::new();
 
-    for m in matcher.find_iter(text) {
-        let start_byte = m.start();
-        let end_byte = m.end();
-        let start_idx = byte_to_char_idx(text, start_byte);
-        let end_idx = byte_to_char_idx(text, end_byte);
+    // Collect (start_byte, end_byte, matched_text) for every regex hit, then
+    // convert all byte offsets to char offsets in a single forward sweep. The
+    // prior per-match `text[..byte_idx].chars().count()` was O(C·M) which
+    // dominated CPU on CJK documents with many hits; this is O(C + M).
+    let hits: Vec<(usize, usize, String)> = matcher
+        .find_iter(text)
+        .map(|m| (m.start(), m.end(), m.as_str().to_string()))
+        .collect();
+
+    let char_spans = byte_spans_to_char_spans(
+        text,
+        hits.iter().map(|(s, e, _)| (*s, *e)),
+    );
+
+    for ((start_byte, end_byte, matched), (start_idx, end_idx)) in
+        hits.iter().zip(char_spans.into_iter())
+    {
+        let start_byte = *start_byte;
+        let end_byte = *end_byte;
 
         let left_text = &text[..start_byte];
         let right_text = &text[end_byte..];
@@ -119,7 +130,7 @@ pub fn concordance_for_text(
         let r1 = right_slice.first().cloned().unwrap_or_default();
 
         left_contexts.push(detokenize(&left_slice));
-        matched_texts.push(m.as_str().to_string());
+        matched_texts.push(matched.clone());
         right_contexts.push(detokenize(&right_slice));
         start_indices.push(start_idx);
         end_indices.push(end_idx);
@@ -160,17 +171,6 @@ pub fn struct_series_from_matches(matches: Vec<Series>) -> Series {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_byte_to_char_idx_multibyte() {
-        let text = "café";
-        let byte_idx = text.find('é').expect("é should be found");
-        assert_eq!(byte_to_char_idx(text, byte_idx), 3);
-
-        let text = "hi 🙂 there";
-        let byte_idx = text.find('🙂').expect("emoji should be found");
-        assert_eq!(byte_to_char_idx(text, byte_idx), 3);
-    }
 
     #[test]
     fn test_detokenize() {

@@ -5,6 +5,7 @@ use pyo3_polars::PolarsAllocator;
 mod concordance;
 pub mod expressions;
 mod lindera_dict;
+mod offsets;
 mod plan_paths;
 mod pos_tagging;
 mod token_frequencies;

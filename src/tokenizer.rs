@@ -9,6 +9,8 @@ use once_cell::sync::OnceCell;
 use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
 use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer};
 
+use crate::offsets::byte_spans_to_char_spans;
+
 pub const DEFAULT_TOKENIZER_MODEL: &str = "bert-base-uncased";
 const DEFAULT_TOKENIZER_REVISION: &str = "main";
 pub const JIEBA_MODEL_ID: &str = "jieba";
@@ -96,13 +98,13 @@ impl TokenizerBackend {
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
                 let toks = encoding.get_tokens();
                 let offsets = encoding.get_offsets();
+                let char_spans = byte_spans_to_char_spans(
+                    &processed,
+                    offsets.iter().map(|(s, e)| (*s, *e)),
+                );
                 toks.iter()
-                    .zip(offsets.iter())
-                    .map(|(tok, (b_start, b_end))| {
-                        let cs = byte_to_char_idx(&processed, *b_start) as i64;
-                        let ce = byte_to_char_idx(&processed, *b_end) as i64;
-                        (tok.clone(), cs, ce)
-                    })
+                    .zip(char_spans.into_iter())
+                    .map(|(tok, (cs, ce))| (tok.clone(), cs, ce))
                     .collect()
             }
             TokenizerBackend::Jieba(jb) => jb
@@ -116,13 +118,16 @@ impl TokenizerBackend {
                     .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?;
                 // Lindera emits byte offsets; the rest of polars-text speaks in
                 // char offsets (matches Jieba + the HF arm above), so translate
-                // through the same helper before handing back to the caller.
+                // through the batch helper before handing back to the caller.
+                // Single forward sweep over char_indices — O(C + N) instead of
+                // the prior O(C·N) per-token byte_to_char_idx walk.
+                let char_spans = byte_spans_to_char_spans(
+                    &processed,
+                    toks.iter().map(|t| (t.byte_start, t.byte_end)),
+                );
                 toks.into_iter()
-                    .map(|t| {
-                        let cs = byte_to_char_idx(&processed, t.byte_start) as i64;
-                        let ce = byte_to_char_idx(&processed, t.byte_end) as i64;
-                        (t.surface.to_string(), cs, ce)
-                    })
+                    .zip(char_spans.into_iter())
+                    .map(|(t, (cs, ce))| (t.surface.to_string(), cs, ce))
                     .collect()
             }
         };
@@ -136,10 +141,6 @@ impl TokenizerBackend {
 
         Ok(result)
     }
-}
-
-fn byte_to_char_idx(text: &str, byte_idx: usize) -> usize {
-    text.char_indices().take_while(|(b, _)| *b < byte_idx).count()
 }
 
 static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<TokenizerBackend>>>> = OnceCell::new();
