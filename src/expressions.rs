@@ -252,24 +252,23 @@ fn list_token_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
     ))
 }
 
-fn struct_series_from_tokens(tokens: Vec<(String, i64, i64)>) -> Series {
-    let mut tok_col: Vec<String> = Vec::with_capacity(tokens.len());
-    let mut start_col: Vec<i64> = Vec::with_capacity(tokens.len());
-    let mut end_col: Vec<i64> = Vec::with_capacity(tokens.len());
-    for (t, s, e) in tokens {
-        tok_col.push(t);
-        start_col.push(s);
-        end_col.push(e);
-    }
+/// Build one StructChunked from the flat (token, start, end) columns of
+/// **all rows**. Used by the tokenize_with_offsets plugin so the per-row
+/// loop only has to remember each row's `[start_idx, end_idx)` slice into
+/// the flat struct rather than allocate three fresh Series + a fresh
+/// StructChunked per row.
+fn flat_struct_series_from_tokens(
+    tok_col: Vec<String>,
+    start_col: Vec<i64>,
+    end_col: Vec<i64>,
+) -> PolarsResult<Series> {
     let n = tok_col.len();
     let fields = vec![
         Series::new("token".into(), tok_col),
         Series::new("start".into(), start_col),
         Series::new("end".into(), end_col),
     ];
-    StructChunked::from_series(PlSmallStr::EMPTY, n, fields.iter())
-        .expect("struct build should succeed")
-        .into_series()
+    Ok(StructChunked::from_series(PlSmallStr::EMPTY, n, fields.iter())?.into_series())
 }
 
 #[polars_expr(output_type_func=list_token_struct_output)]
@@ -278,31 +277,63 @@ pub fn tokenize_with_offsets(inputs: &[Series], kwargs: TokenizeKwargs) -> Polar
     let backend = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
         .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
+    // Phase 1: tokenise every row, accumulating into flat per-field Vecs
+    // and recording each row's [start, end) span into the flat struct.
+    // Pre-allocate optimistically — chosen to dominate on multi-hundred-
+    // token CJK rows where the prior per-row allocation pattern hurt most.
+    let estimated_tokens = ca.len().saturating_mul(32);
+    let mut tok_col: Vec<String> = Vec::with_capacity(estimated_tokens);
+    let mut start_col: Vec<i64> = Vec::with_capacity(estimated_tokens);
+    let mut end_col: Vec<i64> = Vec::with_capacity(estimated_tokens);
+    let mut row_spans: Vec<(usize, usize)> = Vec::with_capacity(ca.len());
+
+    for opt_text in ca.into_iter() {
+        let span_start = tok_col.len();
+        match opt_text {
+            Some(text) => {
+                let tokens = backend
+                    .tokenize_text_with_offsets(text, kwargs.lowercase, kwargs.remove_punct)
+                    .map_err(|e| {
+                        PolarsError::ComputeError(
+                            format!("Tokenize with offsets failed: {e}").into(),
+                        )
+                    })?;
+                for (t, s, e) in tokens {
+                    tok_col.push(t);
+                    start_col.push(s);
+                    end_col.push(e);
+                }
+            }
+            None => {
+                // Null input maps to an empty list element (matches the
+                // prior behaviour, which also folded null and empty into
+                // ``append_empty``).
+            }
+        }
+        row_spans.push((span_start, tok_col.len()));
+    }
+
+    // Phase 2: build the inner struct ONCE from the flat columns.
+    let inner = flat_struct_series_from_tokens(tok_col, start_col, end_col)
+        .map_err(|e| PolarsError::ComputeError(format!("Struct build failed: {e}").into()))?;
+
+    // Phase 3: emit list rows by slicing the shared inner struct.
+    // ``Series::slice`` is O(1) — it just shifts the chunk's offset/length —
+    // so per-row cost here is bounded by what ``AnonymousOwnedListBuilder``
+    // must do internally to materialise the list, not by additional struct
+    // construction.
     let mut builder = AnonymousOwnedListBuilder::new(
         PlSmallStr::EMPTY,
         ca.len(),
         Some(token_offset_struct_type()),
     );
-
-    for opt_text in ca.into_iter() {
-        let text = match opt_text {
-            Some(value) => value,
-            None => {
-                builder.append_empty();
-                continue;
-            }
-        };
-
-        let tokens = backend
-            .tokenize_text_with_offsets(text, kwargs.lowercase, kwargs.remove_punct)
-            .map_err(|e| PolarsError::ComputeError(format!("Tokenize with offsets failed: {e}").into()))?;
-
-        if tokens.is_empty() {
+    for (s, e) in row_spans {
+        if e == s {
             builder.append_empty();
         } else {
-            let struct_series = struct_series_from_tokens(tokens);
-            builder.append_series(&struct_series).map_err(|e| {
-                PolarsError::ComputeError(format!("List builder failed: {e}").into())
+            let slice = inner.slice(s as i64, e - s);
+            builder.append_series(&slice).map_err(|err| {
+                PolarsError::ComputeError(format!("List builder failed: {err}").into())
             })?;
         }
     }
