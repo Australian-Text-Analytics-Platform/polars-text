@@ -146,33 +146,45 @@ def token_frequency_stats(
         "significance",
     ])
 
+    # Normalised frequencies — used as the building blocks for %DIFF /
+    # relative risk / log ratio below. Corpus 0 is conventionally the
+    # reference and corpus 1 the studied corpus (the radio-selected
+    # block in the Wordflow UI), so the direction-sensitive ratios put
+    # corpus 1 in the numerator: positive %DIFF / LogRatio = "more
+    # frequent in the studied corpus".
+    nf_0 = pl.col("freq_corpus_0") / pl.col("corpus_0_total")
+    nf_1 = pl.col("freq_corpus_1") / pl.col("corpus_1_total")
     result = result.with_columns([
-        (pl.col("freq_corpus_0") / pl.col("corpus_0_total") * 100).alias(
-            "percent_corpus_0"
-        ),
-        (pl.col("freq_corpus_1") / pl.col("corpus_1_total") * 100).alias(
-            "percent_corpus_1"
-        ),
-        (
-            (pl.col("freq_corpus_0") / pl.col("corpus_0_total"))
-            - (pl.col("freq_corpus_1") / pl.col("corpus_1_total"))
-        ).alias("percent_diff"),
+        (nf_0 * 100).alias("percent_corpus_0"),
+        (nf_1 * 100).alias("percent_corpus_1"),
+        # %DIFF per Gabrielatos & Marchi (2012):
+        #   ((NF_studied - NF_reference) / NF_reference) * 100
+        # When the token is absent from the reference corpus the
+        # quantity is theoretically infinite; emit `+Inf` (the API
+        # layer's _safe_float converts it to the "+Inf" string the
+        # frontend already renders as "+∞").
+        pl
+        .when(pl.col("freq_corpus_0") == 0)
+        .then(
+            pl
+            .when(pl.col("freq_corpus_1") > 0)
+            .then(pl.lit(float("inf")))
+            .otherwise(None)
+        )
+        .otherwise(((nf_1 - nf_0) / nf_0) * 100)
+        .alias("percent_diff"),
         pl
         .when(pl.col("freq_corpus_1") > 0)
-        .then(
-            (pl.col("freq_corpus_0") / pl.col("corpus_0_total"))
-            / (pl.col("freq_corpus_1") / pl.col("corpus_1_total"))
-        )
+        .then(nf_0 / nf_1)
         .otherwise(None)
         .alias("relative_risk"),
+        # LogRatio per Hardie (CASS blog, 2014): binary log of the
+        # relative risk with the studied corpus on top, so positive
+        # values point at the studied block (matches the doc + the
+        # significance interpretation in the keyness table).
         pl
         .when((pl.col("freq_corpus_0") > 0) & (pl.col("freq_corpus_1") > 0))
-        .then(
-            (
-                (pl.col("freq_corpus_0") / pl.col("corpus_0_total"))
-                / (pl.col("freq_corpus_1") / pl.col("corpus_1_total"))
-            ).log()
-        )
+        .then((nf_1 / nf_0).log(2.0))
         .otherwise(None)
         .alias("log_ratio"),
         pl
