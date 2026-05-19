@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 import pytest
@@ -94,7 +95,7 @@ def test_replace_source_paths_round_trip(parquet_dataset: Path, tmp_path: Path) 
 
     # The rewritten plan must still be deserializable and collectable.
     reloaded = pl.LazyFrame.deserialize(plbin, format="binary")
-    result = reloaded.collect()
+    result = cast(pl.DataFrame, reloaded.collect())
     assert result.shape == (3, 2)
 
 
@@ -142,7 +143,7 @@ def test_replace_source_paths_multiple_scans(tmp_path: Path) -> None:
     assert changed == 2
 
     reloaded = pl.LazyFrame.deserialize(plbin, format="binary")
-    result = reloaded.collect()
+    result = cast(pl.DataFrame, reloaded.collect())
     assert result.shape == (2, 3)
 
 
@@ -182,7 +183,10 @@ def test_parquet_source_path_replace_with_data_validation(tmp_path: Path) -> Non
     changed = replace_source_paths(plbin, {old_paths[0]: str(relocated_parquet)})
     assert changed == 1
 
-    result = pl.LazyFrame.deserialize(plbin, format="binary").collect()
+    result = cast(
+        pl.DataFrame,
+        pl.LazyFrame.deserialize(plbin, format="binary").collect(),
+    )
     assert result.shape == (3, 2)
     assert result["doc_id"].to_list() == ["d1", "d2", "d4"]
     assert result["word_count"].to_list() == [120, 340, 890]

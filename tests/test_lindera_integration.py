@@ -16,6 +16,7 @@ Run locally with::
 from __future__ import annotations
 
 import os
+from typing import cast
 
 import polars as pl
 import polars_text as pt
@@ -55,14 +56,13 @@ def test_lindera_ja_tokenize_produces_morphemes(
     # `pt.tokenize` returns a List(String) column. `.item(0)` hands back a
     # polars Series (not a Python list); use `.to_list()` to compare with
     # plain Python equality.
-    tokens = (
+    result = cast(
+        pl.DataFrame,
         df.lazy()
         .select(pt.tokenize(pl.col("text"), model=model_id))
-        .collect()
-        .to_series(0)
-        .item(0)
-        .to_list()
+        .collect(),
     )
+    tokens = result.to_series(0).item(0).to_list()
     assert any(
         expected_substring == t or expected_substring in t for t in tokens
     ), (
@@ -73,14 +73,13 @@ def test_lindera_ja_tokenize_produces_morphemes(
 
 def test_lindera_ko_tokenize_produces_morphemes() -> None:
     df = pl.DataFrame({"text": ["한국어 형태소 분석은 흥미롭다"]})
-    tokens = (
+    result = cast(
+        pl.DataFrame,
         df.lazy()
         .select(pt.tokenize(pl.col("text"), model="lindera-ko-dic"))
-        .collect()
-        .to_series(0)
-        .item(0)
-        .to_list()
+        .collect(),
     )
+    tokens = result.to_series(0).item(0).to_list()
     # 한국어 = "Korean (language)"; one of the most common standalone
     # nouns. Whatever the exact ko-dic segmentation, this morpheme
     # should be in the output.
@@ -99,14 +98,13 @@ def test_lindera_offsets_reconstruct_source() -> None:
     df = pl.DataFrame({"text": [text]})
     # `tokenize_with_offsets` returns a List(Struct{token,start,end}).
     # `.to_list()` on the inner Series surfaces a Python list of dicts.
-    rows = (
+    result = cast(
+        pl.DataFrame,
         df.lazy()
         .select(pt.tokenize_with_offsets(pl.col("text"), model="lindera-ja-ipadic"))
-        .collect()
-        .to_series(0)
-        .item(0)
-        .to_list()
+        .collect(),
     )
+    rows = result.to_series(0).item(0).to_list()
     chars = list(text)
     for entry in rows:
         tok = entry["token"]

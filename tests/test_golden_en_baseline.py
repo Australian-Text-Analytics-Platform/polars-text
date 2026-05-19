@@ -18,6 +18,7 @@ To regenerate the goldens after an intentional change:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import polars as pl
 import pytest
@@ -53,22 +54,20 @@ def _compute_token_frequency_top_k() -> pl.DataFrame:
 
 def _compute_concordance() -> pl.DataFrame:
     df = pl.read_csv(FIXTURE_EN)
-    return (
+    concordance_expr = cast(Any, pl.col("text")).text.concordance(
+        CONCORDANCE_KEYWORD,
+        num_left_tokens=CONTEXT_TOKENS,
+        num_right_tokens=CONTEXT_TOKENS,
+    )
+    return cast(
+        pl.DataFrame,
         df.lazy()
-        .with_columns(
-            pl.col("text")
-            .text.concordance(
-                CONCORDANCE_KEYWORD,
-                num_left_tokens=CONTEXT_TOKENS,
-                num_right_tokens=CONTEXT_TOKENS,
-            )
-            .alias("kwic")
-        )
+        .with_columns(concordance_expr.alias("kwic"))
         .filter(pl.col("kwic").list.len() > 0)
         .explode("kwic")
         .unnest("kwic")
         .drop("text")
-        .collect()
+        .collect(),
     )
 
 

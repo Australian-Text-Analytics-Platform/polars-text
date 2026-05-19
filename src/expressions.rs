@@ -135,7 +135,7 @@ fn is_sentence_terminator(ch: char) -> bool {
             | '。' | '！' | '？'    // CJK full-width (Chinese, Japanese)
             | '۔'                  // Arabic full stop
             | '؟'                  // Arabic question mark
-            | '।' | '॥'             // Devanagari danda / double danda
+            | '।' | '॥' // Devanagari danda / double danda
     )
 }
 

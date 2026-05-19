@@ -9,9 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0"
-candle-core = "0.10"
-candle-nn = "0.10"
-candle-transformers = "0.10"
 hf-hub = "0.5"
 jieba-rs = "0.9"
 # Phase-5 dict download support: `dirs` resolves the per-OS cache dir
@@ -33,9 +30,6 @@ lindera = { version = "3", default-features = false, features = [
     "lindera-ko-dic",
     "lindera-unidic",
 ] }
-linfa = "0.8"
-linfa-clustering = "0.8"
-ndarray = "0.16"
 once_cell = "1"
 # Keep all polars crates on the exact source tree used by Python polars 1.40.0.
 # Building this crate standalone in CI must not rely on an outer workspace patch,

@@ -112,10 +112,8 @@ impl TokenizerBackend {
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
                 let toks = encoding.get_tokens();
                 let offsets = encoding.get_offsets();
-                let char_spans = byte_spans_to_char_spans(
-                    processed_ref,
-                    offsets.iter().map(|(s, e)| (*s, *e)),
-                );
+                let char_spans =
+                    byte_spans_to_char_spans(processed_ref, offsets.iter().map(|(s, e)| (*s, *e)));
                 toks.iter()
                     .zip(char_spans.into_iter())
                     .map(|(tok, (cs, ce))| (tok.clone(), cs, ce))
@@ -148,9 +146,7 @@ impl TokenizerBackend {
 
         let result: Vec<(String, i64, i64)> = raw
             .into_iter()
-            .filter(|(tok, _, _)| {
-                !remove_punctuation || tok.chars().any(|ch| ch.is_alphanumeric())
-            })
+            .filter(|(tok, _, _)| !remove_punctuation || tok.chars().any(|ch| ch.is_alphanumeric()))
             .collect();
 
         Ok(result)
@@ -166,11 +162,18 @@ fn registry() -> &'static RwLock<HashMap<String, Arc<TokenizerBackend>>> {
 pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<TokenizerBackend>> {
     let key = model_id.unwrap_or(DEFAULT_TOKENIZER_MODEL);
 
-    if let Some(tok) = registry().read().unwrap().get(key) {
-        return Ok(Arc::clone(tok));
+    {
+        let map = registry()
+            .read()
+            .map_err(|_| anyhow::anyhow!("tokenizer registry lock poisoned"))?;
+        if let Some(tok) = map.get(key) {
+            return Ok(Arc::clone(tok));
+        }
     }
 
-    let mut map = registry().write().unwrap();
+    let mut map = registry()
+        .write()
+        .map_err(|_| anyhow::anyhow!("tokenizer registry lock poisoned"))?;
     if let Some(tok) = map.get(key) {
         return Ok(Arc::clone(tok));
     }
@@ -218,16 +221,15 @@ fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
 }
 
 pub fn loaded_model_ids() -> Vec<String> {
-    let mut ids: Vec<String> = registry().read().unwrap().keys().cloned().collect();
+    let Ok(map) = registry().read() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = map.keys().cloned().collect();
     ids.sort();
     ids
 }
 
-pub fn tokenize_plain_text(
-    text: &str,
-    lowercase: bool,
-    remove_punctuation: bool,
-) -> Vec<String> {
+pub fn tokenize_plain_text(text: &str, lowercase: bool, remove_punctuation: bool) -> Vec<String> {
     let processed = if lowercase {
         text.to_lowercase()
     } else {
@@ -250,7 +252,9 @@ pub fn tokenize_plain_text(
 
             let token_upper = token.to_ascii_uppercase();
             let bracketed = format!("[{token_upper}]");
-            if special_set.contains(&token_upper.as_str()) || special_set.contains(&bracketed.as_str()) {
+            if special_set.contains(&token_upper.as_str())
+                || special_set.contains(&bracketed.as_str())
+            {
                 return None;
             }
 
@@ -266,9 +270,9 @@ pub fn tokenize_plain_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        lindera_dict_for_model_id, loaded_model_ids, tokenize_plain_text,
-        TokenizerBackend, JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID,
-        LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID,
+        lindera_dict_for_model_id, loaded_model_ids, tokenize_plain_text, TokenizerBackend,
+        JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID, LINDERA_JA_UNIDIC_MODEL_ID,
+        LINDERA_KO_DIC_MODEL_ID,
     };
     use crate::lindera_dict::LinderaDict;
 

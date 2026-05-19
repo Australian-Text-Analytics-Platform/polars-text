@@ -1,14 +1,8 @@
 """Recommended tokenizer models per language + prefetch / inventory helpers.
 
-This module is intentionally small. It captures the curated set of
-HuggingFace tokenizer model IDs we ship Phase 1 with, plus thin Python
-wrappers around the Rust registry so the backend can pre-warm the
-cache or report which models are loaded.
-
-Phase 1 only exposes the **tokenizer** registry through Python.
-POS-tagging and embedder registries (also restructured in Phase 1.4 / 1.5)
-get their public surface in Phase 3 (per-tool language routing) and
-Phase 3.1 (embedder selection).
+This module is intentionally small. It captures the curated set of tokenizer
+model IDs plus thin Python wrappers around the Rust tokenizer registry so the
+backend can pre-warm the cache or report which models are loaded.
 """
 
 from __future__ import annotations

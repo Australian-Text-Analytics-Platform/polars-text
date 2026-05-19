@@ -1,9 +1,9 @@
+use crate::offsets::byte_spans_to_char_spans;
+use crate::tokenizer::tokenize_plain_text;
 use anyhow::Result;
 use polars::prelude::*;
 use regex::RegexBuilder;
 use serde::Deserialize;
-use crate::offsets::byte_spans_to_char_spans;
-use crate::tokenizer::tokenize_plain_text;
 
 #[derive(Deserialize)]
 pub struct ConcordanceKwargs {
@@ -55,10 +55,7 @@ fn detokenize(tokens: &[String]) -> String {
     tokens.join(" ")
 }
 
-pub fn concordance_for_text(
-    text: &str,
-    kwargs: &ConcordanceKwargs,
-) -> Result<Vec<Series>> {
+pub fn concordance_for_text(text: &str, kwargs: &ConcordanceKwargs) -> Result<Vec<Series>> {
     if kwargs.search_word.is_empty() {
         return Ok(Vec::new());
     }
@@ -90,10 +87,7 @@ pub fn concordance_for_text(
         .map(|m| (m.start(), m.end(), m.as_str().to_string()))
         .collect();
 
-    let char_spans = byte_spans_to_char_spans(
-        text,
-        hits.iter().map(|(s, e, _)| (*s, *e)),
-    );
+    let char_spans = byte_spans_to_char_spans(text, hits.iter().map(|(s, e, _)| (*s, *e)));
 
     for ((start_byte, end_byte, matched), (start_idx, end_idx)) in
         hits.iter().zip(char_spans.into_iter())
@@ -159,10 +153,7 @@ pub fn struct_series_from_matches(matches: Vec<Series>) -> Series {
     if matches.is_empty() {
         return empty_struct_series();
     }
-    let length = matches
-        .first()
-        .map(|series| series.len())
-        .unwrap_or(0);
+    let length = matches.first().map(|series| series.len()).unwrap_or(0);
     StructChunked::from_series(PlSmallStr::EMPTY, length, matches.iter())
         .expect("struct build should succeed")
         .into_series()

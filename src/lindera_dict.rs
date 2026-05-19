@@ -19,8 +19,10 @@
 //! Subsequent calls hit the in-process REGISTRY first and never re-enter
 //! this module — `ensure_lindera_tokenizer` is only called on cache miss.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use hf_hub::api::sync::ApiBuilder;
@@ -33,6 +35,8 @@ use lindera::tokenizer::Tokenizer as LinderaTokenizer;
 /// point at a fixture repo by setting this env var.
 const DEFAULT_DICT_REPO: &str = "SIH/lindera-dicts";
 const DICT_REPO_ENV: &str = "LDACA_LINDERA_DICT_REPO";
+const LOCK_RETRY_COUNT: usize = 300;
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Which prebuilt dict to fetch. Mirrors the model-id constants in
 /// `tokenizer.rs` (`LINDERA_JA_IPADIC_MODEL_ID` etc).
@@ -70,6 +74,56 @@ fn cache_root() -> Result<PathBuf> {
     Ok(base.join("ldaca").join("lindera"))
 }
 
+struct DictLock {
+    path: PathBuf,
+}
+
+impl Drop for DictLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_dict_lock(lock_path: &Path) -> Result<DictLock> {
+    for _ in 0..LOCK_RETRY_COUNT {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(_) => {
+                return Ok(DictLock {
+                    path: lock_path.to_path_buf(),
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                thread::sleep(LOCK_RETRY_DELAY);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to acquire Lindera dict lock {lock_path:?}"));
+            }
+        }
+    }
+    bail!("Timed out waiting for Lindera dict lock {lock_path:?}");
+}
+
+fn fresh_extract_dir(root: &Path, kind: LinderaDict) -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before UNIX_EPOCH")?
+        .as_nanos();
+    let path = root.join(format!(
+        ".{}.extract.{}.{}",
+        kind.cache_subdir(),
+        std::process::id(),
+        nonce
+    ));
+    fs::create_dir_all(&path)
+        .with_context(|| format!("Failed to create temp extract dir {path:?}"))?;
+    Ok(path)
+}
+
 /// Returns the absolute path to the extracted dict directory. Downloads
 /// + extracts from HF on cache miss.
 pub fn ensure_dict(kind: LinderaDict) -> Result<PathBuf> {
@@ -82,11 +136,15 @@ pub fn ensure_dict(kind: LinderaDict) -> Result<PathBuf> {
         return Ok(dict_dir);
     }
 
-    fs::create_dir_all(&root)
-        .with_context(|| format!("Failed to create cache dir {root:?}"))?;
+    fs::create_dir_all(&root).with_context(|| format!("Failed to create cache dir {root:?}"))?;
 
-    let repo_id =
-        std::env::var(DICT_REPO_ENV).unwrap_or_else(|_| DEFAULT_DICT_REPO.to_string());
+    let lock_path = root.join(format!(".{}.lock", kind.cache_subdir()));
+    let _lock = acquire_dict_lock(&lock_path)?;
+    if dict_dir.join("matrix.mtx").is_file() {
+        return Ok(dict_dir);
+    }
+
+    let repo_id = std::env::var(DICT_REPO_ENV).unwrap_or_else(|_| DEFAULT_DICT_REPO.to_string());
     let api = ApiBuilder::from_env()
         .build()
         .context("Failed to initialize hf-hub client")?;
@@ -98,24 +156,36 @@ pub fn ensure_dict(kind: LinderaDict) -> Result<PathBuf> {
         )
     })?;
 
-    extract_tar_gz(&archive_path, &root)
+    let extract_dir = fresh_extract_dir(&root, kind)?;
+    extract_tar_gz(&archive_path, &extract_dir)
         .with_context(|| format!("Failed to extract {archive_path:?}"))?;
 
-    if !dict_dir.join("matrix.mtx").is_file() {
+    let extracted_dict_dir = extract_dir.join(kind.cache_subdir());
+
+    if !extracted_dict_dir.join("matrix.mtx").is_file() {
+        let _ = fs::remove_dir_all(&extract_dir);
         bail!(
             "Lindera dict archive {archive} did not extract \
              to {expected:?}/matrix.mtx — repo layout may have changed",
             archive = kind.archive_name(),
-            expected = dict_dir,
+            expected = extracted_dict_dir,
         );
     }
+
+    if dict_dir.exists() {
+        fs::remove_dir_all(&dict_dir)
+            .with_context(|| format!("Failed to remove incomplete dict dir {dict_dir:?}"))?;
+    }
+    fs::rename(&extracted_dict_dir, &dict_dir)
+        .with_context(|| format!("Failed to move {extracted_dict_dir:?} to {dict_dir:?}"))?;
+    let _ = fs::remove_dir_all(&extract_dir);
     Ok(dict_dir)
 }
 
 fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     use flate2::read::GzDecoder;
-    let f = fs::File::open(archive_path)
-        .with_context(|| format!("Failed to open {archive_path:?}"))?;
+    let f =
+        fs::File::open(archive_path).with_context(|| format!("Failed to open {archive_path:?}"))?;
     let gz = GzDecoder::new(f);
     let mut ar = tar::Archive::new(gz);
     ar.unpack(dest).context("tar extract failed")
@@ -136,7 +206,9 @@ pub fn ensure_lindera_tokenizer(kind: LinderaDict) -> Result<LinderaTokenizer> {
 
 #[cfg(test)]
 mod tests {
-    use super::LinderaDict;
+    use super::{acquire_dict_lock, LinderaDict};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn archive_and_subdir_names_are_distinct_per_kind() {
@@ -154,5 +226,29 @@ mod tests {
                 assert_ne!(a.cache_subdir(), b.cache_subdir());
             }
         }
+    }
+
+    #[test]
+    fn dict_lock_is_released_on_drop() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ldaca-lindera-lock-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let lock_path = dir.join("dict.lock");
+
+        {
+            let _lock = acquire_dict_lock(&lock_path).expect("first lock");
+            assert!(lock_path.exists());
+        }
+
+        assert!(!lock_path.exists());
+        let _lock = acquire_dict_lock(&lock_path).expect("second lock");
+        assert!(fs::metadata(&lock_path).is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

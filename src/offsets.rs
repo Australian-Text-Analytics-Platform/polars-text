@@ -73,7 +73,12 @@ mod tests {
         let byte_spans = vec![(0, 3), (4, 9), (10, 15), (16, 19)];
         let expected: Vec<(i64, i64)> = byte_spans
             .iter()
-            .map(|(s, e)| (byte_to_char_idx_naive(text, *s), byte_to_char_idx_naive(text, *e)))
+            .map(|(s, e)| {
+                (
+                    byte_to_char_idx_naive(text, *s),
+                    byte_to_char_idx_naive(text, *e),
+                )
+            })
             .collect();
         let got = byte_spans_to_char_spans(text, byte_spans.into_iter());
         assert_eq!(got, expected);
@@ -96,7 +101,12 @@ mod tests {
         ];
         let expected: Vec<(i64, i64)> = byte_spans
             .iter()
-            .map(|(s, e)| (byte_to_char_idx_naive(text, *s), byte_to_char_idx_naive(text, *e)))
+            .map(|(s, e)| {
+                (
+                    byte_to_char_idx_naive(text, *s),
+                    byte_to_char_idx_naive(text, *e),
+                )
+            })
             .collect();
         let got = byte_spans_to_char_spans(text, byte_spans.clone().into_iter());
         assert_eq!(got, expected);
@@ -113,14 +123,22 @@ mod tests {
         let smile_byte = text.find('🙂').unwrap();
         let wave_byte = text.find('👋').unwrap();
         let byte_spans = vec![
-            (0, 2),                                // "hi"
+            (0, 2), // "hi"
             (smile_byte, smile_byte + '🙂'.len_utf8()),
-            (smile_byte + '🙂'.len_utf8() + 1, smile_byte + '🙂'.len_utf8() + 6), // "there"
+            (
+                smile_byte + '🙂'.len_utf8() + 1,
+                smile_byte + '🙂'.len_utf8() + 6,
+            ), // "there"
             (wave_byte, wave_byte + '👋'.len_utf8()),
         ];
         let expected: Vec<(i64, i64)> = byte_spans
             .iter()
-            .map(|(s, e)| (byte_to_char_idx_naive(text, *s), byte_to_char_idx_naive(text, *e)))
+            .map(|(s, e)| {
+                (
+                    byte_to_char_idx_naive(text, *s),
+                    byte_to_char_idx_naive(text, *e),
+                )
+            })
             .collect();
         let got = byte_spans_to_char_spans(text, byte_spans.into_iter());
         assert_eq!(got, expected);
