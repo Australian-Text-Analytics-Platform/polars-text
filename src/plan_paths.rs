@@ -29,142 +29,154 @@ fn store_plan(path: &Path, plan: &DslPlan) -> Result<(), String> {
         .map_err(|e| format!("failed to serialize plan: {e}"))
 }
 
-fn walk_collect(plan: &DslPlan, out: &mut Vec<String>) {
-    match plan {
-        DslPlan::Scan { sources, .. } => {
-            if let ScanSources::Paths(paths) = sources {
-                for p in paths.as_ref() {
-                    out.push(p.as_str().to_string());
-                }
-            }
+fn collect_scan_sources(sources: &ScanSources, out: &mut Vec<String>) {
+    if let ScanSources::Paths(paths) = sources {
+        for p in paths.as_ref() {
+            out.push(p.as_str().to_string());
         }
-        DslPlan::Filter { input, .. } => walk_collect(input, out),
-        DslPlan::Cache { input, .. } => walk_collect(input, out),
-        DslPlan::Select { input, .. } => walk_collect(input, out),
-        DslPlan::GroupBy { input, .. } => walk_collect(input, out),
+    }
+}
+
+fn rewrite_scan_sources(sources: &mut ScanSources, mapper: &HashMap<String, String>) -> usize {
+    let ScanSources::Paths(paths) = sources else {
+        return 0;
+    };
+
+    let mut changed = 0usize;
+    let mut new_paths: Vec<PlRefPath> = Vec::with_capacity(paths.len());
+    for p in paths.as_ref() {
+        let current = p.as_str();
+        if let Some(replacement) = mapper.get(current) {
+            new_paths.push(PlRefPath::new(replacement.as_str()));
+            changed += 1;
+        } else {
+            new_paths.push(p.clone());
+        }
+    }
+
+    if changed > 0 {
+        *sources = ScanSources::Paths(Buffer::from_iter(new_paths));
+    }
+
+    changed
+}
+
+fn visit_children(plan: &DslPlan, visit: &mut impl FnMut(&DslPlan)) {
+    match plan {
+        DslPlan::Filter { input, .. }
+        | DslPlan::Cache { input, .. }
+        | DslPlan::Select { input, .. }
+        | DslPlan::GroupBy { input, .. }
+        | DslPlan::HStack { input, .. }
+        | DslPlan::MatchToSchema { input, .. }
+        | DslPlan::Distinct { input, .. }
+        | DslPlan::Sort { input, .. }
+        | DslPlan::Slice { input, .. }
+        | DslPlan::MapFunction { input, .. }
+        | DslPlan::Sink { input, .. } => visit(input.as_ref()),
         DslPlan::Join {
             input_left,
             input_right,
             ..
         } => {
-            walk_collect(input_left, out);
-            walk_collect(input_right, out);
+            visit(input_left.as_ref());
+            visit(input_right.as_ref());
         }
-        DslPlan::HStack { input, .. } => walk_collect(input, out),
-        DslPlan::MatchToSchema { input, .. } => walk_collect(input, out),
         DslPlan::PipeWithSchema { input, .. } => {
             for child in input.iter() {
-                walk_collect(child, out);
+                visit(child);
             }
         }
-        DslPlan::Distinct { input, .. } => walk_collect(input, out),
-        DslPlan::Sort { input, .. } => walk_collect(input, out),
-        DslPlan::Slice { input, .. } => walk_collect(input, out),
-        DslPlan::MapFunction { input, .. } => walk_collect(input, out),
-        DslPlan::Union { inputs, .. } => {
+        DslPlan::Union { inputs, .. } | DslPlan::HConcat { inputs, .. } => {
             for child in inputs {
-                walk_collect(child, out);
-            }
-        }
-        DslPlan::HConcat { inputs, .. } => {
-            for child in inputs {
-                walk_collect(child, out);
+                visit(child);
             }
         }
         DslPlan::ExtContext { input, contexts } => {
-            walk_collect(input, out);
-            for c in contexts {
-                walk_collect(c, out);
+            visit(input.as_ref());
+            for context in contexts {
+                visit(context);
             }
         }
-        DslPlan::Sink { input, .. } => walk_collect(input, out),
         DslPlan::SinkMultiple { inputs } => {
             for child in inputs {
-                walk_collect(child, out);
+                visit(child);
             }
         }
-        DslPlan::IR { dsl, .. } => walk_collect(dsl, out),
-        DslPlan::DataFrameScan { .. } => {}
-        // Future or cfg-gated variants (PythonScan, MergeSorted, Pivot)
+        DslPlan::IR { dsl, .. } => visit(dsl.as_ref()),
+        DslPlan::Scan { .. } | DslPlan::DataFrameScan { .. } => {}
         _ => {}
     }
 }
 
-fn walk_rewrite(plan: &mut DslPlan, mapper: &HashMap<String, String>) -> usize {
-    let mut changed = 0usize;
+fn visit_children_mut(plan: &mut DslPlan, visit: &mut impl FnMut(&mut DslPlan)) {
     match plan {
-        DslPlan::Scan { sources, .. } => {
-            if let ScanSources::Paths(paths) = sources {
-                let mut new_paths: Vec<PlRefPath> = Vec::with_capacity(paths.len());
-                let mut any_changed = false;
-                for p in paths.as_ref() {
-                    let current = p.as_str();
-                    if let Some(replacement) = mapper.get(current) {
-                        new_paths.push(PlRefPath::new(replacement.as_str()));
-                        any_changed = true;
-                        changed += 1;
-                    } else {
-                        new_paths.push(p.clone());
-                    }
-                }
-                if any_changed {
-                    *sources = ScanSources::Paths(Buffer::from_iter(new_paths));
-                }
-            }
-        }
-        DslPlan::Filter { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::Cache { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::Select { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::GroupBy { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
+        DslPlan::Filter { input, .. }
+        | DslPlan::Cache { input, .. }
+        | DslPlan::Select { input, .. }
+        | DslPlan::GroupBy { input, .. }
+        | DslPlan::HStack { input, .. }
+        | DslPlan::MatchToSchema { input, .. }
+        | DslPlan::Distinct { input, .. }
+        | DslPlan::Sort { input, .. }
+        | DslPlan::Slice { input, .. }
+        | DslPlan::MapFunction { input, .. }
+        | DslPlan::Sink { input, .. } => visit(Arc::make_mut(input)),
         DslPlan::Join {
             input_left,
             input_right,
             ..
         } => {
-            changed += walk_rewrite(Arc::make_mut(input_left), mapper);
-            changed += walk_rewrite(Arc::make_mut(input_right), mapper);
-        }
-        DslPlan::HStack { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::MatchToSchema { input, .. } => {
-            changed += walk_rewrite(Arc::make_mut(input), mapper)
+            visit(Arc::make_mut(input_left));
+            visit(Arc::make_mut(input_right));
         }
         DslPlan::PipeWithSchema { input, .. } => {
             let mut owned: Vec<DslPlan> = input.as_ref().to_vec();
             for child in owned.iter_mut() {
-                changed += walk_rewrite(child, mapper);
+                visit(child);
             }
             *input = Arc::from(owned);
         }
-        DslPlan::Distinct { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::Sort { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::Slice { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::MapFunction { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
-        DslPlan::Union { inputs, .. } => {
+        DslPlan::Union { inputs, .. } | DslPlan::HConcat { inputs, .. } => {
             for child in inputs.iter_mut() {
-                changed += walk_rewrite(child, mapper);
-            }
-        }
-        DslPlan::HConcat { inputs, .. } => {
-            for child in inputs.iter_mut() {
-                changed += walk_rewrite(child, mapper);
+                visit(child);
             }
         }
         DslPlan::ExtContext { input, contexts } => {
-            changed += walk_rewrite(Arc::make_mut(input), mapper);
-            for c in contexts.iter_mut() {
-                changed += walk_rewrite(c, mapper);
+            visit(Arc::make_mut(input));
+            for context in contexts.iter_mut() {
+                visit(context);
             }
         }
-        DslPlan::Sink { input, .. } => changed += walk_rewrite(Arc::make_mut(input), mapper),
         DslPlan::SinkMultiple { inputs } => {
             for child in inputs.iter_mut() {
-                changed += walk_rewrite(child, mapper);
+                visit(child);
             }
         }
-        DslPlan::IR { dsl, .. } => changed += walk_rewrite(Arc::make_mut(dsl), mapper),
-        DslPlan::DataFrameScan { .. } => {}
+        DslPlan::IR { dsl, .. } => visit(Arc::make_mut(dsl)),
+        DslPlan::Scan { .. } | DslPlan::DataFrameScan { .. } => {}
         _ => {}
     }
+}
+
+fn walk_collect(plan: &DslPlan, out: &mut Vec<String>) {
+    if let DslPlan::Scan { sources, .. } = plan {
+        collect_scan_sources(sources, out);
+    }
+
+    visit_children(plan, &mut |child| walk_collect(child, out));
+}
+
+fn walk_rewrite(plan: &mut DslPlan, mapper: &HashMap<String, String>) -> usize {
+    let mut changed = match plan {
+        DslPlan::Scan { sources, .. } => rewrite_scan_sources(sources, mapper),
+        _ => 0,
+    };
+
+    visit_children_mut(plan, &mut |child| {
+        changed += walk_rewrite(child, mapper);
+    });
+
     changed
 }
 
