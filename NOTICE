@@ -1,0 +1,23 @@
+polars-text
+Copyright 2025-2026 Language Data Commons of Australia (LDaCA)
+Copyright 2025-2026 Sydney Informatics Hub, The University of Sydney
+
+polars-text is a Rust/PyO3 plugin for Polars providing tokenization,
+concordance, quotation extraction, token-frequency, topic modelling
+embedders, and related text-analytics expressions.
+
+Developed by Sydney Informatics Hub (SIH), The University of Sydney,
+for the Language Data Commons of Australia (LDaCA,
+https://www.ldaca.edu.au) — a national research infrastructure project
+funded by the Australian Research Data Commons (ARDC) and enabled by
+the National Collaborative Research Infrastructure Strategy (NCRIS).
+
+polars-text is developed primarily as a core component of LDaCA
+Wordflow
+(https://github.com/Australian-Text-Analytics-Platform/ldaca-wordflow),
+but is designed to be used independently in research pipelines,
+Jupyter notebooks, and other Polars-based data analyses.
+
+If you use polars-text in research, please cite the Language Data
+Commons of Australia (LDaCA) — see https://www.ldaca.edu.au for the
+recommended citation form.

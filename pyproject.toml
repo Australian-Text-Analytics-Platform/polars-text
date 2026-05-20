@@ -1,9 +1,12 @@
 [project]
 name = "polars-text"
 version = "0.3.0"
-description = "Polars expression plugins for text analysis"
+description = "Polars expression plugins for text analysis (LDaCA Wordflow)"
 readme = "README.md"
 requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Language Data Commons of Australia (LDaCA) and Sydney Informatics Hub, The University of Sydney" }]
 dependencies = ["polars==1.40.0"]
 
 [build-system]

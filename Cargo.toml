@@ -2,6 +2,9 @@
 name = "polars_text"
 version = "0.3.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "Polars expression plugins for text analysis (LDaCA Wordflow)"
+repository = "https://github.com/Australian-Text-Analytics-Platform/polars-text"
 
 [lib]
 name = "polars_text"
