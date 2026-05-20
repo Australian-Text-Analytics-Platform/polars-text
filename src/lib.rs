@@ -1,11 +1,12 @@
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use pyo3_polars::PolarsAllocator;
 
 mod concordance;
 pub mod expressions;
 mod lindera_dict;
 mod plan_paths;
+mod plan_scrub;
 mod pos_tagging;
 mod token_frequencies;
 mod tokenizer;
@@ -21,6 +22,7 @@ fn _internal(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
     _m.add_function(wrap_pyfunction!(token_frequencies_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(list_source_paths_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(replace_source_paths_py, _m)?)?;
+    _m.add_function(wrap_pyfunction!(scrub_plugin_expressions_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(prefetch_tokenizer_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(loaded_tokenizers_py, _m)?)?;
     Ok(())
@@ -42,6 +44,19 @@ fn replace_source_paths_py(path: &str, mapper: &Bound<'_, PyDict>) -> PyResult<u
     }
     plan_paths::replace_source_paths(std::path::Path::new(path), &map)
         .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+#[pyfunction(name = "scrub_plugin_expressions")]
+fn scrub_plugin_expressions_py<'py>(
+    py: Python<'py>,
+    plan_bytes: &Bound<'py, PyBytes>,
+    aliases: Vec<String>,
+    symbol: &str,
+) -> PyResult<(Bound<'py, PyBytes>, usize)> {
+    let bytes_slice = plan_bytes.as_bytes();
+    let (new_bytes, removed) = plan_scrub::scrub_plugin_expressions(bytes_slice, &aliases, symbol)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((PyBytes::new(py, &new_bytes), removed))
 }
 
 #[pyfunction(name = "topic_modeling")]
