@@ -23,6 +23,16 @@ pub const LINDERA_KO_DIC_MODEL_ID: &str = "lindera-ko-dic";
 
 const SPECIAL_TOKENS: &[&str] = &["[CLS]", "[SEP]", "[PAD]", "[UNK]", "[MASK]"];
 
+/// Strip the SentencePiece word-boundary marker ``U+2581`` (`▁`) that
+/// HuggingFace SentencePiece-based tokenisers (XLM-R, T5, ...) prepend
+/// to word-start tokens. The marker is added by the tokeniser — it is
+/// not present in the source text, so byte/char offsets for the
+/// remaining surface are unchanged. For WordPiece-style models
+/// (BERT, ...) tokens never have this prefix so the strip is a no-op.
+fn strip_word_boundary_marker(token: &str) -> &str {
+    token.strip_prefix('\u{2581}').unwrap_or(token)
+}
+
 /// A model-specific tokenizer fronting one of:
 /// - a HuggingFace tokenizer (BERT-family WordPiece, XLM-R SentencePiece, etc.)
 /// - `jieba-rs` for word-level Chinese segmentation
@@ -52,7 +62,11 @@ impl TokenizerBackend {
                 let encoding = tokenizer
                     .encode(processed, add_special_tokens)
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
-                encoding.get_tokens().iter().cloned().collect()
+                encoding
+                    .get_tokens()
+                    .iter()
+                    .map(|t| strip_word_boundary_marker(t).to_string())
+                    .collect()
             }
             TokenizerBackend::Jieba(jb) => jb
                 .cut(&processed, true)
@@ -101,7 +115,7 @@ impl TokenizerBackend {
                     .map(|(tok, (b_start, b_end))| {
                         let cs = byte_to_char_idx(&processed, *b_start) as i64;
                         let ce = byte_to_char_idx(&processed, *b_end) as i64;
-                        (tok.clone(), cs, ce)
+                        (strip_word_boundary_marker(tok).to_string(), cs, ce)
                     })
                     .collect()
             }
