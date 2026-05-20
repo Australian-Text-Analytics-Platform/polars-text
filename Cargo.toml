@@ -44,6 +44,12 @@ once_cell = "1"
 polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", default-features = false, features = [
     "fmt",
     "dtype-struct",
+    # `parquet` enables both the eager `ParquetReader` / `ParquetWriter`
+    # and the LazyFrame parquet scan. Needed by the lazy tokens-cache
+    # lookup expression (`tokenize_with_cache_lookup`) which reads per-
+    # bucket cache files at execution time and appends a fresh delta
+    # parquet for any rows that missed.
+    "parquet",
 ] }
 #
 # polars-plan feature set
@@ -246,3 +252,7 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 tokenizers = "0.22.2"
+# UUID for fresh `<bucket>__delta__<uuid>.parquet` filenames written by
+# the lazy tokens-cache lookup expression. v4 (random) — same as the
+# Python side's `uuid.uuid4().hex` for parity.
+uuid = { version = "1", features = ["v4"] }

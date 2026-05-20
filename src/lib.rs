@@ -9,6 +9,7 @@ mod plan_paths;
 mod pos_tagging;
 mod token_frequencies;
 mod tokenizer;
+mod tokens_cache_io;
 mod topic_modeling;
 
 #[global_allocator]

@@ -7,6 +7,7 @@ from .functions import (
     concordance,
     sentence_count,
     tokenize,
+    tokenize_with_cache_lookup,
     tokenize_with_offsets,
     word_count,
 )
@@ -24,6 +25,7 @@ from .topic_modeling import topic_modeling
 __all__ = [
     "tokenize",
     "tokenize_with_offsets",
+    "tokenize_with_cache_lookup",
     "clean_text",
     "word_count",
     "char_count",

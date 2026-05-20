@@ -7,6 +7,9 @@ use crate::concordance::{
     ConcordanceKwargs,
 };
 use crate::tokenizer::ensure_tokenizer_for_model;
+use crate::tokens_cache_io::{
+    list_bucket_files, load_cache_map, resolve_cache_dir, write_delta, CONTENT_HASH_COLUMN,
+};
 
 fn string_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), DataType::String))
@@ -252,6 +255,21 @@ fn list_token_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
     ))
 }
 
+/// Two-input variant — names the output after the FIRST input (the
+/// source text column), ignoring the second (the precomputed hash). Used
+/// by `tokenize_with_cache_lookup`, which takes (source, hash) but
+/// returns just the tokens list. Keeping a separate function (instead
+/// of reusing `list_token_struct_output`) is just future-proofing —
+/// today both behave identically because both name the output after
+/// index 0, but having a dedicated function makes the
+/// "second input is metadata, not column source" intent explicit.
+fn list_token_struct_output_from_two_inputs(input_fields: &[Field]) -> PolarsResult<Field> {
+    Ok(Field::new(
+        input_fields[0].name().clone(),
+        DataType::List(Box::new(token_offset_struct_type())),
+    ))
+}
+
 fn struct_series_from_tokens(tokens: Vec<(String, i64, i64)>) -> Series {
     let mut tok_col: Vec<String> = Vec::with_capacity(tokens.len());
     let mut start_col: Vec<i64> = Vec::with_capacity(tokens.len());
@@ -310,6 +328,271 @@ pub fn tokenize_with_offsets(inputs: &[Series], kwargs: TokenizeKwargs) -> Polar
     let mut list = builder.finish();
     list.rename(ca.name().clone());
     Ok(list.into_series())
+}
+
+/// Kwargs for the lazy tokens-cache lookup expression. Stays in sync
+/// with `polars_text.tokenize_with_cache_lookup` on the Python side
+/// (see `polars_text/functions.py`). All fields are baked into the
+/// serialised `.plbin` plan; none of them carry absolute paths — that
+/// is the central portability win of the lazy design.
+#[derive(serde::Deserialize)]
+struct TokenizeWithCacheKwargs {
+    // Tokeniser knobs — same semantics as `TokenizeKwargs`. The
+    // expression delegates per-row tokenisation to the same backend
+    // `tokenize_with_offsets` uses, so output is byte-identical on
+    // cache miss.
+    lowercase: bool,
+    remove_punct: bool,
+    #[serde(default)]
+    model_id: Option<String>,
+
+    // Cache plumbing. The bucket filename is a stable hash of
+    // (model, params) — same value Python's `tokens_cache.cache_filename`
+    // produces, so both sides read/write the same files. `user_id`
+    // selects the per-user subdir under `LDACA_TOKENS_CACHE_DIR`.
+    bucket_filename: String,
+    user_id: String,
+
+    // Controls whether a missing `LDACA_TOKENS_CACHE_DIR` env at
+    // execution time is fatal. Set to true in production analysis
+    // workers (bootstrap sets the env); leave false in tests so the
+    // fallback /tmp path keeps the test suite hermetic.
+    #[serde(default = "default_require_env")]
+    require_env_cache_dir: bool,
+}
+
+fn default_require_env() -> bool {
+    false
+}
+
+/// Lazy tokens-cache lookup expression.
+///
+/// Takes two inputs:
+///
+/// * `inputs[0]` — the source text column (`Utf8`).
+/// * `inputs[1]` — the precomputed content-hash column (`UInt64`),
+///   produced on the Python side by `pl.col(source).hash()`. We accept
+///   it precomputed (instead of recomputing inside Rust) so the cache
+///   lookup is guaranteed bit-compatible with whatever hash function
+///   the Python eager pipeline uses to populate the same bucket — and
+///   so Phase 2.5 plan migration preserves cache hits without us having
+///   to match polars' internal hash defaults from the Rust side.
+///
+/// Per-row semantics:
+///
+/// 1. Look the precomputed hash up in the per-bucket cache map (loaded
+///    once per expression invocation from disk under
+///    `LDACA_TOKENS_CACHE_DIR / user_id / tokens / <bucket>{,__delta__*}.parquet`).
+/// 2. Cache hit → emit the cached `List<Struct<token, start, end>>` row.
+///    Cache miss → call the same `tokenize_text_with_offsets` backend
+///    that `tokenize_with_offsets` uses, emit the result AND queue the
+///    (hash, tokens) pair for a fresh delta-file write.
+/// 3. If any rows missed, write `<bucket>__delta__<uuid>.parquet`
+///    under an advisory `flock` so concurrent workers don't race over
+///    the same bytes.
+///
+/// `is_elementwise = false` on the Python wrapper side — the expression
+/// maintains state across rows within a batch (the in-memory cache map),
+/// so polars must not split a batch in ways that violate that invariant.
+#[polars_expr(output_type_func=list_token_struct_output_from_two_inputs)]
+pub fn tokenize_with_cache_lookup(
+    inputs: &[Series],
+    kwargs: TokenizeWithCacheKwargs,
+) -> PolarsResult<Series> {
+    if inputs.len() < 2 {
+        return Err(PolarsError::ComputeError(
+            "tokenize_with_cache_lookup: expected 2 inputs (source, precomputed_hash); \
+             pass `pl.col(source).hash()` as the second argument from the Python wrapper."
+                .into(),
+        ));
+    }
+    let ca = inputs[0].str()?;
+    let hashes = inputs[1].u64().map_err(|_| {
+        PolarsError::ComputeError(
+            "tokenize_with_cache_lookup: second input must be UInt64 (the precomputed \
+             content hash from `pl.col(source).hash()`)"
+                .into(),
+        )
+    })?;
+    let cache_dir = resolve_cache_dir(&kwargs.user_id, kwargs.require_env_cache_dir)?;
+    let bucket_files = list_bucket_files(&cache_dir, &kwargs.bucket_filename);
+    let cache_map = load_cache_map(&bucket_files)?;
+
+    let mut builder = AnonymousOwnedListBuilder::new(
+        PlSmallStr::EMPTY,
+        ca.len(),
+        Some(token_offset_struct_type()),
+    );
+
+    // Rows that missed the cache and need to be tokenised + written
+    // back as a new delta. Held until the row scan finishes so a
+    // single delta file captures the whole batch.
+    let mut miss_hashes: Vec<u64> = Vec::new();
+    let mut miss_token_lists: Vec<Series> = Vec::new();
+
+    // Lazily ensure the tokeniser backend exists — only on first miss.
+    // Cache-only hot paths (every row is a hit) never pay the cost of
+    // loading the tokeniser at all.
+    let mut backend_cell: Option<std::sync::Arc<crate::tokenizer::TokenizerBackend>> = None;
+
+    for idx in 0..ca.len() {
+        let Some(text) = ca.get(idx) else {
+            builder.append_empty();
+            continue;
+        };
+        let Some(h) = hashes.get(idx) else {
+            // Null hash — shouldn't happen for non-null strings, but
+            // belt-and-braces: tokenise without caching this row.
+            let tokens =
+                tokenise_with_lazy_backend(&mut backend_cell, kwargs.model_id.as_deref(), text, kwargs.lowercase, kwargs.remove_punct)?;
+            push_tokens_row(&mut builder, tokens)?;
+            continue;
+        };
+
+        if let Some(cached) = cache_map.get(&h) {
+            // Cache HIT — push the cached row from the in-memory map.
+            // Falls through to the miss path on schema mismatch; this
+            // future-proofs against a cache parquet with a different
+            // dtype after a polars upgrade.
+            match cached {
+                AnyValue::List(s) => {
+                    builder.append_series(s).map_err(|e| {
+                        PolarsError::ComputeError(
+                            format!("tokenize_with_cache_lookup: cached row append failed: {e}")
+                                .into(),
+                        )
+                    })?;
+                    continue;
+                }
+                AnyValue::Null => {
+                    builder.append_empty();
+                    continue;
+                }
+                _ => {
+                    // Unexpected dtype — fall through to recompute.
+                }
+            }
+        }
+
+        // Cache MISS — tokenise from scratch, push to output, and queue
+        // for the post-loop delta write.
+        let tokens = tokenise_with_lazy_backend(
+            &mut backend_cell,
+            kwargs.model_id.as_deref(),
+            text,
+            kwargs.lowercase,
+            kwargs.remove_punct,
+        )?;
+        let token_series = if tokens.is_empty() {
+            builder.append_empty();
+            // Even empty token lists belong in the cache — recomputing
+            // them is non-zero work and identical-input → identical-output
+            // is a hard invariant we depend on.
+            empty_tokens_struct_series()
+        } else {
+            let s = struct_series_from_tokens(tokens);
+            builder.append_series(&s).map_err(|e| {
+                PolarsError::ComputeError(
+                    format!("tokenize_with_cache_lookup: tokenise row append failed: {e}").into(),
+                )
+            })?;
+            s
+        };
+        miss_hashes.push(h);
+        miss_token_lists.push(token_series);
+    }
+
+    // Persist misses as a fresh delta parquet so subsequent collects on
+    // this plan (or on related plans sharing the same bucket) get the
+    // cached value back without re-tokenising.
+    if !miss_hashes.is_empty() {
+        write_misses_to_delta(
+            &cache_dir,
+            &kwargs.bucket_filename,
+            miss_hashes,
+            miss_token_lists,
+        )?;
+    }
+
+    let mut list = builder.finish();
+    list.rename(ca.name().clone());
+    Ok(list.into_series())
+}
+
+/// Empty `Struct<token, start, end>` series — used as the "no tokens"
+/// payload for empty-text cache rows so the cache parquet schema is
+/// uniform whether or not a given input row produced tokens.
+fn empty_tokens_struct_series() -> Series {
+    let tok = Series::new_empty("token".into(), &DataType::String);
+    let start = Series::new_empty("start".into(), &DataType::Int64);
+    let end = Series::new_empty("end".into(), &DataType::Int64);
+    StructChunked::from_series(PlSmallStr::EMPTY, 0, [tok, start, end].iter())
+        .expect("empty struct build should succeed")
+        .into_series()
+}
+
+/// Tokeniser-backend lazy init — only loads the model on first miss so
+/// cache-only hot paths skip the cost entirely.
+fn tokenise_with_lazy_backend(
+    backend_cell: &mut Option<std::sync::Arc<crate::tokenizer::TokenizerBackend>>,
+    model_id: Option<&str>,
+    text: &str,
+    lowercase: bool,
+    remove_punct: bool,
+) -> PolarsResult<Vec<(String, i64, i64)>> {
+    if backend_cell.is_none() {
+        let b = ensure_tokenizer_for_model(model_id)
+            .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
+        *backend_cell = Some(b);
+    }
+    let backend = backend_cell.as_ref().expect("just inserted");
+    backend
+        .tokenize_text_with_offsets(text, lowercase, remove_punct)
+        .map_err(|e| PolarsError::ComputeError(format!("Tokenize with offsets failed: {e}").into()))
+}
+
+/// Append a row of pre-computed tokens to the list builder. Extracted so
+/// the null-hash branch above can reuse the same struct-encoding path.
+fn push_tokens_row(
+    builder: &mut AnonymousOwnedListBuilder,
+    tokens: Vec<(String, i64, i64)>,
+) -> PolarsResult<()> {
+    if tokens.is_empty() {
+        builder.append_empty();
+        return Ok(());
+    }
+    let s = struct_series_from_tokens(tokens);
+    builder.append_series(&s).map_err(|e| {
+        PolarsError::ComputeError(format!("tokens row append failed: {e}").into())
+    })
+}
+
+/// Encode the queued misses as a 2-column DataFrame (`hash`, `tokens`)
+/// matching `TOKENS_CACHE_SCHEMA` and append to the bucket as a fresh
+/// delta parquet. No-op if `miss_hashes` is empty — caller guarantees.
+fn write_misses_to_delta(
+    cache_dir: &std::path::Path,
+    bucket_filename: &str,
+    miss_hashes: Vec<u64>,
+    miss_token_lists: Vec<Series>,
+) -> PolarsResult<()> {
+    let hash_series = Series::new(CONTENT_HASH_COLUMN.into(), miss_hashes);
+    let mut list_builder = AnonymousOwnedListBuilder::new(
+        "tokens".into(),
+        miss_token_lists.len(),
+        Some(token_offset_struct_type()),
+    );
+    for s in &miss_token_lists {
+        list_builder.append_series(s).map_err(|e| {
+            PolarsError::ComputeError(
+                format!("tokenize_with_cache_lookup: delta-row encode failed: {e}").into(),
+            )
+        })?;
+    }
+    let tokens_series = list_builder.finish().into_series();
+    let mut df = DataFrame::new_infer_height(vec![hash_series.into(), tokens_series.into()])?;
+    write_delta(cache_dir, bucket_filename, &mut df)?;
+    Ok(())
 }
 
 #[cfg(test)]
