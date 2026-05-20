@@ -44,17 +44,33 @@ fn clean_text_value(text: &str) -> String {
     normalized.trim().to_string()
 }
 
+fn map_string_values(
+    inputs: &[Series],
+    mut map: impl FnMut(&str) -> String,
+) -> PolarsResult<Series> {
+    let ca = inputs[0].str()?;
+    let out: Vec<String> = ca
+        .into_iter()
+        .map(|opt_text| opt_text.map(&mut map).unwrap_or_default())
+        .collect();
+    Ok(Series::new(ca.name().clone(), out))
+}
+
+fn count_string_values(
+    inputs: &[Series],
+    mut count: impl FnMut(&str) -> i64,
+) -> PolarsResult<Series> {
+    let ca = inputs[0].str()?;
+    let out: Vec<i64> = ca
+        .into_iter()
+        .map(|opt_text| opt_text.map(&mut count).unwrap_or(0))
+        .collect();
+    Ok(Series::new(ca.name().clone(), out))
+}
+
 #[polars_expr(output_type_func=string_output)]
 pub fn clean_text(inputs: &[Series]) -> PolarsResult<Series> {
-    let ca = inputs[0].str()?;
-    let mut out: Vec<String> = Vec::with_capacity(ca.len());
-    for opt_text in ca.into_iter() {
-        match opt_text {
-            Some(text) => out.push(clean_text_value(text)),
-            None => out.push(String::new()),
-        }
-    }
-    Ok(Series::new(ca.name().clone(), out))
+    map_string_values(inputs, clean_text_value)
 }
 
 /// Heuristic test for "writing-system characters that are their own word
@@ -83,44 +99,26 @@ pub fn word_count(inputs: &[Series]) -> PolarsResult<Series> {
     // ``pl.col(derived_tokens_col).list.len()``. English / whitespace-
     // tokenised flows are byte-identical: any text with internal whitespace
     // still goes through ``split_whitespace``.
-    let ca = inputs[0].str()?;
-    let mut out: Vec<i64> = Vec::with_capacity(ca.len());
-    for opt_text in ca.into_iter() {
-        let count = match opt_text {
-            Some(text) => {
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    0
-                } else if trimmed.chars().any(|c| c.is_whitespace()) {
-                    trimmed.split_whitespace().count() as i64
-                } else if trimmed.chars().all(is_cjk_word_char) {
-                    trimmed.chars().count() as i64
-                } else {
-                    // Mixed CJK + non-CJK with no whitespace (e.g. CJK
-                    // followed by Latin punctuation): treat the whole run
-                    // as one word, matching the existing semantics.
-                    1
-                }
-            }
-            None => 0,
-        };
-        out.push(count);
-    }
-    Ok(Series::new(ca.name().clone(), out))
+    count_string_values(inputs, |text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            0
+        } else if trimmed.chars().any(|c| c.is_whitespace()) {
+            trimmed.split_whitespace().count() as i64
+        } else if trimmed.chars().all(is_cjk_word_char) {
+            trimmed.chars().count() as i64
+        } else {
+            // Mixed CJK + non-CJK with no whitespace (e.g. CJK followed by
+            // Latin punctuation): treat the whole run as one word, matching
+            // the existing semantics.
+            1
+        }
+    })
 }
 
 #[polars_expr(output_type_func=int_output)]
 pub fn char_count(inputs: &[Series]) -> PolarsResult<Series> {
-    let ca = inputs[0].str()?;
-    let mut out: Vec<i64> = Vec::with_capacity(ca.len());
-    for opt_text in ca.into_iter() {
-        let count = match opt_text {
-            Some(text) => text.chars().count() as i64,
-            None => 0,
-        };
-        out.push(count);
-    }
-    Ok(Series::new(ca.name().clone(), out))
+    count_string_values(inputs, |text| text.chars().count() as i64)
 }
 
 /// Sentence terminators covered by ``sentence_count``. ASCII ``. ! ?``
@@ -144,19 +142,11 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
     // Phase 3.3: terminator set is Unicode-aware. EN flows are byte-identical
     // because the ASCII terminators are still in the set; CJK now splits on
     // ``。！？`` correctly instead of returning 1 for an entire paragraph.
-    let ca = inputs[0].str()?;
-    let mut out: Vec<i64> = Vec::with_capacity(ca.len());
-    for opt_text in ca.into_iter() {
-        let count = match opt_text {
-            Some(text) => text
-                .split(is_sentence_terminator)
-                .filter(|segment| !segment.trim().is_empty())
-                .count() as i64,
-            None => 0,
-        };
-        out.push(count);
-    }
-    Ok(Series::new(ca.name().clone(), out))
+    count_string_values(inputs, |text| {
+        text.split(is_sentence_terminator)
+            .filter(|segment| !segment.trim().is_empty())
+            .count() as i64
+    })
 }
 
 #[polars_expr(output_type_func=list_string_output)]

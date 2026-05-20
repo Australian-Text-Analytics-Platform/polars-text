@@ -7,6 +7,18 @@ from polars.plugins import register_plugin_function
 from .utils import PLUGIN_PATH
 
 
+def _tokenize_kwargs(
+    *, lowercase: bool, remove_punct: bool, model: str | None
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "lowercase": lowercase,
+        "remove_punct": remove_punct,
+    }
+    if model is not None:
+        kwargs["model_id"] = model
+    return kwargs
+
+
 def tokenize(
     expr: IntoExpr,
     *,
@@ -14,17 +26,13 @@ def tokenize(
     remove_punct: bool = True,
     model: str | None = None,
 ) -> pl.Expr:
-    kwargs: dict[str, object] = {
-        "lowercase": lowercase,
-        "remove_punct": remove_punct,
-    }
-    if model is not None:
-        kwargs["model_id"] = model
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
         function_name="tokenize",
         args=expr,
-        kwargs=kwargs,
+        kwargs=_tokenize_kwargs(
+            lowercase=lowercase, remove_punct=remove_punct, model=model
+        ),
         is_elementwise=True,
     )
 
@@ -42,17 +50,13 @@ def tokenize_with_offsets(
     ``lowercase=True``) text. This is the schema Phase 2 persists as a
     tokens column on derived nodes.
     """
-    kwargs: dict[str, object] = {
-        "lowercase": lowercase,
-        "remove_punct": remove_punct,
-    }
-    if model is not None:
-        kwargs["model_id"] = model
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
         function_name="tokenize_with_offsets",
         args=expr,
-        kwargs=kwargs,
+        kwargs=_tokenize_kwargs(
+            lowercase=lowercase, remove_punct=remove_punct, model=model
+        ),
         is_elementwise=True,
     )
 

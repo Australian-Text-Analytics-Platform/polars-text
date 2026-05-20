@@ -26,6 +26,10 @@ pub const LINDERA_KO_DIC_MODEL_ID: &str = "lindera-ko-dic";
 
 const SPECIAL_TOKENS: &[&str] = &["[CLS]", "[SEP]", "[PAD]", "[UNK]", "[MASK]"];
 
+fn keep_token_text(token: &str, remove_punctuation: bool) -> bool {
+    !remove_punctuation || token.chars().any(|ch| ch.is_alphanumeric())
+}
+
 /// A model-specific tokenizer fronting one of:
 /// - a HuggingFace tokenizer (BERT-family WordPiece, XLM-R SentencePiece, etc.)
 /// - `jieba-rs` for word-level Chinese segmentation
@@ -86,9 +90,7 @@ impl TokenizerBackend {
                 .collect(),
         };
 
-        if remove_punctuation {
-            tokens.retain(|tok| tok.chars().any(|ch| ch.is_alphanumeric()));
-        }
+        tokens.retain(|tok| keep_token_text(tok, remove_punctuation));
         Ok(tokens)
     }
 
@@ -146,7 +148,7 @@ impl TokenizerBackend {
 
         let result: Vec<(String, i64, i64)> = raw
             .into_iter()
-            .filter(|(tok, _, _)| !remove_punctuation || tok.chars().any(|ch| ch.is_alphanumeric()))
+            .filter(|(tok, _, _)| keep_token_text(tok, remove_punctuation))
             .collect();
 
         Ok(result)

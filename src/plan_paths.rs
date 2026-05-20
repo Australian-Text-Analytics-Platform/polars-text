@@ -61,54 +61,6 @@ fn rewrite_scan_sources(sources: &mut ScanSources, mapper: &HashMap<String, Stri
     changed
 }
 
-fn visit_children(plan: &DslPlan, visit: &mut impl FnMut(&DslPlan)) {
-    match plan {
-        DslPlan::Filter { input, .. }
-        | DslPlan::Cache { input, .. }
-        | DslPlan::Select { input, .. }
-        | DslPlan::GroupBy { input, .. }
-        | DslPlan::HStack { input, .. }
-        | DslPlan::MatchToSchema { input, .. }
-        | DslPlan::Distinct { input, .. }
-        | DslPlan::Sort { input, .. }
-        | DslPlan::Slice { input, .. }
-        | DslPlan::MapFunction { input, .. }
-        | DslPlan::Sink { input, .. } => visit(input.as_ref()),
-        DslPlan::Join {
-            input_left,
-            input_right,
-            ..
-        } => {
-            visit(input_left.as_ref());
-            visit(input_right.as_ref());
-        }
-        DslPlan::PipeWithSchema { input, .. } => {
-            for child in input.iter() {
-                visit(child);
-            }
-        }
-        DslPlan::Union { inputs, .. } | DslPlan::HConcat { inputs, .. } => {
-            for child in inputs {
-                visit(child);
-            }
-        }
-        DslPlan::ExtContext { input, contexts } => {
-            visit(input.as_ref());
-            for context in contexts {
-                visit(context);
-            }
-        }
-        DslPlan::SinkMultiple { inputs } => {
-            for child in inputs {
-                visit(child);
-            }
-        }
-        DslPlan::IR { dsl, .. } => visit(dsl.as_ref()),
-        DslPlan::Scan { .. } | DslPlan::DataFrameScan { .. } => {}
-        _ => {}
-    }
-}
-
 fn visit_children_mut(plan: &mut DslPlan, visit: &mut impl FnMut(&mut DslPlan)) {
     match plan {
         DslPlan::Filter { input, .. }
@@ -159,14 +111,6 @@ fn visit_children_mut(plan: &mut DslPlan, visit: &mut impl FnMut(&mut DslPlan)) 
     }
 }
 
-fn walk_collect(plan: &DslPlan, out: &mut Vec<String>) {
-    if let DslPlan::Scan { sources, .. } = plan {
-        collect_scan_sources(sources, out);
-    }
-
-    visit_children(plan, &mut |child| walk_collect(child, out));
-}
-
 fn walk_rewrite(plan: &mut DslPlan, mapper: &HashMap<String, String>) -> usize {
     let mut changed = match plan {
         DslPlan::Scan { sources, .. } => rewrite_scan_sources(sources, mapper),
@@ -183,7 +127,11 @@ fn walk_rewrite(plan: &mut DslPlan, mapper: &HashMap<String, String>) -> usize {
 pub fn list_source_paths(path: &Path) -> Result<Vec<String>, String> {
     let plan = load_plan(path)?;
     let mut out = Vec::new();
-    walk_collect(&plan, &mut out);
+    for node in &plan {
+        if let DslPlan::Scan { sources, .. } = node {
+            collect_scan_sources(sources, &mut out);
+        }
+    }
     Ok(out)
 }
 
