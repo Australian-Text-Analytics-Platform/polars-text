@@ -4,14 +4,26 @@ These tests trigger network fetches from HuggingFace Hub on first run
 (same as the existing tokenize / topic-modeling tests). Subsequent runs
 use the cached models.
 
-If running in an environment without network access, mark these
-ignored via pytest -k or set HF_HUB_OFFLINE=1 with cached models.
+Run locally with ``POLARS_TEXT_RUN_HF_TESTS=1 uv run pytest -m network``.
 """
 
 from __future__ import annotations
 
+import os
+
 import polars as pl
 import polars_text as pt
+import pytest
+
+_HF_TESTS_ENV = "POLARS_TEXT_RUN_HF_TESTS"
+
+pytestmark = [
+    pytest.mark.network,
+    pytest.mark.skipif(
+        _HF_TESTS_ENV not in os.environ,
+        reason=f"Set {_HF_TESTS_ENV}=1 to run Hugging Face tokenizer integration tests.",
+    ),
+]
 
 
 # Same multilingual model id we expect to populate the registry in Phase 1.8.

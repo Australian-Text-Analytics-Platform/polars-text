@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
 import polars_text as pt
+import pytest
 from polars_text.models import (
     RECOMMENDED_JA_DICTS,
     RECOMMENDED_TOKENIZERS,
@@ -11,13 +14,17 @@ from polars_text.models import (
     recommended_tokenizer_for,
 )
 
+_HF_TESTS_ENV = "POLARS_TEXT_RUN_HF_TESTS"
+_requires_hf_models = pytest.mark.skipif(
+    _HF_TESTS_ENV not in os.environ,
+    reason=f"Set {_HF_TESTS_ENV}=1 to run Hugging Face model registry integration tests.",
+)
+
 
 def test_recommended_tokenizers_has_core_languages() -> None:
     for lang in ("en", "zh", "ja", "ko", "multi", "fallback"):
         assert lang in RECOMMENDED_TOKENIZERS
-        assert RECOMMENDED_TOKENIZERS[lang], (
-            f"empty tokenizer id for language {lang!r}"
-        )
+        assert RECOMMENDED_TOKENIZERS[lang], f"empty tokenizer id for language {lang!r}"
 
 
 def test_recommended_tokenizer_for_known_languages() -> None:
@@ -41,18 +48,19 @@ def test_recommended_ja_dicts_starts_with_default_ja_model() -> None:
 
 
 def test_recommended_tokenizer_for_unknown_falls_back_to_multi() -> None:
-    assert (
-        recommended_tokenizer_for("klingon")
-        == RECOMMENDED_TOKENIZERS["multi"]
-    )
+    assert recommended_tokenizer_for("klingon") == RECOMMENDED_TOKENIZERS["multi"]
 
 
+@pytest.mark.network
+@_requires_hf_models
 def test_prefetch_model_populates_registry() -> None:
     target = "bert-base-uncased"
     prefetch_model(target)
     assert target in list_loaded_models()
 
 
+@pytest.mark.network
+@_requires_hf_models
 def test_prefetch_model_is_idempotent() -> None:
     target = "bert-base-uncased"
     prefetch_model(target)
