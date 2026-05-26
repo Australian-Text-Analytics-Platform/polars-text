@@ -34,7 +34,9 @@ def test_jieba_produces_word_level_chinese_tokens() -> None:
 
 
 def test_jieba_differs_from_bert_base_chinese() -> None:
-    text = "中国人民解放军"  # "Chinese People's Liberation Army" — a single named entity
+    text = (
+        "中国人民解放军"  # "Chinese People's Liberation Army" — a single named entity
+    )
     jieba_tokens = _tokens_for(text, model="jieba")
     bert_tokens = _tokens_for(text, model="bert-base-chinese")
     # bert-base-chinese should produce char-level tokens (one token per Hanzi).

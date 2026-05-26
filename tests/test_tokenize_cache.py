@@ -38,9 +38,7 @@ def test_cache_schema_has_six_columns(tmp_path: Path) -> None:
     ]
 
 
-def test_warm_cache_does_not_retokenize(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+def test_warm_cache_does_not_retokenize(tmp_path: Path, monkeypatch: Any) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     base = pl.DataFrame({"text": ["hello world", "hello world"]}).lazy()
     expr = pt.tokenize(pl.col("text"), cache=cache_path)

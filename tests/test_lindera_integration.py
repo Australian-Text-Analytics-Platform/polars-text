@@ -58,16 +58,11 @@ def test_lindera_ja_tokenize_produces_morphemes(
     # its dictionaries.
     result = cast(
         pl.DataFrame,
-        df.lazy()
-        .select(pt.tokenize(pl.col("text"), model=model_id))
-        .collect(),
+        df.lazy().select(pt.tokenize(pl.col("text"), model=model_id)).collect(),
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
-    assert any(
-        expected_substring == t or expected_substring in t for t in tokens
-    ), (
-        f"expected {expected_substring!r} morpheme in {model_id} tokens; "
-        f"got {tokens!r}"
+    assert any(expected_substring == t or expected_substring in t for t in tokens), (
+        f"expected {expected_substring!r} morpheme in {model_id} tokens; got {tokens!r}"
     )
 
 
@@ -75,9 +70,7 @@ def test_lindera_ko_tokenize_produces_morphemes() -> None:
     df = pl.DataFrame({"text": ["한국어 형태소 분석은 흥미롭다"]})
     result = cast(
         pl.DataFrame,
-        df.lazy()
-        .select(pt.tokenize(pl.col("text"), model="lindera-ko-dic"))
-        .collect(),
+        df.lazy().select(pt.tokenize(pl.col("text"), model="lindera-ko-dic")).collect(),
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     # 한국어 = "Korean (language)"; one of the most common standalone

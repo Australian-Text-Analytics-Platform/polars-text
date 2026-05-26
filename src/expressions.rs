@@ -308,5 +308,4 @@ mod tests {
         let cleaned = clean_text_value("  Hi--there\t42 ");
         assert_eq!(cleaned, "hi there");
     }
-
 }

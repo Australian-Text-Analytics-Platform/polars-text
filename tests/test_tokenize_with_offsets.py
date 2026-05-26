@@ -3,7 +3,7 @@
 Offsets are character positions into the lowercased (if `lowercase=True`,
 the default) processed text. The schema is `List[Struct{token: String,
 start: Int64, end: Int64}]` and forms the contract Phase 2 uses for the
-persisted tokens column on derived nodes.
+persisted tokenization column on workspace nodes.
 """
 
 from __future__ import annotations
