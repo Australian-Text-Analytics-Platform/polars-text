@@ -33,7 +33,7 @@ the `text` namespace on expressions.
 
 ### Expression functions
 
-- `tokenize(expr, lowercase=True, remove_punct=True)`
+- `tokenize(expr, lowercase=True, remove_punct=True, model=None, cache=None)`
 - `clean_text(expr)`
 - `word_count(expr)`
 - `char_count(expr)`
@@ -51,6 +51,11 @@ out = df.select([
     pl.col("text").text.tokenize().alias("tokens"),
 ])
 ```
+
+`tokenize` returns a list of structs with `token`, `start`, and `end`
+character offsets. Pass `cache=Path("tokens.duckdb")` to persist tokenization
+results in a DuckDB cache and reuse them by content hash; leave `cache=None`
+to compute directly through the Rust plugin.
 
 ## Concordance
 
@@ -85,6 +90,12 @@ stats = pt.token_frequency_stats(freqs_0, freqs_1)
 ```
 
 ## Output schemas
+
+**Tokenization** (list of structs):
+
+- `token`
+- `start`
+- `end`
 
 **Concordance** (list of structs):
 

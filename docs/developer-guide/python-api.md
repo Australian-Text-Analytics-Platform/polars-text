@@ -5,7 +5,6 @@
 `polars_text/__init__.py` exports:
 
 - `tokenize`,
-- `tokenize_with_offsets`,
 - `clean_text`,
 - `word_count`,
 - `char_count`,
@@ -13,8 +12,6 @@
 - `concordance`,
 - `token_frequencies`,
 - `token_frequency_stats`,
-- `list_source_paths`,
-- `replace_source_paths`,
 - tokenizer model registry helpers.
 
 Importing the package also imports `namespace.py`, which registers the `.text`
@@ -36,9 +33,10 @@ pt.tokenize(pl.col("text"))
 pl.col("text").text.tokenize()
 ```
 
-`tokenize_with_offsets()` returns a list of structs with `token`, `start`, and
-`end` character offsets. This is the schema the backend stores as hidden token
-columns on workspace nodes.
+`tokenize()` returns a list of structs with `token`, `start`, and `end`
+character offsets. Passing `cache=Path(...)` uses a DuckDB-backed cache at that
+path; `cache=None` computes directly through the Rust plugin. Wordflow uses the
+cached form only after resolving a per-user cache path in the backend.
 
 ## Namespace API
 
@@ -78,12 +76,9 @@ post-processing over already-counted dictionaries.
 language codes. `prefetch_model()` and `list_loaded_models()` call the Rust
 registry wrappers.
 
-## Plan Path Wrappers
+## Plan Source Utilities
 
-`plan_paths.py` exposes:
-
-- `list_source_paths(path)`,
-- `replace_source_paths(path, mapper)`.
-
-They are exact wrappers over Rust functions and are used by `docworkspace` to
-make serialized LazyFrame plans portable across moved workspace folders.
+Serialized LazyFrame plan source-path listing and rewriting now lives in the
+separate `polars-source-utils` package. `docworkspace` imports that package for
+workspace rebasing so `polars-text` stays focused on tokenizer and text
+expression builds.

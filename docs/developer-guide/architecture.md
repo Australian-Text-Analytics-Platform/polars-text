@@ -11,12 +11,11 @@ The package provides:
   and concordance;
 - a `.text` namespace on Polars expressions;
 - Series-based token-frequency helpers;
-- tokenizer model recommendation and prefetch helpers;
-- utilities to inspect and rewrite file paths inside serialized Polars
-  LazyFrame plans.
+- tokenizer model recommendation and prefetch helpers.
 
-The backend uses these functions directly and also depends on the plan-path
-helpers through `docworkspace`.
+The backend uses these functions directly. Serialized LazyFrame plan source-path
+inspection and rewriting lives in the sibling `polars-source-utils` package and
+is used by `docworkspace`.
 
 ## Main Boundaries
 
@@ -30,12 +29,10 @@ Rust files under `src/` implement the heavy work:
 - `concordance.rs`: regex matching and context-window construction.
 - `offsets.rs`: byte-to-character offset conversion.
 - `token_frequencies.rs`: native token-frequency counting.
-- `plan_paths.rs`: serialized Polars plan inspection and path rewriting.
 
 ## Design Principle
 
 The package keeps Python as the ergonomic API layer and Rust as the execution
 layer. Plugin functions should expose Polars expressions so the caller can keep
 work lazy. Operations that cannot be expression plugins, such as token
-frequency dictionaries and `.plbin` plan rewriting, are exposed as direct PyO3
-functions.
+frequency dictionaries, are exposed as direct PyO3 functions.

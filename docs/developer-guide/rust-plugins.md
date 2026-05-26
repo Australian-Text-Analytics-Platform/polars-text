@@ -21,7 +21,6 @@ Implemented expression plugins include:
 - `char_count`,
 - `sentence_count`,
 - `tokenize`,
-- `tokenize_with_offsets`,
 - `concordance`.
 
 Each plugin declares its output schema through an output-type function. This is
@@ -43,12 +42,10 @@ Arabic sentence marks, and Devanagari danda marks.
 
 ## Tokenization Output
 
-`tokenize` returns `List[String]`.
-
-`tokenize_with_offsets` returns `List[Struct[token: String, start: Int64,
-end: Int64]]`. It tokenizes every row, accumulates flat token/start/end
-vectors, builds one inner struct series, then slices that shared struct into
-per-row list entries. This avoids per-row struct allocation overhead.
+`tokenize` returns `List[Struct[token: String, start: Int64, end: Int64]]`. It
+tokenizes every row, accumulates flat token/start/end vectors, builds one inner
+struct series, then slices that shared struct into per-row list entries. This
+avoids per-row struct allocation overhead.
 
 ## Concordance Output
 

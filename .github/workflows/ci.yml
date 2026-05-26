@@ -65,9 +65,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           container: off
-          # polars-plan's `nightly` feature uses `#![feature(...)]`, which
-          # requires the Rust nightly toolchain.
-          rust-toolchain: nightly
+          rust-toolchain: stable
           args: --release --out dist --interpreter 3.14
 
       - name: Install test dependencies

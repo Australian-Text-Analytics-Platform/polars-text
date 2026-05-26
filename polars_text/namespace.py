@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import polars as pl
 
 from . import functions
@@ -16,26 +18,14 @@ class TextNamespace:
         lowercase: bool = True,
         remove_punct: bool = True,
         model: str | None = None,
+        cache: str | os.PathLike[str] | None = None,
     ) -> pl.Expr:
         return functions.tokenize(
             self._expr,
             lowercase=lowercase,
             remove_punct=remove_punct,
             model=model,
-        )
-
-    def tokenize_with_offsets(
-        self,
-        *,
-        lowercase: bool = True,
-        remove_punct: bool = True,
-        model: str | None = None,
-    ) -> pl.Expr:
-        return functions.tokenize_with_offsets(
-            self._expr,
-            lowercase=lowercase,
-            remove_punct=remove_punct,
-            model=model,
+            cache=cache,
         )
 
     def concordance(

@@ -35,7 +35,7 @@ def _tokens_for(text: str, *, model: str | None) -> list[str]:
     df = pl.DataFrame({"text": [text]})
     out = df.select(pt.tokenize(pl.col("text"), model=model))
     series = out["text"].to_list()[0]
-    return list(series)
+    return [entry["token"] for entry in series]
 
 
 def test_default_model_omits_model_id_kwarg() -> None:

@@ -10,6 +10,9 @@ def test_tokenize_expr() -> None:
     df = pl.DataFrame({"text": ["Hello, world!", None]})
     out = df.select(pt.tokenize(pl.col("text"), model="jieba"))
     assert out.shape == (2, 1)
+    rows = out["text"].to_list()
+    assert rows[0][0]["token"]
+    assert list(rows[1]) == []
 
 
 def test_tokenize_namespace() -> None:
@@ -17,3 +20,6 @@ def test_tokenize_namespace() -> None:
     text_expr = cast(Any, pl.col("text"))
     out = df.select(text_expr.text.tokenize(model="jieba"))
     assert out.shape == (2, 1)
+    rows = out["text"].to_list()
+    assert rows[0][0]["token"]
+    assert list(rows[1]) == []

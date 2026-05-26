@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+
 import polars as pl
 from polars._typing import IntoExpr
 from polars.plugins import register_plugin_function
 
+from .token_cache import cached_tokenize_expr, uncached_tokenize_expr
 from .utils import PLUGIN_PATH
 
 
@@ -25,39 +28,29 @@ def tokenize(
     lowercase: bool = True,
     remove_punct: bool = True,
     model: str | None = None,
-) -> pl.Expr:
-    return register_plugin_function(
-        plugin_path=PLUGIN_PATH,
-        function_name="tokenize",
-        args=expr,
-        kwargs=_tokenize_kwargs(
-            lowercase=lowercase, remove_punct=remove_punct, model=model
-        ),
-        is_elementwise=True,
-    )
-
-
-def tokenize_with_offsets(
-    expr: IntoExpr,
-    *,
-    lowercase: bool = True,
-    remove_punct: bool = True,
-    model: str | None = None,
+    cache: str | os.PathLike[str] | None = None,
 ) -> pl.Expr:
     """Tokenize and emit a list of ``{token, start, end}`` structs per row.
 
     ``start`` / ``end`` are character offsets into the (lowercased, if
-    ``lowercase=True``) text. This is the schema Phase 2 persists as a
-    tokens column on derived nodes.
+    ``lowercase=True``) text. If ``cache`` is a path, tokenization results are
+    persisted in a DuckDB cache at that location and reused by content hash.
     """
-    return register_plugin_function(
-        plugin_path=PLUGIN_PATH,
-        function_name="tokenize_with_offsets",
-        args=expr,
-        kwargs=_tokenize_kwargs(
-            lowercase=lowercase, remove_punct=remove_punct, model=model
-        ),
-        is_elementwise=True,
+    if cache is None:
+        return uncached_tokenize_expr(
+            expr,
+            lowercase=lowercase,
+            remove_punct=remove_punct,
+            model=model,
+        )
+    if not isinstance(expr, pl.Expr):
+        expr = pl.col(expr) if isinstance(expr, str) else pl.lit(expr)
+    return cached_tokenize_expr(
+        expr,
+        cache=cache,
+        lowercase=lowercase,
+        remove_punct=remove_punct,
+        model=model,
     )
 
 
@@ -123,7 +116,6 @@ def sentence_count(expr: IntoExpr) -> pl.Expr:
 
 __all__ = [
     "tokenize",
-    "tokenize_with_offsets",
     "concordance",
     "clean_text",
     "word_count",

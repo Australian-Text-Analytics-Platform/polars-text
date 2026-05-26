@@ -53,16 +53,16 @@ def test_lindera_ja_tokenize_produces_morphemes(
     model_id: str, expected_substring: str
 ) -> None:
     df = pl.DataFrame({"text": ["関西国際空港でトートバッグを買った"]})
-    # `pt.tokenize` returns a List(String) column. `.item(0)` hands back a
-    # polars Series (not a Python list); use `.to_list()` to compare with
-    # plain Python equality.
+    # `pt.tokenize` returns List(Struct{token,start,end}); `.item(0)` hands
+    # back a polars Series (not a Python list), so extract token strings from
+    # its dictionaries.
     result = cast(
         pl.DataFrame,
         df.lazy()
         .select(pt.tokenize(pl.col("text"), model=model_id))
         .collect(),
     )
-    tokens = result.to_series(0).item(0).to_list()
+    tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     assert any(
         expected_substring == t or expected_substring in t for t in tokens
     ), (
@@ -79,7 +79,7 @@ def test_lindera_ko_tokenize_produces_morphemes() -> None:
         .select(pt.tokenize(pl.col("text"), model="lindera-ko-dic"))
         .collect(),
     )
-    tokens = result.to_series(0).item(0).to_list()
+    tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     # 한국어 = "Korean (language)"; one of the most common standalone
     # nouns. Whatever the exact ko-dic segmentation, this morpheme
     # should be in the output.
@@ -89,19 +89,19 @@ def test_lindera_ko_tokenize_produces_morphemes() -> None:
 
 
 def test_lindera_offsets_reconstruct_source() -> None:
-    """tokenize_with_offsets must emit char offsets that re-slice the
+    """tokenize must emit char offsets that re-slice the
     original text — same invariant as the Jieba offset test in
     test_jieba_chinese.py. Catches the byte-vs-char conversion bug
     that bit us during the topic-modelling CJK fix.
     """
     text = "今日は良い天気"
     df = pl.DataFrame({"text": [text]})
-    # `tokenize_with_offsets` returns a List(Struct{token,start,end}).
+    # `tokenize` returns a List(Struct{token,start,end}).
     # `.to_list()` on the inner Series surfaces a Python list of dicts.
     result = cast(
         pl.DataFrame,
         df.lazy()
-        .select(pt.tokenize_with_offsets(pl.col("text"), model="lindera-ja-ipadic"))
+        .select(pt.tokenize(pl.col("text"), model="lindera-ja-ipadic"))
         .collect(),
     )
     rows = result.to_series(0).item(0).to_list()
@@ -111,7 +111,7 @@ def test_lindera_offsets_reconstruct_source() -> None:
         start = int(entry["start"])
         end = int(entry["end"])
         # Char-indexed slicing matches the offset convention emitted by
-        # tokenize_with_offsets (Jieba does the same).
+        # tokenize (Jieba does the same).
         extracted = "".join(chars[start:end])
         assert tok == extracted, (
             f"Lindera offset mismatch for {tok!r} ({start}..{end}); "

@@ -7,7 +7,6 @@ from .functions import (
     concordance,
     sentence_count,
     tokenize,
-    tokenize_with_offsets,
     word_count,
 )
 from .models import (
@@ -17,12 +16,10 @@ from .models import (
     prefetch_model,
     recommended_tokenizer_for,
 )
-from .plan_paths import list_source_paths, replace_source_paths
 from .token_frequencies import token_frequencies, token_frequency_stats
 
 __all__ = [
     "tokenize",
-    "tokenize_with_offsets",
     "clean_text",
     "word_count",
     "char_count",
@@ -30,8 +27,6 @@ __all__ = [
     "concordance",
     "token_frequencies",
     "token_frequency_stats",
-    "list_source_paths",
-    "replace_source_paths",
     "RECOMMENDED_JA_DICTS",
     "RECOMMENDED_TOKENIZERS",
     "list_loaded_models",

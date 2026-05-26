@@ -1,4 +1,4 @@
-# Tokenizers And Plan Paths
+# Tokenizers
 
 ## Tokenizer Registry
 
@@ -51,16 +51,7 @@ concordance context tokenization without loading a full model backend.
 
 ## Serialized Plan Paths
 
-Polars `.plbin` files can store absolute file paths for scan nodes. Moving a
-workspace would normally break those plans.
-
-`src/plan_paths.rs` deserializes a `DslPlan`, walks the tree, and inspects or
-rewrites `DslPlan::Scan` sources:
-
-- `list_source_paths(path)` returns scan source paths in depth-first order.
-- `replace_source_paths(path, mapper)` applies exact path substitutions and
-  writes the plan back only if something changed.
-
-The Cargo feature set for Polars plan deserialization must include all plan
-variants the app can serialize. Tests cover random sample and joined scans
-because missing Polars features surface as plan-deserialization errors.
+Polars `.plbin` source-path listing and rewriting moved to the sibling
+`polars-source-utils` package. That package carries the broad `polars-plan`
+feature surface needed for plan deserialization; `polars-text` only keeps the
+text-processing plugin and tokenizer code.

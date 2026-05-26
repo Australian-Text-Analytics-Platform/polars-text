@@ -16,7 +16,7 @@ import polars_text as pt
 def _tokens_for(text: str, *, model: str | None) -> list[str]:
     df = pl.DataFrame({"text": [text]})
     out = df.select(pt.tokenize(pl.col("text"), model=model))
-    return list(out["text"].to_list()[0])
+    return [entry["token"] for entry in out["text"].to_list()[0]]
 
 
 def test_jieba_produces_word_level_chinese_tokens() -> None:

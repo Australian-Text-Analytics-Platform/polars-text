@@ -149,33 +149,6 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
     })
 }
 
-#[polars_expr(output_type_func=list_string_output)]
-pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
-    let ca = inputs[0].str()?;
-    let backend = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
-        .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
-
-    let mut out: Vec<Option<Series>> = Vec::with_capacity(ca.len());
-    for opt_text in ca.into_iter() {
-        let text = match opt_text {
-            Some(value) => value,
-            None => {
-                out.push(Some(Series::new(PlSmallStr::EMPTY, Vec::<String>::new())));
-                continue;
-            }
-        };
-
-        let tokens = backend
-            .tokenize_text(text, false, kwargs.lowercase, kwargs.remove_punct)
-            .map_err(|e| PolarsError::ComputeError(format!("Tokenization failed: {e}").into()))?;
-        out.push(Some(Series::new(PlSmallStr::EMPTY, tokens)));
-    }
-
-    let mut list = ListChunked::from_iter(out);
-    list.rename(ca.name().clone());
-    Ok(list.into_series())
-}
-
 #[polars_expr(output_type_func=list_struct_output)]
 pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
@@ -220,13 +193,6 @@ struct TokenizeKwargs {
     model_id: Option<String>,
 }
 
-fn list_string_output(input_fields: &[Field]) -> PolarsResult<Field> {
-    Ok(Field::new(
-        input_fields[0].name().clone(),
-        DataType::List(Box::new(DataType::String)),
-    ))
-}
-
 fn token_offset_struct_type() -> DataType {
     DataType::Struct(vec![
         Field::new("token".into(), DataType::String),
@@ -243,10 +209,9 @@ fn list_token_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
 }
 
 /// Build one StructChunked from the flat (token, start, end) columns of
-/// **all rows**. Used by the tokenize_with_offsets plugin so the per-row
-/// loop only has to remember each row's `[start_idx, end_idx)` slice into
-/// the flat struct rather than allocate three fresh Series + a fresh
-/// StructChunked per row.
+/// **all rows**. Used by the tokenize plugin so the per-row loop only has
+/// to remember each row's `[start_idx, end_idx)` slice into the flat struct
+/// rather than allocate three fresh Series + a fresh StructChunked per row.
 fn flat_struct_series_from_tokens(
     tok_col: Vec<String>,
     start_col: Vec<i64>,
@@ -262,7 +227,7 @@ fn flat_struct_series_from_tokens(
 }
 
 #[polars_expr(output_type_func=list_token_struct_output)]
-pub fn tokenize_with_offsets(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
+pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
     let backend = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
         .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
@@ -284,9 +249,7 @@ pub fn tokenize_with_offsets(inputs: &[Series], kwargs: TokenizeKwargs) -> Polar
                 let tokens = backend
                     .tokenize_text_with_offsets(text, kwargs.lowercase, kwargs.remove_punct)
                     .map_err(|e| {
-                        PolarsError::ComputeError(
-                            format!("Tokenize with offsets failed: {e}").into(),
-                        )
+                        PolarsError::ComputeError(format!("Tokenization failed: {e}").into())
                     })?;
                 for (t, s, e) in tokens {
                     tok_col.push(t);
@@ -346,11 +309,4 @@ mod tests {
         assert_eq!(cleaned, "hi there");
     }
 
-    #[test]
-    fn test_list_string_output_type() -> PolarsResult<()> {
-        let field = Field::new(PlSmallStr::from("text"), DataType::String);
-        let output = list_string_output(&[field])?;
-        assert_eq!(output.dtype(), &DataType::List(Box::new(DataType::String)));
-        Ok(())
-    }
 }
