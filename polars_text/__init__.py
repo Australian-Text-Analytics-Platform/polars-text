@@ -6,7 +6,6 @@ from .functions import (
     clean_text,
     concordance,
     sentence_count,
-    tokenize,
     word_count,
 )
 from .models import (
@@ -19,7 +18,6 @@ from .models import (
 from .token_frequencies import token_frequencies, token_frequency_stats
 
 __all__ = [
-    "tokenize",
     "clean_text",
     "word_count",
     "char_count",

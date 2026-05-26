@@ -9,13 +9,15 @@ not require network access.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import polars as pl
-import polars_text as pt
+import polars_text
 
 
 def _tokens_for(text: str, *, model: str | None) -> list[str]:
     df = pl.DataFrame({"text": [text]})
-    out = df.select(pt.tokenize(pl.col("text"), model=model))
+    out = df.select(cast(Any, pl.col("text")).text.tokenize(model=model))
     return [entry["token"] for entry in out["text"].to_list()[0]]
 
 
@@ -60,7 +62,7 @@ def test_jieba_handles_mixed_zh_en_text() -> None:
 def test_jieba_default_for_zh_via_recommended_tokenizer() -> None:
     # End-to-end: looking up the recommended tokenizer for "zh" and using it
     # gives the same result as passing model="jieba" directly.
-    recommended = pt.recommended_tokenizer_for("zh")
+    recommended = polars_text.recommended_tokenizer_for("zh")
     assert recommended == "jieba"
     a = _tokens_for("今天天气很好", model=recommended)
     b = _tokens_for("今天天气很好", model="jieba")

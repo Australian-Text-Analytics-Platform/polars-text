@@ -16,10 +16,10 @@ Run locally with::
 from __future__ import annotations
 
 import os
-from typing import cast
+from typing import Any, cast
 
 import polars as pl
-import polars_text as pt
+import polars_text
 import pytest
 
 _DICT_REPO_ENV = "LDACA_LINDERA_DICT_REPO"
@@ -53,12 +53,14 @@ def test_lindera_ja_tokenize_produces_morphemes(
     model_id: str, expected_substring: str
 ) -> None:
     df = pl.DataFrame({"text": ["関西国際空港でトートバッグを買った"]})
-    # `pt.tokenize` returns List(Struct{token,start,end}); `.item(0)` hands
+    # `.text.tokenize` returns List(Struct{token,start,end}); `.item(0)` hands
     # back a polars Series (not a Python list), so extract token strings from
     # its dictionaries.
     result = cast(
         pl.DataFrame,
-        df.lazy().select(pt.tokenize(pl.col("text"), model=model_id)).collect(),
+        df.lazy()
+        .select(cast(Any, pl.col("text")).text.tokenize(model=model_id))
+        .collect(),
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     assert any(expected_substring == t or expected_substring in t for t in tokens), (
@@ -70,7 +72,9 @@ def test_lindera_ko_tokenize_produces_morphemes() -> None:
     df = pl.DataFrame({"text": ["한국어 형태소 분석은 흥미롭다"]})
     result = cast(
         pl.DataFrame,
-        df.lazy().select(pt.tokenize(pl.col("text"), model="lindera-ko-dic")).collect(),
+        df.lazy()
+        .select(cast(Any, pl.col("text")).text.tokenize(model="lindera-ko-dic"))
+        .collect(),
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     # 한국어 = "Korean (language)"; one of the most common standalone
@@ -94,7 +98,7 @@ def test_lindera_offsets_reconstruct_source() -> None:
     result = cast(
         pl.DataFrame,
         df.lazy()
-        .select(pt.tokenize(pl.col("text"), model="lindera-ja-ipadic"))
+        .select(cast(Any, pl.col("text")).text.tokenize(model="lindera-ja-ipadic"))
         .collect(),
     )
     rows = result.to_series(0).item(0).to_list()

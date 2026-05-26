@@ -8,7 +8,7 @@ Series-based utilities for token frequency stats.
 
 ```python
 import polars as pl
-import polars_text as pt
+import polars_text
 
 df = pl.DataFrame({
     "text": [
@@ -18,22 +18,21 @@ df = pl.DataFrame({
 })
 
 out = df.with_columns([
-    pt.clean_text(pl.col("text")).alias("clean"),
-    pt.word_count(pl.col("text")).alias("word_count"),
-    pt.char_count(pl.col("text")).alias("char_count"),
-    pt.sentence_count(pl.col("text")).alias("sentence_count"),
-    pt.tokenize(pl.col("text"), lowercase=True, remove_punct=True).alias("tokens"),
+    pl.col("text").text.clean_text().alias("clean"),
+    pl.col("text").text.word_count().alias("word_count"),
+    pl.col("text").text.char_count().alias("char_count"),
+    pl.col("text").text.sentence_count().alias("sentence_count"),
+    pl.col("text").text.tokenize(lowercase=True, remove_punct=True).alias("tokens"),
 ])
 ```
 
 ## Expressions and namespace
 
-All expression functions are available both as module functions and through
-the `text` namespace on expressions.
+Tokenization is available through the `text` namespace on expressions.
 
-### Expression functions
+### Tokenization
 
-- `tokenize(expr, lowercase=True, remove_punct=True, model=None, cache=None)`
+- `pl.col("text").text.tokenize(lowercase=True, remove_punct=True, model=None, cache=None)`
 - `clean_text(expr)`
 - `word_count(expr)`
 - `char_count(expr)`

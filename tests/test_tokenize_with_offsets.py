@@ -8,20 +8,22 @@ persisted tokenization column on workspace nodes.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import polars as pl
-import polars_text as pt
+import polars_text
 
 
 def _structs(text: str, *, model: str | None) -> list[dict]:
     df = pl.DataFrame({"text": [text]})
-    out = df.select(pt.tokenize(pl.col("text"), model=model))
+    out = df.select(cast(Any, pl.col("text")).text.tokenize(model=model))
     rows = out["text"].to_list()[0]
     return list(rows)
 
 
 def test_schema_is_list_of_struct() -> None:
     df = pl.DataFrame({"text": ["Hello"]})
-    out = df.select(pt.tokenize(pl.col("text")))
+    out = df.select(cast(Any, pl.col("text")).text.tokenize())
     dtype = out.schema["text"]
     assert isinstance(dtype, pl.List)
     inner = dtype.inner
@@ -79,7 +81,7 @@ def test_offsets_are_monotonically_nondecreasing_for_jieba() -> None:
 
 def test_empty_text_returns_empty_list() -> None:
     df = pl.DataFrame({"text": [""]})
-    out = df.select(pt.tokenize(pl.col("text")))
+    out = df.select(cast(Any, pl.col("text")).text.tokenize())
     rows = out["text"].to_list()[0]
     # Should be empty or a list of zero structs.
     assert list(rows) == []
@@ -92,7 +94,7 @@ def test_null_text_in_mixed_column_returns_empty_list() -> None:
     # column is inferred String, then verify the None row produces an empty
     # token list.
     df = pl.DataFrame({"text": ["Hello", None]})
-    out = df.select(pt.tokenize(pl.col("text")))
+    out = df.select(cast(Any, pl.col("text")).text.tokenize())
     rows = out["text"].to_list()
     assert len(rows) == 2
     assert list(rows[1]) == []

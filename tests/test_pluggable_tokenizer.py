@@ -10,9 +10,10 @@ Run locally with ``POLARS_TEXT_RUN_HF_TESTS=1 uv run pytest -m network``.
 from __future__ import annotations
 
 import os
+from typing import Any, cast
 
 import polars as pl
-import polars_text as pt
+import polars_text
 import pytest
 
 _HF_TESTS_ENV = "POLARS_TEXT_RUN_HF_TESTS"
@@ -33,7 +34,7 @@ ALT_MODEL_ZH = "bert-base-chinese"
 
 def _tokens_for(text: str, *, model: str | None) -> list[str]:
     df = pl.DataFrame({"text": [text]})
-    out = df.select(pt.tokenize(pl.col("text"), model=model))
+    out = df.select(cast(Any, pl.col("text")).text.tokenize(model=model))
     series = out["text"].to_list()[0]
     return [entry["token"] for entry in series]
 

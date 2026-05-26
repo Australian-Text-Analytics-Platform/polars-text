@@ -4,7 +4,6 @@
 
 `polars_text/__init__.py` exports:
 
-- `tokenize`,
 - `clean_text`,
 - `word_count`,
 - `char_count`,
@@ -23,13 +22,12 @@ expression namespace with Polars.
 passes `PLUGIN_PATH`, the Rust function name, input expression, keyword
 arguments, and `is_elementwise=True`.
 
-The expression API is available in two equivalent forms:
+Tokenization is available through the `.text` expression namespace:
 
 ```python
 import polars as pl
-import polars_text as pt
+import polars_text
 
-pt.tokenize(pl.col("text"))
 pl.col("text").text.tokenize()
 ```
 
@@ -47,8 +45,7 @@ cached form only after resolving a per-user cache path in the backend.
 ```
 
 The namespace is intentionally thin. It forwards to functions in
-`functions.py`, so behavior stays identical between module-level calls and
-`.text.*` calls.
+`functions.py`, so tokenization behavior has a single implementation.
 
 ## Token Frequencies
 

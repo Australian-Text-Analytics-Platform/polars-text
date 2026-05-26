@@ -85,7 +85,7 @@ def _connect(cache: CachePath):
         import duckdb
     except ImportError as exc:
         raise ImportError(
-            "Using polars_text.tokenize(..., cache=...) requires the duckdb package."
+            "Using pl.col(...).text.tokenize(..., cache=...) requires the duckdb package."
         ) from exc
 
     path = Path(cache)
