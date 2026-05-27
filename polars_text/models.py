@@ -11,15 +11,26 @@ from typing import Final
 
 from ._internal import (
     loaded_tokenizers as _loaded_tokenizers,
+)
+from ._internal import (
     prefetch_tokenizer as _prefetch_tokenizer,
 )
+
+PREDEFINED_MODELS: Final[list[str]] = [
+    "plain_words_en",
+    "jieba",
+    "lindera-ja-ipadic",
+    "lindera-ja-unidic",
+    "lindera-ko-dic",
+]
 
 
 #: Curated tokenizer model IDs per language.
 #:
-#: - ``en`` is the historical default and what the EN goldens were built
-#:   against; do not change without regenerating Phase 0.2 goldens.
-#: - ``zh`` uses Jieba (word-level Chinese segmentation, via jieba-rs).
+#: - ``en`` uses ``plain_words_en`` for fast local rule-based word tokens.
+#:   Hugging Face IDs such as ``bert-base-uncased`` remain valid explicit
+#:   model choices when subword tokenization is desired.
+#: - ``zh`` uses Lindera Jieba for word-level Chinese segmentation.
 #:   Character-level Chinese (``bert-base-chinese``) is intentionally NOT
 #:   the default because per-character tokens have little linguistic
 #:   meaning in practice. Users can still opt into ``bert-base-chinese``
@@ -39,7 +50,7 @@ from ._internal import (
 #: - ``fallback`` is mBERT, kept as an explicit second-tier choice for
 #:   users who specifically want it.
 RECOMMENDED_TOKENIZERS: Final[dict[str, str]] = {
-    "en": "bert-base-uncased",
+    "en": "plain_words_en",
     "zh": "jieba",
     "ja": "lindera-ja-ipadic",
     "ko": "lindera-ko-dic",
@@ -87,6 +98,7 @@ def list_loaded_models() -> list[str]:
 
 
 __all__ = [
+    "PREDEFINED_MODELS",
     "RECOMMENDED_JA_DICTS",
     "RECOMMENDED_TOKENIZERS",
     "list_loaded_models",

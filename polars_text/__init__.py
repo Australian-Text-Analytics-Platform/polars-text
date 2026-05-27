@@ -9,6 +9,7 @@ from .functions import (
     word_count,
 )
 from .models import (
+    PREDEFINED_MODELS,
     RECOMMENDED_JA_DICTS,
     RECOMMENDED_TOKENIZERS,
     list_loaded_models,
@@ -25,6 +26,7 @@ __all__ = [
     "concordance",
     "token_frequencies",
     "token_frequency_stats",
+    "PREDEFINED_MODELS",
     "RECOMMENDED_JA_DICTS",
     "RECOMMENDED_TOKENIZERS",
     "list_loaded_models",

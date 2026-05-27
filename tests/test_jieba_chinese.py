@@ -3,8 +3,8 @@
 Verifies that `model="jieba"` produces word-level Chinese tokens, distinct
 from the character-level fallback you get with `bert-base-chinese`.
 
-Jieba's dictionary is bundled with the jieba-rs crate, so these tests do
-not require network access.
+Jieba's dictionary is embedded through Lindera, so these tests do not require
+network access.
 """
 
 from __future__ import annotations

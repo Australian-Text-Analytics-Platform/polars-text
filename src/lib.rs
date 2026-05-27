@@ -20,9 +20,13 @@ fn _internal(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[pyfunction(name = "token_frequencies")]
-#[pyo3(signature = (texts))]
-fn token_frequencies_py(py: Python<'_>, texts: Vec<String>) -> PyResult<Py<PyAny>> {
-    token_frequencies::token_frequencies_py(py, texts)
+#[pyo3(signature = (texts, model = None))]
+fn token_frequencies_py(
+    py: Python<'_>,
+    texts: Vec<String>,
+    model: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    token_frequencies::token_frequencies_py(py, texts, model.as_deref())
 }
 
 #[pyfunction(name = "prefetch_tokenizer")]

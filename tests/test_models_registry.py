@@ -7,6 +7,7 @@ import os
 import polars_text as pt
 import pytest
 from polars_text.models import (
+    PREDEFINED_MODELS,
     RECOMMENDED_JA_DICTS,
     RECOMMENDED_TOKENIZERS,
     list_loaded_models,
@@ -28,10 +29,20 @@ def test_recommended_tokenizers_has_core_languages() -> None:
 
 
 def test_recommended_tokenizer_for_known_languages() -> None:
-    assert recommended_tokenizer_for("en") == "bert-base-uncased"
+    assert recommended_tokenizer_for("en") == "plain_words_en"
     assert recommended_tokenizer_for("zh") == "jieba"
     assert recommended_tokenizer_for("ja") == "lindera-ja-ipadic"
     assert recommended_tokenizer_for("ko") == "lindera-ko-dic"
+
+
+def test_predefined_models_lists_local_backends() -> None:
+    assert set(PREDEFINED_MODELS) == {
+        "plain_words_en",
+        "jieba",
+        "lindera-ja-ipadic",
+        "lindera-ja-unidic",
+        "lindera-ko-dic",
+    }
 
 
 def test_recommended_ja_dicts_starts_with_default_ja_model() -> None:
@@ -76,5 +87,6 @@ def test_helpers_exported_from_package_root() -> None:
     assert pt.recommended_tokenizer_for is recommended_tokenizer_for
     assert pt.prefetch_model is prefetch_model
     assert pt.list_loaded_models is list_loaded_models
+    assert pt.PREDEFINED_MODELS is PREDEFINED_MODELS
     assert pt.RECOMMENDED_TOKENIZERS is RECOMMENDED_TOKENIZERS
     assert pt.RECOMMENDED_JA_DICTS is RECOMMENDED_JA_DICTS

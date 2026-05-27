@@ -11,6 +11,20 @@ def test_token_frequencies_returns_dict() -> None:
     assert freqs["there"] == 1
 
 
+def test_token_frequencies_accepts_plain_words_en_model() -> None:
+    series = pl.Series("text", ["Hello, [UNK] ##sta Queensland"])
+    freqs = pt.token_frequencies(series, model="plain_words_en")
+    assert freqs == {"hello": 1, "sta": 1, "queensland": 1}
+
+
+def test_token_frequencies_default_matches_plain_words_en() -> None:
+    series = pl.Series("text", ["Hello, world!", None])
+    assert pt.token_frequencies(series) == pt.token_frequencies(
+        series,
+        model="plain_words_en",
+    )
+
+
 def test_token_frequency_stats_columns() -> None:
     freqs_0 = {"hello": 2, "world": 1}
     freqs_1 = {"hello": 1, "there": 2}

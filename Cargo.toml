@@ -10,22 +10,21 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1.0"
 hf-hub = "0.5"
-jieba-rs = "0.9"
 # Phase-5 dict download support: `dirs` resolves the per-OS cache dir
 # cross-platform (Mac/Linux/Windows) and `tar` + the already-present
 # `flate2` extract the prebuilt Lindera dict tarballs we host on HF.
 dirs = "5"
 flate2 = "1"
 tar = "0.4"
-# Lindera — morpheme-level segmentation for Japanese (IPADIC / UniDic) and
-# Korean (ko-dic). Per Phase 5 of docs/pluggable-tokeniser/PLAN.md we
-# deliberately do NOT enable any `embed-*` feature: dicts are downloaded
-# on first use to ~/.cache/ldaca/lindera/ via the lindera_dict module so
-# the wheel stays slim. The `lindera-ipadic` / `lindera-ko-dic` /
-# `lindera-unidic` features pull in the per-dict loader code paths only
-# — the actual dict binaries are not bundled.
+# Lindera — word/morpheme-level segmentation for Chinese (Jieba), Japanese
+# (IPADIC / UniDic), and Korean (ko-dic). Jieba is embedded through Lindera so
+# `model="jieba"` does not need a separate backend. JA/KO dicts stay
+# download-on-first-use via lindera_dict so the wheel avoids bundling those
+# larger binaries. The `lindera-ipadic` / `lindera-ko-dic` / `lindera-unidic`
+# features pull in per-dict loader code paths only.
 lindera = { version = "3", default-features = false, features = [
     "mmap",
+    "embed-jieba",
     "lindera-ipadic",
     "lindera-ko-dic",
     "lindera-unidic",

@@ -15,12 +15,15 @@ backend on a cache miss. Loaded backends are shared by `Arc`.
 
 `TokenizerBackend` supports:
 
+- `plain_words_en` for local rule-based English word tokenization,
 - Hugging Face `tokenizers::Tokenizer`,
-- `jieba-rs` for Chinese word segmentation,
-- Lindera for Japanese and Korean morphological segmentation.
+- Lindera for Chinese Jieba word segmentation and Japanese/Korean
+  morphological segmentation.
 
-Hugging Face models are loaded from `tokenizer.json` through `hf-hub`. Jieba is
-local. Lindera dictionaries are downloaded on first use.
+`plain_words_en` is stateless and uses the BERT pre-tokenizer without loading a
+model. Hugging Face models are loaded from `tokenizer.json` through `hf-hub`.
+Jieba is embedded through Lindera. Japanese and Korean Lindera dictionaries are
+downloaded on first use.
 
 ## Lindera Dictionaries
 
@@ -34,9 +37,10 @@ when `matrix.mtx` exists in the extracted directory.
 
 ## Case And Offset Handling
 
-Only Hugging Face tokenizers are case-aware. Jieba and Lindera operate on
-scripts where case-folding is not meaningful, so the lowercase branch returns a
-borrowed string instead of allocating a lowercase copy.
+Only `plain_words_en` and Hugging Face tokenizers are case-aware. Lindera
+backends operate on scripts where case-folding is not meaningful, so the
+lowercase branch returns a borrowed string instead of allocating a lowercase
+copy.
 
 Hugging Face and Lindera emit byte offsets. The backend and UI use character
 offsets. `offsets.rs` converts monotonic byte spans to character spans in one
@@ -45,9 +49,11 @@ tokens)`.
 
 ## Plain Tokenizer
 
-`tokenize_plain_text()` uses the BERT pre-tokenizer and removes punctuation or
-special tokens when requested. It supports token-frequency counting and
-concordance context tokenization without loading a full model backend.
+`plain_words_en` and the legacy `tokenize_plain_text()` wrapper use the BERT
+pre-tokenizer and remove punctuation or special tokens when requested. Token
+frequency counting now routes through the same backend dispatch as
+`.text.tokenize(model=...)`; the legacy helper remains for concordance context
+tokenization.
 
 ## Serialized Plan Paths
 

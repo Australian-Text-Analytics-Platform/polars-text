@@ -4,16 +4,24 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::tokenizer::tokenize_plain_text;
+use crate::tokenizer::{ensure_tokenizer_for_model, PLAIN_WORDS_EN_MODEL_ID};
 
-pub fn token_frequencies_py(py: Python<'_>, texts: Vec<String>) -> PyResult<Py<PyAny>> {
+pub fn token_frequencies_py(
+    py: Python<'_>,
+    texts: Vec<String>,
+    model_id: Option<&str>,
+) -> PyResult<Py<PyAny>> {
     let mut counts: HashMap<String, u64> = HashMap::new();
+    let backend = ensure_tokenizer_for_model(Some(model_id.unwrap_or(PLAIN_WORDS_EN_MODEL_ID)))
+        .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("{e}")))?;
 
     for text in texts {
         if text.trim().is_empty() {
             continue;
         }
-        let tokens = tokenize_plain_text(&text, true, true);
+        let tokens = backend
+            .tokenize_text(&text, false, true, true)
+            .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("{e}")))?;
         for token in tokens {
             *counts.entry(token).or_insert(0) += 1;
         }

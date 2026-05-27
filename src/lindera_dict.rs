@@ -2,13 +2,15 @@
 //!
 //! Phase 5 (Lindera JA + KO) ships three prebuilt morpheme dicts:
 //! IPADIC (~15 MB gzipped) and UniDic (~50 MB gzipped) for Japanese,
-//! ko-dic (~34 MB gzipped) for Korean. Per `docs/pluggable-tokeniser/PLAN.md`
-//! they are NOT bundled in the polars-text wheel — instead the first
-//! JA/KO tokenize call lands here, fetches the matching tarball from
+//! ko-dic (~34 MB gzipped) for Korean. Those larger dicts are NOT bundled in
+//! the polars-text wheel — instead the first JA/KO tokenize call lands here,
+//! fetches the matching tarball from
 //! the HuggingFace dataset `SIH/lindera-dicts` (overridable via
 //! `LDACA_LINDERA_DICT_REPO` for testing), extracts into the per-OS
 //! cache dir, and hands the loaded `Tokenizer` back to `tokenizer.rs`
 //! for memoization in the existing `REGISTRY`.
+//! Chinese Jieba is embedded through Lindera and uses the same tokenizer
+//! construction helper without the download/cache path.
 //!
 //! Cache layout:
 //!   <cache-dir>/ldaca/lindera/
@@ -191,6 +193,18 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
     ar.unpack(dest).context("tar extract failed")
 }
 
+fn lindera_tokenizer_from_uri(uri: &str) -> Result<LinderaTokenizer> {
+    let dictionary = load_dictionary(uri)
+        .map_err(|e| anyhow::anyhow!("Lindera load_dictionary({uri}) failed: {e}"))?;
+    let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
+    Ok(LinderaTokenizer::new(segmenter))
+}
+
+pub fn ensure_embedded_lindera_tokenizer(dictionary_name: &str) -> Result<LinderaTokenizer> {
+    let uri = format!("embedded://{dictionary_name}");
+    lindera_tokenizer_from_uri(&uri)
+}
+
 /// Build a `LinderaTokenizer` for the given dict, downloading + extracting
 /// on first use. Caller (in `tokenizer.rs`) wraps the result in the
 /// shared `REGISTRY` so subsequent lookups skip both the download and
@@ -198,10 +212,7 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<()> {
 pub fn ensure_lindera_tokenizer(kind: LinderaDict) -> Result<LinderaTokenizer> {
     let dict_dir = ensure_dict(kind)?;
     let uri = format!("file://{}", dict_dir.display());
-    let dictionary = load_dictionary(&uri)
-        .map_err(|e| anyhow::anyhow!("Lindera load_dictionary({uri}) failed: {e}"))?;
-    let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
-    Ok(LinderaTokenizer::new(segmenter))
+    lindera_tokenizer_from_uri(&uri)
 }
 
 #[cfg(test)]

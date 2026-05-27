@@ -14,8 +14,9 @@ use crate::offsets::byte_spans_to_char_spans;
 
 pub const DEFAULT_TOKENIZER_MODEL: &str = "bert-base-uncased";
 const DEFAULT_TOKENIZER_REVISION: &str = "main";
+pub const PLAIN_WORDS_EN_MODEL_ID: &str = "plain_words_en";
 pub const JIEBA_MODEL_ID: &str = "jieba";
-/// Opaque model IDs for the three Lindera dict variants. Phase 5 routes
+/// Opaque model IDs for the three downloaded Lindera dict variants. Phase 5 routes
 /// these through `load_backend` to a downloader (lindera_dict.rs) that
 /// fetches the binary dict on first use; subsequent calls hit the
 /// in-memory REGISTRY. The frontend selector surfaces JA's IPADIC vs
@@ -32,12 +33,61 @@ fn keep_token_text(token: &str, remove_punctuation: bool) -> bool {
 
 /// A model-specific tokenizer fronting one of:
 /// - a HuggingFace tokenizer (BERT-family WordPiece, XLM-R SentencePiece, etc.)
-/// - `jieba-rs` for word-level Chinese segmentation
-/// - Lindera for morpheme-level Japanese (IPADIC / UniDic) or Korean (ko-dic)
+/// - Lindera for Chinese Jieba word segmentation, Japanese (IPADIC / UniDic),
+///   or Korean (ko-dic)
 pub enum TokenizerBackend {
+    PlainWordsEn,
     HuggingFace(Tokenizer),
-    Jieba(jieba_rs::Jieba),
     Lindera(LinderaTokenizer),
+}
+
+struct TokenRecord {
+    token: String,
+    start: i64,
+    end: i64,
+}
+
+fn is_special_token_text(token: &str) -> bool {
+    let token_upper = token.to_ascii_uppercase();
+    if SPECIAL_TOKENS.contains(&token_upper.as_str()) {
+        return true;
+    }
+
+    let bracketed = format!("[{token_upper}]");
+    SPECIAL_TOKENS.contains(&bracketed.as_str())
+}
+
+fn plain_word_records(text: &str, remove_punctuation: bool) -> Vec<TokenRecord> {
+    let mut pre_tokenized = PreTokenizedString::from(text);
+    if BertPreTokenizer.pre_tokenize(&mut pre_tokenized).is_err() {
+        return Vec::new();
+    }
+
+    let splits = pre_tokenized.get_splits(OffsetReferential::Original, OffsetType::Byte);
+    let char_spans = byte_spans_to_char_spans(
+        text,
+        splits.iter().map(|(_, (start, end), _)| (*start, *end)),
+    );
+
+    splits
+        .into_iter()
+        .zip(char_spans)
+        .filter_map(|((token, _span, _), (start, end))| {
+            if remove_punctuation && !token.chars().any(|ch| ch.is_alphanumeric()) {
+                return None;
+            }
+
+            if is_special_token_text(token) || token.is_empty() {
+                return None;
+            }
+
+            Some(TokenRecord {
+                token: token.to_string(),
+                start,
+                end,
+            })
+        })
+        .collect()
 }
 
 impl TokenizerBackend {
@@ -47,7 +97,10 @@ impl TokenizerBackend {
     /// is pure waste. The Python wrapper also defaults to `lowercase=False`
     /// for CJK models — this is a safety net for any caller that forgets.
     fn case_aware(&self) -> bool {
-        matches!(self, TokenizerBackend::HuggingFace(_))
+        matches!(
+            self,
+            TokenizerBackend::PlainWordsEn | TokenizerBackend::HuggingFace(_)
+        )
     }
 
     /// Apply the requested case-folding only when meaningful. Returns a
@@ -68,30 +121,69 @@ impl TokenizerBackend {
         lowercase: bool,
         remove_punctuation: bool,
     ) -> Result<Vec<String>> {
-        let processed = self.preprocess(text, lowercase);
+        Ok(self
+            .tokenize_records(text, add_special_tokens, lowercase, remove_punctuation)?
+            .into_iter()
+            .map(|record| record.token)
+            .collect())
+    }
 
-        let mut tokens: Vec<String> = match self {
+    fn tokenize_records(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        lowercase: bool,
+        remove_punctuation: bool,
+    ) -> Result<Vec<TokenRecord>> {
+        let processed = self.preprocess(text, lowercase);
+        let processed_ref: &str = processed.as_ref();
+
+        let mut records: Vec<TokenRecord> = match self {
+            TokenizerBackend::PlainWordsEn => plain_word_records(processed_ref, remove_punctuation),
             TokenizerBackend::HuggingFace(tokenizer) => {
                 let encoding = tokenizer
-                    .encode(processed.as_ref(), add_special_tokens)
+                    .encode(processed_ref, add_special_tokens)
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
-                encoding.get_tokens().iter().cloned().collect()
+                let toks = encoding.get_tokens();
+                let offsets = encoding.get_offsets();
+                let char_spans =
+                    byte_spans_to_char_spans(processed_ref, offsets.iter().map(|(s, e)| (*s, *e)));
+                toks.iter()
+                    .zip(char_spans.into_iter())
+                    .map(|(tok, (start, end))| TokenRecord {
+                        token: tok.clone(),
+                        start,
+                        end,
+                    })
+                    .collect()
             }
-            TokenizerBackend::Jieba(jb) => jb
-                .cut(processed.as_ref(), true)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
             TokenizerBackend::Lindera(tok) => tok
-                .tokenize(processed.as_ref())
+                .tokenize(processed_ref)
                 .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?
                 .into_iter()
-                .map(|t| t.surface.to_string())
+                .map(|t| TokenRecord {
+                    token: t.surface.to_string(),
+                    start: t.byte_start as i64,
+                    end: t.byte_end as i64,
+                })
                 .collect(),
         };
 
-        tokens.retain(|tok| keep_token_text(tok, remove_punctuation));
-        Ok(tokens)
+        if matches!(self, TokenizerBackend::Lindera(_)) {
+            let char_spans = byte_spans_to_char_spans(
+                processed_ref,
+                records
+                    .iter()
+                    .map(|record| (record.start as usize, record.end as usize)),
+            );
+            for (record, (start, end)) in records.iter_mut().zip(char_spans) {
+                record.start = start;
+                record.end = end;
+            }
+        }
+
+        records.retain(|record| keep_token_text(&record.token, remove_punctuation));
+        Ok(records)
     }
 
     /// Tokenize and emit `(token, start, end)` triples where `start` and `end`
@@ -104,51 +196,10 @@ impl TokenizerBackend {
         lowercase: bool,
         remove_punctuation: bool,
     ) -> Result<Vec<(String, i64, i64)>> {
-        let processed = self.preprocess(text, lowercase);
-        let processed_ref: &str = processed.as_ref();
-
-        let raw: Vec<(String, i64, i64)> = match self {
-            TokenizerBackend::HuggingFace(tokenizer) => {
-                let encoding = tokenizer
-                    .encode(processed_ref, false)
-                    .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
-                let toks = encoding.get_tokens();
-                let offsets = encoding.get_offsets();
-                let char_spans =
-                    byte_spans_to_char_spans(processed_ref, offsets.iter().map(|(s, e)| (*s, *e)));
-                toks.iter()
-                    .zip(char_spans.into_iter())
-                    .map(|(tok, (cs, ce))| (tok.clone(), cs, ce))
-                    .collect()
-            }
-            TokenizerBackend::Jieba(jb) => jb
-                .tokenize(processed_ref, jieba_rs::TokenizeMode::Default, true)
-                .into_iter()
-                .map(|t| (t.word.to_string(), t.start as i64, t.end as i64))
-                .collect(),
-            TokenizerBackend::Lindera(tok) => {
-                let toks = tok
-                    .tokenize(processed_ref)
-                    .map_err(|e| anyhow::anyhow!("Lindera tokenize failed: {e}"))?;
-                // Lindera emits byte offsets; the rest of polars-text speaks in
-                // char offsets (matches Jieba + the HF arm above), so translate
-                // through the batch helper before handing back to the caller.
-                // Single forward sweep over char_indices — O(C + N) instead of
-                // the prior O(C·N) per-token byte_to_char_idx walk.
-                let char_spans = byte_spans_to_char_spans(
-                    processed_ref,
-                    toks.iter().map(|t| (t.byte_start, t.byte_end)),
-                );
-                toks.into_iter()
-                    .zip(char_spans.into_iter())
-                    .map(|(t, (cs, ce))| (t.surface.to_string(), cs, ce))
-                    .collect()
-            }
-        };
-
-        let result: Vec<(String, i64, i64)> = raw
+        let result: Vec<(String, i64, i64)> = self
+            .tokenize_records(text, false, lowercase, remove_punctuation)?
             .into_iter()
-            .filter(|(tok, _, _)| keep_token_text(tok, remove_punctuation))
+            .map(|record| (record.token, record.start, record.end))
             .collect();
 
         Ok(result)
@@ -186,8 +237,12 @@ pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<Tokenize
 }
 
 fn load_backend(model_id: &str) -> Result<TokenizerBackend> {
+    if model_id == PLAIN_WORDS_EN_MODEL_ID {
+        return Ok(TokenizerBackend::PlainWordsEn);
+    }
     if model_id == JIEBA_MODEL_ID {
-        return Ok(TokenizerBackend::Jieba(jieba_rs::Jieba::new()));
+        let tok = crate::lindera_dict::ensure_embedded_lindera_tokenizer(JIEBA_MODEL_ID)?;
+        return Ok(TokenizerBackend::Lindera(tok));
     }
     if let Some(kind) = lindera_dict_for_model_id(model_id) {
         let tok = crate::lindera_dict::ensure_lindera_tokenizer(kind)?;
@@ -232,49 +287,17 @@ pub fn loaded_model_ids() -> Vec<String> {
 }
 
 pub fn tokenize_plain_text(text: &str, lowercase: bool, remove_punctuation: bool) -> Vec<String> {
-    let processed = if lowercase {
-        text.to_lowercase()
-    } else {
-        text.to_string()
-    };
-
-    let mut pre_tokenized = PreTokenizedString::from(processed.as_str());
-    if BertPreTokenizer.pre_tokenize(&mut pre_tokenized).is_err() {
-        return Vec::new();
-    }
-
-    let special_set = SPECIAL_TOKENS;
-    pre_tokenized
-        .get_splits(OffsetReferential::Original, OffsetType::Byte)
-        .into_iter()
-        .filter_map(|(token, _span, _)| {
-            if remove_punctuation && !token.chars().any(|ch| ch.is_alphanumeric()) {
-                return None;
-            }
-
-            let token_upper = token.to_ascii_uppercase();
-            let bracketed = format!("[{token_upper}]");
-            if special_set.contains(&token_upper.as_str())
-                || special_set.contains(&bracketed.as_str())
-            {
-                return None;
-            }
-
-            if token.is_empty() {
-                return None;
-            }
-
-            Some(token.to_string())
-        })
-        .collect()
+    TokenizerBackend::PlainWordsEn
+        .tokenize_text(text, false, lowercase, remove_punctuation)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        lindera_dict_for_model_id, loaded_model_ids, tokenize_plain_text, TokenizerBackend,
-        JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID, LINDERA_JA_UNIDIC_MODEL_ID,
-        LINDERA_KO_DIC_MODEL_ID,
+        ensure_tokenizer_for_model, lindera_dict_for_model_id, loaded_model_ids,
+        tokenize_plain_text, TokenizerBackend, JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID,
+        LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID, PLAIN_WORDS_EN_MODEL_ID,
     };
     use crate::lindera_dict::LinderaDict;
 
@@ -295,8 +318,7 @@ mod tests {
 
     #[test]
     fn test_jieba_backend_segments_chinese_words() {
-        let jb = jieba_rs::Jieba::new();
-        let backend = TokenizerBackend::Jieba(jb);
+        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
         let tokens = backend
             .tokenize_text("今天天气很好", false, false, true)
             .unwrap();
@@ -317,9 +339,39 @@ mod tests {
     }
 
     #[test]
+    fn test_plain_words_en_model_id_constant() {
+        assert_eq!(PLAIN_WORDS_EN_MODEL_ID, "plain_words_en");
+    }
+
+    #[test]
+    fn test_plain_words_en_backend_matches_plain_helper() {
+        let backend = TokenizerBackend::PlainWordsEn;
+        let text = "Hello, [UNK] ##sta Queensland";
+        let tokens = backend.tokenize_text(text, false, true, true).unwrap();
+        assert_eq!(tokens, tokenize_plain_text(text, true, true));
+    }
+
+    #[test]
+    fn test_plain_words_en_offsets_reconstruct_english() {
+        let backend = TokenizerBackend::PlainWordsEn;
+        let text = "Hello, Queensland";
+        let toks = backend
+            .tokenize_text_with_offsets(text, true, true)
+            .unwrap();
+        let text_lc = text.to_lowercase();
+        for (tok, start, end) in &toks {
+            let extracted: String = text_lc
+                .chars()
+                .skip(*start as usize)
+                .take((*end - *start) as usize)
+                .collect();
+            assert_eq!(*tok, extracted);
+        }
+    }
+
+    #[test]
     fn test_jieba_offsets_reconstruct_chinese() {
-        let jb = jieba_rs::Jieba::new();
-        let backend = TokenizerBackend::Jieba(jb);
+        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
         let text = "我爱中国";
         let toks = backend
             .tokenize_text_with_offsets(text, false, false)
@@ -364,8 +416,7 @@ mod tests {
         // tokens whether on or off. Before the case_aware() guard, the
         // backend paid a full to_lowercase() Unicode walk + heap clone
         // per row for nothing; now it short-circuits to a borrow.
-        let jb = jieba_rs::Jieba::new();
-        let backend = TokenizerBackend::Jieba(jb);
+        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
         let text = "今天天气很好";
         let tokens_lower = backend.tokenize_text(text, false, true, false).unwrap();
         let tokens_plain = backend.tokenize_text(text, false, false, false).unwrap();
@@ -384,8 +435,8 @@ mod tests {
     fn test_case_aware_flag() {
         // Pin the backend-classification contract so future additions
         // (e.g. a fastText backend for CJK) explicitly opt in or out.
-        let jb = jieba_rs::Jieba::new();
-        assert!(!TokenizerBackend::Jieba(jb).case_aware());
+        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
+        assert!(!backend.case_aware());
     }
 
     #[test]

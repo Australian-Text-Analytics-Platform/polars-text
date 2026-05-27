@@ -49,8 +49,12 @@ The namespace is intentionally thin. It forwards to functions in
 
 ## Token Frequencies
 
-`token_frequencies(series)` accepts a Polars `Series`, normalizes `None` to an
-empty string, and calls the Rust `token_frequencies` helper.
+`token_frequencies(series, model=None)` accepts a Polars `Series`, normalizes
+`None` to an empty string, and calls the Rust `token_frequencies` helper. When
+`model` is omitted, token frequency counting uses the predefined
+`plain_words_en` backend so it matches the historical rule-based English word
+tokenizer. Passing any predefined tokenizer ID or Hugging Face model ID routes
+through the same model registry as `.text.tokenize(model=...)`.
 
 `token_frequency_stats(corpus_0, corpus_1)` builds a Polars DataFrame with
 frequencies, expected counts, log likelihood, BIC-style Bayes factor,
@@ -62,8 +66,10 @@ post-processing over already-counted dictionaries.
 
 `models.py` contains curated tokenizer ids:
 
-- English: `bert-base-uncased`,
-- Chinese: `jieba`,
+- predefined local IDs: `plain_words_en`, `jieba`, `lindera-ja-ipadic`,
+  `lindera-ja-unidic`, `lindera-ko-dic`, exposed as `PREDEFINED_MODELS`,
+- English: `plain_words_en`,
+- Chinese: `jieba` through Lindera Jieba,
 - Japanese: `lindera-ja-ipadic`,
 - Korean: `lindera-ko-dic`,
 - multilingual: `xlm-roberta-base`,
