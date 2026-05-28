@@ -30,6 +30,20 @@ PREDEFINED_MODELS: Final[dict[str, tuple[str, ...]]] = {
 }
 
 
+#: Human-facing labels for the predefined inventory. Keep labels next to the
+#: inventory so API clients do not need to hard-code model catalog metadata.
+PREDEFINED_MODEL_LABELS: Final[dict[str, str]] = {
+    "native:plain_words_en": "Plain words (English)",
+    "huggingface:bert-base-uncased": "BERT base uncased",
+    "lindera:cc-cedict": "CC-CEDICT",
+    "lindera:jieba": "Jieba",
+    "lindera:ja-ipadic": "IPADIC",
+    "lindera:ja-ipadic-neologd": "IPADIC Neologd",
+    "lindera:ja-unidic": "UniDic",
+    "lindera:ko-dic": "ko-dic",
+}
+
+
 #: Lindera dictionary-backed tokenizer IDs grouped by supported language.
 LINDERA_MODELS_BY_LANGUAGE: Final[dict[str, tuple[str, ...]]] = {
     "zh": ("lindera:cc-cedict", "lindera:jieba"),
@@ -57,9 +71,23 @@ def list_loaded_models() -> list[str]:
     return list(_loaded_tokenizers())
 
 
+def predefined_model_records() -> list[dict[str, object]]:
+    """Return predefined tokenizer model records for API clients."""
+    return [
+        {
+            "model": model,
+            "label": PREDEFINED_MODEL_LABELS.get(model, model),
+            "languages": list(languages),
+        }
+        for model, languages in PREDEFINED_MODELS.items()
+    ]
+
+
 __all__ = [
     "LINDERA_MODELS_BY_LANGUAGE",
     "PREDEFINED_MODELS",
+    "PREDEFINED_MODEL_LABELS",
     "list_loaded_models",
+    "predefined_model_records",
     "prefetch_model",
 ]
