@@ -7,12 +7,10 @@ import os
 import polars_text as pt
 import pytest
 from polars_text.models import (
+    LINDERA_MODELS_BY_LANGUAGE,
     PREDEFINED_MODELS,
-    RECOMMENDED_JA_DICTS,
-    RECOMMENDED_TOKENIZERS,
     list_loaded_models,
     prefetch_model,
-    recommended_tokenizer_for,
 )
 
 _HF_TESTS_ENV = "POLARS_TEXT_RUN_HF_TESTS"
@@ -22,50 +20,53 @@ _requires_hf_models = pytest.mark.skipif(
 )
 
 
-def test_recommended_tokenizers_has_core_languages() -> None:
-    for lang in ("en", "zh", "ja", "ko", "multi", "fallback"):
-        assert lang in RECOMMENDED_TOKENIZERS
-        assert RECOMMENDED_TOKENIZERS[lang], f"empty tokenizer id for language {lang!r}"
-
-
-def test_recommended_tokenizer_for_known_languages() -> None:
-    assert recommended_tokenizer_for("en") == "plain_words_en"
-    assert recommended_tokenizer_for("zh") == "jieba"
-    assert recommended_tokenizer_for("ja") == "lindera-ja-ipadic"
-    assert recommended_tokenizer_for("ko") == "lindera-ko-dic"
-
-
-def test_predefined_models_lists_local_backends() -> None:
+def test_predefined_models_lists_supported_languages() -> None:
     assert set(PREDEFINED_MODELS) == {
-        "plain_words_en",
-        "jieba",
-        "lindera-ja-ipadic",
-        "lindera-ja-unidic",
-        "lindera-ko-dic",
+        "native:plain_words_en",
+        "huggingface:bert-base-uncased",
+        "lindera:cc-cedict",
+        "lindera:ja-ipadic",
+        "lindera:ja-ipadic-neologd",
+        "lindera:ja-unidic",
+        "lindera:jieba",
+        "lindera:ko-dic",
     }
+    assert PREDEFINED_MODELS["native:plain_words_en"] == ("en",)
+    assert PREDEFINED_MODELS["huggingface:bert-base-uncased"] == ("en",)
+    assert PREDEFINED_MODELS["lindera:cc-cedict"] == ("zh",)
+    assert PREDEFINED_MODELS["lindera:jieba"] == ("zh",)
+    assert PREDEFINED_MODELS["lindera:ja-ipadic"] == ("ja",)
+    assert PREDEFINED_MODELS["lindera:ja-ipadic-neologd"] == ("ja",)
+    assert PREDEFINED_MODELS["lindera:ja-unidic"] == ("ja",)
+    assert PREDEFINED_MODELS["lindera:ko-dic"] == ("ko",)
 
 
-def test_recommended_ja_dicts_starts_with_default_ja_model() -> None:
-    # The frontend dict selector relies on the first entry being the
-    # current ``RECOMMENDED_TOKENIZERS["ja"]`` so opening the dialog
-    # preselects the recommended option.
-    assert RECOMMENDED_JA_DICTS[0][0] == RECOMMENDED_TOKENIZERS["ja"]
-    # Every entry must be a (model_id, human_label) pair.
-    for model_id, label in RECOMMENDED_JA_DICTS:
-        assert model_id.startswith("lindera-ja-"), (
-            f"unexpected non-Lindera entry in RECOMMENDED_JA_DICTS: {model_id!r}"
-        )
-        assert label, "human label must be non-empty for the selector"
+def test_lindera_models_by_language_lists_all_supported_dicts() -> None:
+    assert LINDERA_MODELS_BY_LANGUAGE == {
+        "zh": ("lindera:cc-cedict", "lindera:jieba"),
+        "ja": (
+            "lindera:ja-ipadic",
+            "lindera:ja-ipadic-neologd",
+            "lindera:ja-unidic",
+        ),
+        "ko": ("lindera:ko-dic",),
+    }
+    for models in LINDERA_MODELS_BY_LANGUAGE.values():
+        for model_id in models:
+            assert model_id in PREDEFINED_MODELS
+            assert model_id.startswith("lindera:")
 
 
-def test_recommended_tokenizer_for_unknown_falls_back_to_multi() -> None:
-    assert recommended_tokenizer_for("klingon") == RECOMMENDED_TOKENIZERS["multi"]
+def test_model_exports_do_not_include_recommendations() -> None:
+    assert not hasattr(pt, "RECOMMENDED_TOKENIZERS")
+    assert not hasattr(pt, "RECOMMENDED_JA_DICTS")
+    assert not hasattr(pt, "recommended_tokenizer_for")
 
 
 @pytest.mark.network
 @_requires_hf_models
 def test_prefetch_model_populates_registry() -> None:
-    target = "bert-base-uncased"
+    target = "huggingface:bert-base-uncased"
     prefetch_model(target)
     assert target in list_loaded_models()
 
@@ -73,7 +74,7 @@ def test_prefetch_model_populates_registry() -> None:
 @pytest.mark.network
 @_requires_hf_models
 def test_prefetch_model_is_idempotent() -> None:
-    target = "bert-base-uncased"
+    target = "huggingface:bert-base-uncased"
     prefetch_model(target)
     first = list_loaded_models()
     prefetch_model(target)
@@ -84,9 +85,7 @@ def test_prefetch_model_is_idempotent() -> None:
 
 def test_helpers_exported_from_package_root() -> None:
     # The package-level names should match what models.py exports.
-    assert pt.recommended_tokenizer_for is recommended_tokenizer_for
+    assert pt.LINDERA_MODELS_BY_LANGUAGE is LINDERA_MODELS_BY_LANGUAGE
     assert pt.prefetch_model is prefetch_model
     assert pt.list_loaded_models is list_loaded_models
     assert pt.PREDEFINED_MODELS is PREDEFINED_MODELS
-    assert pt.RECOMMENDED_TOKENIZERS is RECOMMENDED_TOKENIZERS
-    assert pt.RECOMMENDED_JA_DICTS is RECOMMENDED_JA_DICTS

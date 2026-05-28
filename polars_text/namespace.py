@@ -15,16 +15,16 @@ class TextNamespace:
     def tokenize(
         self,
         *,
+        model: str,
         lowercase: bool = True,
         remove_punct: bool = True,
-        model: str | None = None,
         cache: str | os.PathLike[str] | None = None,
     ) -> pl.Expr:
         return functions.tokenize(
             self._expr,
+            model=model,
             lowercase=lowercase,
             remove_punct=remove_punct,
-            model=model,
             cache=cache,
         )
 

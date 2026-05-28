@@ -7,11 +7,13 @@ import polars as pl
 from ._internal import token_frequencies as _token_frequencies
 
 
-def token_frequencies(series: pl.Series, model: str | None = None) -> dict[str, int]:
+def token_frequencies(series: pl.Series, model: str) -> dict[str, int]:
     if not isinstance(series, pl.Series):
         raise TypeError("token_frequencies expects a Polars Series")
+    if not model.strip():
+        raise ValueError("token_frequencies requires an explicit tokenizer model ID")
     texts = [value if value is not None else "" for value in series.to_list()]
-    return _token_frequencies(texts, model)
+    return _token_frequencies(texts, model.strip())
 
 
 def token_frequency_stats(

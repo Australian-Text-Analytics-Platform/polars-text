@@ -12,18 +12,20 @@ use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer
 
 use crate::offsets::byte_spans_to_char_spans;
 
-pub const DEFAULT_TOKENIZER_MODEL: &str = "bert-base-uncased";
 const DEFAULT_TOKENIZER_REVISION: &str = "main";
-pub const PLAIN_WORDS_EN_MODEL_ID: &str = "plain_words_en";
-pub const JIEBA_MODEL_ID: &str = "jieba";
-/// Opaque model IDs for the three downloaded Lindera dict variants. Phase 5 routes
-/// these through `load_backend` to a downloader (lindera_dict.rs) that
-/// fetches the binary dict on first use; subsequent calls hit the
-/// in-memory REGISTRY. The frontend selector surfaces JA's IPADIC vs
-/// UniDic choice; KO has only ko-dic so it's a single ID.
-pub const LINDERA_JA_IPADIC_MODEL_ID: &str = "lindera-ja-ipadic";
-pub const LINDERA_JA_UNIDIC_MODEL_ID: &str = "lindera-ja-unidic";
-pub const LINDERA_KO_DIC_MODEL_ID: &str = "lindera-ko-dic";
+const NATIVE_MODEL_PREFIX: &str = "native:";
+const HUGGINGFACE_MODEL_PREFIX: &str = "huggingface:";
+const LINDERA_MODEL_PREFIX: &str = "lindera:";
+pub const PLAIN_WORDS_EN_MODEL_ID: &str = "native:plain_words_en";
+pub const JIEBA_MODEL_ID: &str = "lindera:jieba";
+/// Opaque model IDs for downloaded Lindera dict variants. These route through
+/// `load_backend` to the on-demand downloader in `lindera_dict.rs`; subsequent
+/// calls hit the in-memory REGISTRY.
+pub const LINDERA_ZH_CC_CEDICT_MODEL_ID: &str = "lindera:cc-cedict";
+pub const LINDERA_JA_IPADIC_MODEL_ID: &str = "lindera:ja-ipadic";
+pub const LINDERA_JA_IPADIC_NEOLOGD_MODEL_ID: &str = "lindera:ja-ipadic-neologd";
+pub const LINDERA_JA_UNIDIC_MODEL_ID: &str = "lindera:ja-unidic";
+pub const LINDERA_KO_DIC_MODEL_ID: &str = "lindera:ko-dic";
 
 const SPECIAL_TOKENS: &[&str] = &["[CLS]", "[SEP]", "[PAD]", "[UNK]", "[MASK]"];
 
@@ -213,7 +215,9 @@ fn registry() -> &'static RwLock<HashMap<String, Arc<TokenizerBackend>>> {
 }
 
 pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<TokenizerBackend>> {
-    let key = model_id.unwrap_or(DEFAULT_TOKENIZER_MODEL);
+    let key = model_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Tokenizer model id is required"))?;
 
     {
         let map = registry()
@@ -237,23 +241,47 @@ pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<Tokenize
 }
 
 fn load_backend(model_id: &str) -> Result<TokenizerBackend> {
-    if model_id == PLAIN_WORDS_EN_MODEL_ID {
-        return Ok(TokenizerBackend::PlainWordsEn);
+    if model_id.starts_with(NATIVE_MODEL_PREFIX) {
+        return match model_id {
+            PLAIN_WORDS_EN_MODEL_ID => Ok(TokenizerBackend::PlainWordsEn),
+            _ => Err(anyhow::anyhow!(
+                "Unknown native tokenizer model id: {model_id}"
+            )),
+        };
     }
-    if model_id == JIEBA_MODEL_ID {
-        let tok = crate::lindera_dict::ensure_embedded_lindera_tokenizer(JIEBA_MODEL_ID)?;
-        return Ok(TokenizerBackend::Lindera(tok));
+
+    if let Some(huggingface_model_id) = model_id.strip_prefix(HUGGINGFACE_MODEL_PREFIX) {
+        if huggingface_model_id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Hugging Face tokenizer model id must include a repository id"
+            ));
+        }
+        return load_hf_tokenizer(huggingface_model_id).map(TokenizerBackend::HuggingFace);
     }
-    if let Some(kind) = lindera_dict_for_model_id(model_id) {
-        let tok = crate::lindera_dict::ensure_lindera_tokenizer(kind)?;
-        return Ok(TokenizerBackend::Lindera(tok));
+
+    if model_id.starts_with(LINDERA_MODEL_PREFIX) {
+        if let Some(kind) = lindera_dict_for_model_id(model_id) {
+            let tok = crate::lindera_dict::ensure_lindera_tokenizer(kind)?;
+            return Ok(TokenizerBackend::Lindera(tok));
+        }
+        return Err(anyhow::anyhow!(
+            "Unknown Lindera tokenizer model id: {model_id}"
+        ));
     }
-    load_hf_tokenizer(model_id).map(TokenizerBackend::HuggingFace)
+
+    Err(anyhow::anyhow!(
+        "Unknown tokenizer model id {model_id:?}; expected native:..., huggingface:..., or lindera:..."
+    ))
 }
 
 fn lindera_dict_for_model_id(model_id: &str) -> Option<crate::lindera_dict::LinderaDict> {
     match model_id {
+        LINDERA_ZH_CC_CEDICT_MODEL_ID => Some(crate::lindera_dict::LinderaDict::CcCedict),
+        JIEBA_MODEL_ID => Some(crate::lindera_dict::LinderaDict::Jieba),
         LINDERA_JA_IPADIC_MODEL_ID => Some(crate::lindera_dict::LinderaDict::JaIpadic),
+        LINDERA_JA_IPADIC_NEOLOGD_MODEL_ID => {
+            Some(crate::lindera_dict::LinderaDict::JaIpadicNeologd)
+        }
         LINDERA_JA_UNIDIC_MODEL_ID => Some(crate::lindera_dict::LinderaDict::JaUnidic),
         LINDERA_KO_DIC_MODEL_ID => Some(crate::lindera_dict::LinderaDict::KoDic),
         _ => None,
@@ -295,9 +323,10 @@ pub fn tokenize_plain_text(text: &str, lowercase: bool, remove_punctuation: bool
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_tokenizer_for_model, lindera_dict_for_model_id, loaded_model_ids,
-        tokenize_plain_text, TokenizerBackend, JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID,
-        LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID, PLAIN_WORDS_EN_MODEL_ID,
+        lindera_dict_for_model_id, load_backend, loaded_model_ids, tokenize_plain_text,
+        TokenizerBackend, JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID,
+        LINDERA_JA_IPADIC_NEOLOGD_MODEL_ID, LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID,
+        LINDERA_ZH_CC_CEDICT_MODEL_ID, PLAIN_WORDS_EN_MODEL_ID,
     };
     use crate::lindera_dict::LinderaDict;
 
@@ -317,30 +346,13 @@ mod tests {
     }
 
     #[test]
-    fn test_jieba_backend_segments_chinese_words() {
-        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
-        let tokens = backend
-            .tokenize_text("今天天气很好", false, false, true)
-            .unwrap();
-        // Jieba should produce word-level tokens, not chars. With remove_punct=true
-        // the punctuation filter still passes Chinese characters (they are
-        // is_alphanumeric per Unicode). The key invariant is that at least one
-        // token is multi-character — that is the distinguishing feature vs the
-        // bert-base-chinese char-level fallback.
-        assert!(
-            tokens.iter().any(|t| t.chars().count() > 1),
-            "expected at least one multi-char (word-level) token from Jieba, got {tokens:?}"
-        );
-    }
-
-    #[test]
     fn test_jieba_model_id_constant() {
-        assert_eq!(JIEBA_MODEL_ID, "jieba");
+        assert_eq!(JIEBA_MODEL_ID, "lindera:jieba");
     }
 
     #[test]
     fn test_plain_words_en_model_id_constant() {
-        assert_eq!(PLAIN_WORDS_EN_MODEL_ID, "plain_words_en");
+        assert_eq!(PLAIN_WORDS_EN_MODEL_ID, "native:plain_words_en");
     }
 
     #[test]
@@ -370,35 +382,25 @@ mod tests {
     }
 
     #[test]
-    fn test_jieba_offsets_reconstruct_chinese() {
-        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
-        let text = "我爱中国";
-        let toks = backend
-            .tokenize_text_with_offsets(text, false, false)
-            .unwrap();
-        for (tok, start, end) in &toks {
-            // Char-slice the text using the (start, end) char positions and
-            // verify it equals the emitted token string.
-            let extracted: String = text
-                .chars()
-                .skip(*start as usize)
-                .take((*end - *start) as usize)
-                .collect();
-            assert_eq!(
-                *tok, extracted,
-                "Jieba offset mismatch for {tok:?} ({start}..{end})"
-            );
-        }
-    }
-
-    #[test]
     fn test_lindera_model_id_constants_match_dict_kinds() {
-        // Phase 5: the three Lindera model IDs route to the matching
+        // Phase 5: the Lindera model IDs route to the matching
         // LinderaDict variant in load_backend. Catches a copy-paste
         // mistake where two ids map to the same kind.
         assert_eq!(
+            lindera_dict_for_model_id(LINDERA_ZH_CC_CEDICT_MODEL_ID),
+            Some(LinderaDict::CcCedict)
+        );
+        assert_eq!(
+            lindera_dict_for_model_id(JIEBA_MODEL_ID),
+            Some(LinderaDict::Jieba)
+        );
+        assert_eq!(
             lindera_dict_for_model_id(LINDERA_JA_IPADIC_MODEL_ID),
             Some(LinderaDict::JaIpadic)
+        );
+        assert_eq!(
+            lindera_dict_for_model_id(LINDERA_JA_IPADIC_NEOLOGD_MODEL_ID),
+            Some(LinderaDict::JaIpadicNeologd)
         );
         assert_eq!(
             lindera_dict_for_model_id(LINDERA_JA_UNIDIC_MODEL_ID),
@@ -411,43 +413,34 @@ mod tests {
     }
 
     #[test]
-    fn test_jieba_lowercase_flag_is_noop_for_cjk() {
-        // CJK has no case, so the lowercase flag must produce the same
-        // tokens whether on or off. Before the case_aware() guard, the
-        // backend paid a full to_lowercase() Unicode walk + heap clone
-        // per row for nothing; now it short-circuits to a borrow.
-        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
-        let text = "今天天气很好";
-        let tokens_lower = backend.tokenize_text(text, false, true, false).unwrap();
-        let tokens_plain = backend.tokenize_text(text, false, false, false).unwrap();
-        assert_eq!(tokens_lower, tokens_plain);
-
-        let offsets_lower = backend
-            .tokenize_text_with_offsets(text, true, false)
-            .unwrap();
-        let offsets_plain = backend
-            .tokenize_text_with_offsets(text, false, false)
-            .unwrap();
-        assert_eq!(offsets_lower, offsets_plain);
-    }
-
-    #[test]
-    fn test_case_aware_flag() {
-        // Pin the backend-classification contract so future additions
-        // (e.g. a fastText backend for CJK) explicitly opt in or out.
-        let backend = ensure_tokenizer_for_model(Some(JIEBA_MODEL_ID)).unwrap();
-        assert!(!backend.case_aware());
-    }
-
-    #[test]
     fn test_lindera_dict_for_unknown_model_id_returns_none() {
-        // Anything that isn't one of the three opaque ids falls through
-        // to the HF path in load_backend — verified here by asserting
-        // None for plausible adjacent strings.
+        // Anything that is not one of the prefixed Lindera ids should not be
+        // interpreted as a Lindera dictionary.
         assert_eq!(lindera_dict_for_model_id("lindera-ja"), None);
         assert_eq!(lindera_dict_for_model_id("ja-ipadic"), None);
-        assert_eq!(lindera_dict_for_model_id("bert-base-uncased"), None);
+        assert_eq!(
+            lindera_dict_for_model_id("huggingface:bert-base-uncased"),
+            None
+        );
         assert_eq!(lindera_dict_for_model_id("jieba"), None);
         assert_eq!(lindera_dict_for_model_id(""), None);
+    }
+
+    #[test]
+    fn test_unprefixed_model_ids_are_rejected() {
+        let err = match load_backend("bert-base-uncased") {
+            Ok(_) => panic!("unprefixed model id should be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("Unknown tokenizer model id"), "{err}");
+    }
+
+    #[test]
+    fn test_missing_model_id_is_rejected() {
+        let err = match super::ensure_tokenizer_for_model(None) {
+            Ok(_) => panic!("missing model id should be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("Tokenizer model id is required"), "{err}");
     }
 }

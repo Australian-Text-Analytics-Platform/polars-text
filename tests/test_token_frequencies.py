@@ -1,10 +1,12 @@
+from typing import Any, cast
+
 import polars as pl
 import polars_text as pt
 
 
 def test_token_frequencies_returns_dict() -> None:
     series = pl.Series("text", ["Hello world", "Hello there"])
-    freqs = pt.token_frequencies(series)
+    freqs = pt.token_frequencies(series, model="native:plain_words_en")
     assert isinstance(freqs, dict)
     assert freqs["hello"] == 2
     assert freqs["world"] == 1
@@ -13,16 +15,19 @@ def test_token_frequencies_returns_dict() -> None:
 
 def test_token_frequencies_accepts_plain_words_en_model() -> None:
     series = pl.Series("text", ["Hello, [UNK] ##sta Queensland"])
-    freqs = pt.token_frequencies(series, model="plain_words_en")
+    freqs = pt.token_frequencies(series, model="native:plain_words_en")
     assert freqs == {"hello": 1, "sta": 1, "queensland": 1}
 
 
-def test_token_frequencies_default_matches_plain_words_en() -> None:
+def test_token_frequencies_requires_model() -> None:
     series = pl.Series("text", ["Hello, world!", None])
-    assert pt.token_frequencies(series) == pt.token_frequencies(
-        series,
-        model="plain_words_en",
-    )
+    token_frequencies = cast(Any, pt.token_frequencies)
+    try:
+        token_frequencies(series)
+    except TypeError as exc:
+        assert "model" in str(exc)
+    else:
+        raise AssertionError("token_frequencies should require a model")
 
 
 def test_token_frequency_stats_columns() -> None:

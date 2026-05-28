@@ -27,9 +27,8 @@ pytestmark = [
 ]
 
 
-# Same multilingual model id we expect to populate the registry in Phase 1.8.
-ALT_MODEL_EN_MULTILINGUAL = "bert-base-multilingual-cased"
-ALT_MODEL_ZH = "bert-base-chinese"
+ALT_MODEL_EN_MULTILINGUAL = "huggingface:bert-base-multilingual-cased"
+ALT_MODEL_ZH = "huggingface:bert-base-chinese"
 
 
 def _tokens_for(text: str, *, model: str | None) -> list[str]:
@@ -39,30 +38,19 @@ def _tokens_for(text: str, *, model: str | None) -> list[str]:
     return [entry["token"] for entry in series]
 
 
-def test_default_model_omits_model_id_kwarg() -> None:
-    # Passing model=None must reproduce the pre-Phase-1 behaviour (same wire
-    # format, same kwargs payload), which protects the EN goldens from drift.
-    tokens = _tokens_for("Hello, world!", model=None)
-    assert tokens, "default tokenizer must return non-empty tokens"
-    # bert-base-uncased lowercases by default and would produce subwords like
-    # ['hello', ',', 'world', '!'] before punct removal. With remove_punct=True
-    # (the default) the punctuation is filtered.
+def test_bert_uncased_produces_non_empty_tokens() -> None:
+    tokens = _tokens_for("Hello, world!", model="huggingface:bert-base-uncased")
+    assert tokens, "bert-base-uncased must return non-empty tokens"
     assert all(tok.isalnum() or "##" in tok for tok in tokens), tokens
-
-
-def test_explicit_default_matches_implicit_default() -> None:
-    implicit = _tokens_for("The quick brown fox.", model=None)
-    explicit = _tokens_for("The quick brown fox.", model="bert-base-uncased")
-    assert implicit == explicit
 
 
 def test_different_models_produce_different_tokens_for_english() -> None:
     text = "Tokenization differs between BERT models."
-    uncased = _tokens_for(text, model="bert-base-uncased")
+    uncased = _tokens_for(text, model="huggingface:bert-base-uncased")
     multilingual = _tokens_for(text, model=ALT_MODEL_EN_MULTILINGUAL)
     assert uncased and multilingual
     assert uncased != multilingual, (
-        "bert-base-uncased and bert-base-multilingual-cased should disagree "
+        "huggingface:bert-base-uncased and huggingface:bert-base-multilingual-cased should disagree "
         "on at least one English token (different vocabularies)."
     )
 
@@ -82,6 +70,6 @@ def test_same_model_twice_is_cached() -> None:
     # the wall-time on the second call is much smaller than the first. Skip
     # explicit timing here — the cache correctness is exercised by the Rust
     # unit tests; this test just covers the happy path twice.
-    a = _tokens_for("Same input twice.", model="bert-base-uncased")
-    b = _tokens_for("Same input twice.", model="bert-base-uncased")
+    a = _tokens_for("Same input twice.", model="huggingface:bert-base-uncased")
+    b = _tokens_for("Same input twice.", model="huggingface:bert-base-uncased")
     assert a == b

@@ -9,12 +9,10 @@ from .functions import (
     word_count,
 )
 from .models import (
+    LINDERA_MODELS_BY_LANGUAGE,
     PREDEFINED_MODELS,
-    RECOMMENDED_JA_DICTS,
-    RECOMMENDED_TOKENIZERS,
     list_loaded_models,
     prefetch_model,
-    recommended_tokenizer_for,
 )
 from .token_frequencies import token_frequencies, token_frequency_stats
 
@@ -26,10 +24,8 @@ __all__ = [
     "concordance",
     "token_frequencies",
     "token_frequency_stats",
+    "LINDERA_MODELS_BY_LANGUAGE",
     "PREDEFINED_MODELS",
-    "RECOMMENDED_JA_DICTS",
-    "RECOMMENDED_TOKENIZERS",
     "list_loaded_models",
     "prefetch_model",
-    "recommended_tokenizer_for",
 ]

@@ -1,15 +1,13 @@
-"""Phase 5 Lindera integration tests — hit the real download path.
+"""Lindera integration tests — hit the real GitHub release download path.
 
-These tests download a Lindera dict from the configured HF repo
-(``LDACA_LINDERA_DICT_REPO``, default ``ldaca/lindera-dicts``) and
-verify the tokenizer produces morpheme-level JA / KO output. They are
-gated behind ``@pytest.mark.network`` AND a ``skipif`` checking for
-``LDACA_LINDERA_DICT_REPO`` so they no-op in CI / offline dev environments
-until the dict-hosting decision is finalized.
+These tests download official Lindera dictionary zips and verify the tokenizer
+produces morpheme-level JA / KO output. They are gated behind
+``@pytest.mark.network`` and an explicit opt-in env var so they no-op in CI /
+offline dev environments.
 
 Run locally with::
 
-    LDACA_LINDERA_DICT_REPO=mily/lindera-dicts uv run pytest -m network \
+    POLARS_TEXT_RUN_LINDERA_TESTS=1 uv run pytest -m network \
         polars-text/tests/test_lindera_integration.py
 """
 
@@ -22,16 +20,13 @@ import polars as pl
 import polars_text
 import pytest
 
-_DICT_REPO_ENV = "LDACA_LINDERA_DICT_REPO"
+_LINDERA_TESTS_ENV = "POLARS_TEXT_RUN_LINDERA_TESTS"
 
 pytestmark = [
     pytest.mark.network,
     pytest.mark.skipif(
-        _DICT_REPO_ENV not in os.environ,
-        reason=(
-            f"Set {_DICT_REPO_ENV} to a reachable HF dataset hosting the "
-            "Lindera dict tarballs to enable these tests."
-        ),
+        _LINDERA_TESTS_ENV not in os.environ,
+        reason=f"Set {_LINDERA_TESTS_ENV}=1 to run Lindera download tests.",
     ),
 ]
 
@@ -43,10 +38,10 @@ pytestmark = [
         # standard MeCab+IPADIC morpheme rules. We assert on the
         # individual morpheme rather than the joined surface so the
         # test survives small dict-version drift.
-        ("lindera-ja-ipadic", "関西"),
+        ("lindera:ja-ipadic", "関西"),
         # UniDic over-segments compared to IPADIC but still recognises
         # 国際 as a morpheme.
-        ("lindera-ja-unidic", "国際"),
+        ("lindera:ja-unidic", "国際"),
     ],
 )
 def test_lindera_ja_tokenize_produces_morphemes(
@@ -73,7 +68,7 @@ def test_lindera_ko_tokenize_produces_morphemes() -> None:
     result = cast(
         pl.DataFrame,
         df.lazy()
-        .select(cast(Any, pl.col("text")).text.tokenize(model="lindera-ko-dic"))
+        .select(cast(Any, pl.col("text")).text.tokenize(model="lindera:ko-dic"))
         .collect(),
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
@@ -98,7 +93,7 @@ def test_lindera_offsets_reconstruct_source() -> None:
     result = cast(
         pl.DataFrame,
         df.lazy()
-        .select(cast(Any, pl.col("text")).text.tokenize(model="lindera-ja-ipadic"))
+        .select(cast(Any, pl.col("text")).text.tokenize(model="lindera:ja-ipadic"))
         .collect(),
     )
     rows = result.to_series(0).item(0).to_list()

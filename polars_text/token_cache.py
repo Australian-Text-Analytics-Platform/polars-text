@@ -40,15 +40,20 @@ CREATE TABLE IF NOT EXISTS token_cache (
 _DB_LOCK = threading.Lock()
 
 
+def _normalise_model(model: str | None) -> str:
+    if model is None or not model.strip():
+        raise ValueError("tokenize requires an explicit tokenizer model ID")
+    return model.strip()
+
+
 def _tokenize_kwargs(
-    *, lowercase: bool, remove_punct: bool, model: str | None
+    *, lowercase: bool, remove_punct: bool, model: str
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "lowercase": lowercase,
         "remove_punct": remove_punct,
+        "model_id": model,
     }
-    if model is not None:
-        kwargs["model_id"] = model
     return kwargs
 
 
@@ -57,14 +62,15 @@ def uncached_tokenize_expr(
     *,
     lowercase: bool = True,
     remove_punct: bool = True,
-    model: str | None = None,
+    model: str,
 ) -> pl.Expr:
+    model_id = _normalise_model(model)
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
         function_name="tokenize",
         args=expr,
         kwargs=_tokenize_kwargs(
-            lowercase=lowercase, remove_punct=remove_punct, model=model
+            lowercase=lowercase, remove_punct=remove_punct, model=model_id
         ),
         is_elementwise=True,
     )
@@ -166,7 +172,7 @@ def _persist_new(
 def _tokenize_misses(
     texts: list[str],
     *,
-    model: str | None,
+    model: str,
     lowercase: bool,
     remove_punct: bool,
 ) -> list[list[dict[str, Any]]]:
@@ -243,11 +249,11 @@ def cached_tokenize_expr(
     source_expr: pl.Expr,
     *,
     cache: CachePath,
-    model: str | None,
+    model: str,
     lowercase: bool = True,
     remove_punct: bool = True,
 ) -> pl.Expr:
-    model_key = model or "bert-base-uncased"
+    model_key = _normalise_model(model)
     params = {"lowercase": lowercase, "remove_punct": remove_punct}
     params_hash = _params_hash(params)
     fn = functools.partial(

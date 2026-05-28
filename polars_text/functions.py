@@ -10,24 +10,29 @@ from .token_cache import cached_tokenize_expr, uncached_tokenize_expr
 from .utils import PLUGIN_PATH
 
 
+def _normalise_model(model: str | None) -> str:
+    if model is None or not model.strip():
+        raise ValueError("tokenize requires an explicit tokenizer model ID")
+    return model.strip()
+
+
 def _tokenize_kwargs(
-    *, lowercase: bool, remove_punct: bool, model: str | None
+    *, lowercase: bool, remove_punct: bool, model: str
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "lowercase": lowercase,
         "remove_punct": remove_punct,
+        "model_id": model,
     }
-    if model is not None:
-        kwargs["model_id"] = model
     return kwargs
 
 
 def tokenize(
     expr: IntoExpr,
     *,
+    model: str,
     lowercase: bool = True,
     remove_punct: bool = True,
-    model: str | None = None,
     cache: str | os.PathLike[str] | None = None,
 ) -> pl.Expr:
     """Tokenize and emit a list of ``{token, start, end}`` structs per row.
@@ -36,12 +41,13 @@ def tokenize(
     ``lowercase=True``) text. If ``cache`` is a path, tokenization results are
     persisted in a DuckDB cache at that location and reused by content hash.
     """
+    model_id = _normalise_model(model)
     if cache is None:
         return uncached_tokenize_expr(
             expr,
             lowercase=lowercase,
             remove_punct=remove_punct,
-            model=model,
+            model=model_id,
         )
     if not isinstance(expr, pl.Expr):
         expr = pl.col(expr) if isinstance(expr, str) else pl.lit(expr)
@@ -50,7 +56,7 @@ def tokenize(
         cache=cache,
         lowercase=lowercase,
         remove_punct=remove_punct,
-        model=model,
+        model=model_id,
     )
 
 

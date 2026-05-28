@@ -8,7 +8,9 @@ import polars_text
 
 def test_tokenize_namespace_with_model() -> None:
     df = pl.DataFrame({"text": ["Hello, world!", None]})
-    out = df.select(cast(Any, pl.col("text")).text.tokenize(model="jieba"))
+    out = df.select(
+        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
+    )
     assert out.shape == (2, 1)
     rows = out["text"].to_list()
     assert rows[0][0]["token"]
@@ -17,7 +19,9 @@ def test_tokenize_namespace_with_model() -> None:
 
 def test_tokenize_namespace() -> None:
     df = pl.DataFrame({"text": ["Hello, world!", None]})
-    out = df.select(cast(Any, pl.col("text")).text.tokenize(model="jieba"))
+    out = df.select(
+        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
+    )
     assert out.shape == (2, 1)
     rows = out["text"].to_list()
     assert rows[0][0]["token"]

@@ -8,10 +8,21 @@ persisted tokenization column on workspace nodes.
 
 from __future__ import annotations
 
+import os
 from typing import Any, cast
 
 import polars as pl
 import polars_text
+import pytest
+
+_LINDERA_JIEBA_TESTS_ENV = "POLARS_TEXT_RUN_LINDERA_JIEBA_TESTS"
+_requires_lindera_jieba = pytest.mark.skipif(
+    _LINDERA_JIEBA_TESTS_ENV not in os.environ,
+    reason=(
+        f"Set {_LINDERA_JIEBA_TESTS_ENV}=1 and provide a reachable "
+        "lindera:jieba dictionary archive to run Jieba download tests."
+    ),
+)
 
 
 def _structs(text: str, *, model: str | None) -> list[dict]:
@@ -23,7 +34,9 @@ def _structs(text: str, *, model: str | None) -> list[dict]:
 
 def test_schema_is_list_of_struct() -> None:
     df = pl.DataFrame({"text": ["Hello"]})
-    out = df.select(cast(Any, pl.col("text")).text.tokenize())
+    out = df.select(
+        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
+    )
     dtype = out.schema["text"]
     assert isinstance(dtype, pl.List)
     inner = dtype.inner
@@ -32,9 +45,11 @@ def test_schema_is_list_of_struct() -> None:
     assert field_names == {"token", "start", "end"}
 
 
+@pytest.mark.network
+@_requires_lindera_jieba
 def test_jieba_offsets_reconstruct_chinese() -> None:
     text = "我爱中国"
-    rows = _structs(text, model="jieba")
+    rows = _structs(text, model="lindera:jieba")
     assert rows, "Jieba returned no tokens"
     # Default lowercase=True doesn't change Chinese chars; reconstruction
     # via char-slice must match the token string.
@@ -48,7 +63,7 @@ def test_jieba_offsets_reconstruct_chinese() -> None:
 
 def test_hf_offsets_reconstruct_english_lowercased() -> None:
     text = "Tokenization happens fast"
-    rows = _structs(text, model=None)  # default = bert-base-uncased
+    rows = _structs(text, model="huggingface:bert-base-uncased")
     assert rows, "default HF tokenizer returned no tokens"
     text_lc = text.lower()
     for row in rows:
@@ -63,15 +78,21 @@ def test_hf_offsets_reconstruct_english_lowercased() -> None:
         )
 
 
-def test_explicit_default_matches_implicit_default() -> None:
-    a = _structs("hello world", model=None)
-    b = _structs("hello world", model="bert-base-uncased")
-    assert a == b
+def test_model_is_required() -> None:
+    df = pl.DataFrame({"text": ["hello world"]})
+    try:
+        df.select(cast(Any, pl.col("text")).text.tokenize())
+    except TypeError as exc:
+        assert "model" in str(exc)
+    else:
+        raise AssertionError("tokenize should require a model")
 
 
+@pytest.mark.network
+@_requires_lindera_jieba
 def test_offsets_are_monotonically_nondecreasing_for_jieba() -> None:
     # Jieba word tokens shouldn't overlap and should advance through the text.
-    rows = _structs("他来到了北京清华大学", model="jieba")
+    rows = _structs("他来到了北京清华大学", model="lindera:jieba")
     prev_end = 0
     for row in rows:
         assert row["start"] >= prev_end, row
@@ -81,7 +102,9 @@ def test_offsets_are_monotonically_nondecreasing_for_jieba() -> None:
 
 def test_empty_text_returns_empty_list() -> None:
     df = pl.DataFrame({"text": [""]})
-    out = df.select(cast(Any, pl.col("text")).text.tokenize())
+    out = df.select(
+        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
+    )
     rows = out["text"].to_list()[0]
     # Should be empty or a list of zero structs.
     assert list(rows) == []
@@ -94,7 +117,9 @@ def test_null_text_in_mixed_column_returns_empty_list() -> None:
     # column is inferred String, then verify the None row produces an empty
     # token list.
     df = pl.DataFrame({"text": ["Hello", None]})
-    out = df.select(cast(Any, pl.col("text")).text.tokenize())
+    out = df.select(
+        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
+    )
     rows = out["text"].to_list()
     assert len(rows) == 2
     assert list(rows[1]) == []

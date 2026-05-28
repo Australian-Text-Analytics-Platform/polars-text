@@ -8,14 +8,18 @@ import polars as pl
 import polars_text
 import polars_text.token_cache as token_cache
 
+MODEL_ID = "native:plain_words_en"
+
 
 def test_cached_tokenize_matches_uncached_output(tmp_path: Path) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     df = pl.DataFrame({"text": ["hello world", "hello again", None]})
 
-    uncached = df.select(cast(Any, pl.col("text")).text.tokenize()).to_dicts()
+    uncached = df.select(
+        cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID)
+    ).to_dicts()
     cached = df.select(
-        cast(Any, pl.col("text")).text.tokenize(cache=cache_path)
+        cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     ).to_dicts()
 
     assert cached == uncached
@@ -25,7 +29,7 @@ def test_cached_tokenize_matches_uncached_output(tmp_path: Path) -> None:
 def test_cache_schema_has_six_columns(tmp_path: Path) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     df = pl.DataFrame({"text": ["hello world"]})
-    df.select(cast(Any, pl.col("text")).text.tokenize(cache=cache_path))
+    df.select(cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path))
 
     with duckdb.connect(str(cache_path), read_only=True) as conn:
         rows = conn.execute("DESCRIBE token_cache").fetchall()
@@ -43,7 +47,7 @@ def test_cache_schema_has_six_columns(tmp_path: Path) -> None:
 def test_warm_cache_does_not_retokenize(tmp_path: Path, monkeypatch: Any) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     base = pl.DataFrame({"text": ["hello world", "hello world"]}).lazy()
-    expr = cast(Any, pl.col("text")).text.tokenize(cache=cache_path)
+    expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     base.with_columns(expr.alias("tokens")).collect()
 
     def fail(*args: Any, **kwargs: Any) -> Any:
@@ -77,7 +81,7 @@ def test_filter_pushdown_only_tokenizes_surviving_rows(
 
     monkeypatch.setattr(token_cache, "_tokenize_misses", spy)
 
-    expr = cast(Any, pl.col("text")).text.tokenize(cache=cache_path)
+    expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     filtered = (
         base.with_columns(expr.alias("tokens")).filter(pl.col("id") == 3).collect()
     )
@@ -103,7 +107,7 @@ def test_repeated_texts_in_chunk_are_deduplicated(
 
     monkeypatch.setattr(token_cache, "_tokenize_misses", spy)
 
-    expr = cast(Any, pl.col("text")).text.tokenize(cache=cache_path)
+    expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     out = cast(pl.DataFrame, base.with_columns(expr.alias("tokens")).collect())
 
     assert out.height == 3

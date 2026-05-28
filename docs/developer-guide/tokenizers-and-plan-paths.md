@@ -15,29 +15,41 @@ backend on a cache miss. Loaded backends are shared by `Arc`.
 
 `TokenizerBackend` supports:
 
-- `plain_words_en` for local rule-based English word tokenization,
-- Hugging Face `tokenizers::Tokenizer`,
-- Lindera for Chinese Jieba word segmentation and Japanese/Korean
-  morphological segmentation.
+- `native:*` IDs for in-process tokenizers. Today this is only
+  `native:plain_words_en` for local rule-based English word tokenization.
+- `huggingface:*` IDs for Hugging Face `tokenizers::Tokenizer` repos. The
+  prefix is stripped before the repo ID is passed to `hf-hub`; for example
+  `huggingface:bert-base-uncased` downloads `tokenizer.json` from the
+  `bert-base-uncased` model repo.
+- `lindera:*` IDs for Chinese CC-CEDICT / Jieba word segmentation, Japanese
+  IPADIC / IPADIC-neologd / UniDic morphological segmentation, and Korean
+  ko-dic morphological segmentation.
 
-`plain_words_en` is stateless and uses the BERT pre-tokenizer without loading a
+`native:plain_words_en` is stateless and uses the BERT pre-tokenizer without loading a
 model. Hugging Face models are loaded from `tokenizer.json` through `hf-hub`.
-Jieba is embedded through Lindera. Japanese and Korean Lindera dictionaries are
-downloaded on first use.
+No Lindera dictionaries are embedded in the extension. Every `lindera:*`
+dictionary is downloaded on first use.
 
 ## Lindera Dictionaries
 
-`src/lindera_dict.rs` downloads prebuilt dictionary tarballs from the Hugging
-Face dataset `SIH/lindera-dicts`, unless `LDACA_LINDERA_DICT_REPO` overrides
-the repo for tests.
+`src/lindera_dict.rs` downloads official prebuilt dictionary zips from the
+Lindera GitHub Releases page on first use.
 
-The cache is stored under the OS cache directory in `ldaca/lindera/`. A lock
-file prevents simultaneous extract races. A dictionary is considered complete
-when `matrix.mtx` exists in the extracted directory.
+The cache is stored under `$HOME/.cache/ldaca/`, or under `LINDERA_DICT_PATH`
+when that environment variable is set. A lock file prevents simultaneous
+extract races. A dictionary is considered complete when `matrix.mtx` exists in
+the extracted directory.
+
+Lindera's own `LINDERA_CACHE` and `LINDERA_DICTIONARIES_PATH` variables are
+used by Lindera dictionary crates at build time. At runtime, when embedded
+dictionaries are disabled, Lindera's `load_dictionary` API accepts an
+`embedded://` URI, a `file://` URI, or a filesystem path. Because this build
+does not embed dictionaries, `polars-text` must resolve an on-disk dictionary
+directory and pass that concrete path to Lindera.
 
 ## Case And Offset Handling
 
-Only `plain_words_en` and Hugging Face tokenizers are case-aware. Lindera
+Only `native:plain_words_en` and Hugging Face tokenizers are case-aware. Lindera
 backends operate on scripts where case-folding is not meaningful, so the
 lowercase branch returns a borrowed string instead of allocating a lowercase
 copy.
@@ -49,7 +61,7 @@ tokens)`.
 
 ## Plain Tokenizer
 
-`plain_words_en` and the legacy `tokenize_plain_text()` wrapper use the BERT
+`native:plain_words_en` and the legacy `tokenize_plain_text()` wrapper use the BERT
 pre-tokenizer and remove punctuation or special tokens when requested. Token
 frequency counting now routes through the same backend dispatch as
 `.text.tokenize(model=...)`; the legacy helper remains for concordance context

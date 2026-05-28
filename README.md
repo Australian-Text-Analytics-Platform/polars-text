@@ -22,7 +22,11 @@ out = df.with_columns([
     pl.col("text").text.word_count().alias("word_count"),
     pl.col("text").text.char_count().alias("char_count"),
     pl.col("text").text.sentence_count().alias("sentence_count"),
-    pl.col("text").text.tokenize(lowercase=True, remove_punct=True).alias("tokens"),
+    pl.col("text").text.tokenize(
+        model="native:plain_words_en",
+        lowercase=True,
+        remove_punct=True,
+    ).alias("tokens"),
 ])
 ```
 
@@ -32,7 +36,7 @@ Tokenization is available through the `text` namespace on expressions.
 
 ### Tokenization
 
-- `pl.col("text").text.tokenize(lowercase=True, remove_punct=True, model=None, cache=None)`
+- `pl.col("text").text.tokenize(model="native:plain_words_en", lowercase=True, remove_punct=True, cache=None)`
 - `clean_text(expr)`
 - `word_count(expr)`
 - `char_count(expr)`
@@ -47,14 +51,15 @@ df = pl.DataFrame({"text": ["Hello world, hello again."]})
 out = df.select([
     pl.col("text").text.clean_text().alias("clean"),
     pl.col("text").text.word_count().alias("word_count"),
-    pl.col("text").text.tokenize().alias("tokens"),
+    pl.col("text").text.tokenize(model="native:plain_words_en").alias("tokens"),
 ])
 ```
 
 `tokenize` returns a list of structs with `token`, `start`, and `end`
-character offsets. Pass `cache=Path("tokens.duckdb")` to persist tokenization
-results in a DuckDB cache and reuse them by content hash; leave `cache=None`
-to compute directly through the Rust plugin.
+character offsets. Pass an explicit `native:`, `huggingface:`, or `lindera:`
+model ID. Pass `cache=Path("tokens.duckdb")` to persist tokenization results in
+a DuckDB cache and reuse them by content hash; leave `cache=None` to compute
+directly through the Rust plugin.
 
 ## Concordance
 
@@ -82,8 +87,8 @@ Compute corpus token counts and compare corpora with standard statistics.
 series_0 = pl.Series("text", ["hello world", "hello again"])
 series_1 = pl.Series("text", ["goodbye world"])
 
-freqs_0 = pt.token_frequencies(series_0)
-freqs_1 = pt.token_frequencies(series_1)
+freqs_0 = pt.token_frequencies(series_0, model="native:plain_words_en")
+freqs_1 = pt.token_frequencies(series_1, model="native:plain_words_en")
 
 stats = pt.token_frequency_stats(freqs_0, freqs_1)
 ```
@@ -104,10 +109,13 @@ stats = pt.token_frequency_stats(freqs_0, freqs_1)
 
 ## Models and downloads
 
-Some features download Hugging Face models on first use (via `hf-hub`) and run
-on CPU:
+Some features download tokenizer assets on first use and run on CPU:
 
-- Tokenization: `bert-base-uncased` (`tokenizer.json`)
+- Hugging Face tokenizers: for example `huggingface:bert-base-uncased`
+  (`tokenizer.json` via `hf-hub`)
+- Lindera dictionaries: `lindera:cc-cedict`, `lindera:jieba`,
+  `lindera:ja-ipadic`, `lindera:ja-ipadic-neologd`, `lindera:ja-unidic`,
+  and `lindera:ko-dic` from official Lindera release zips
 
 The initial call may take longer while models download and cache.
 

@@ -21,9 +21,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
-import pytest
-
 import polars_text as pt
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_EN = REPO_ROOT / "tests" / "fixtures" / "multilingual" / "literary" / "en.csv"
@@ -45,7 +44,7 @@ CONTEXT_TOKENS = 5
 
 def _compute_token_frequency_top_k() -> pl.DataFrame:
     df = pl.read_csv(FIXTURE_EN)
-    freq = pt.token_frequencies(df["text"])
+    freq = pt.token_frequencies(df["text"], model="native:plain_words_en")
     top = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_K]
     return pl.DataFrame(
         {"token": [t for t, _ in top], "frequency": [f for _, f in top]}
@@ -98,9 +97,7 @@ def test_token_frequency_baseline_en_literary() -> None:
 
 def test_concordance_baseline_en_literary() -> None:
     actual_csv = _compute_concordance().write_csv()
-    golden_path = (
-        GOLDEN_DIR / f"concordance_literary_en_{CONCORDANCE_KEYWORD}.csv"
-    )
+    golden_path = GOLDEN_DIR / f"concordance_literary_en_{CONCORDANCE_KEYWORD}.csv"
     golden_csv = golden_path.read_text()
     assert actual_csv == golden_csv, (
         f"Concordance baseline drift on literary/en.csv (keyword={CONCORDANCE_KEYWORD!r}). "

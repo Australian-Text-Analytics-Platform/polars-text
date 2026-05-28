@@ -22,13 +22,14 @@ expression namespace with Polars.
 passes `PLUGIN_PATH`, the Rust function name, input expression, keyword
 arguments, and `is_elementwise=True`.
 
-Tokenization is available through the `.text` expression namespace:
+Tokenization is available through the `.text` expression namespace. Callers must
+pass an explicit tokenizer model ID:
 
 ```python
 import polars as pl
 import polars_text
 
-pl.col("text").text.tokenize()
+pl.col("text").text.tokenize(model="native:plain_words_en")
 ```
 
 `tokenize()` returns a list of structs with `token`, `start`, and `end`
@@ -49,12 +50,10 @@ The namespace is intentionally thin. It forwards to functions in
 
 ## Token Frequencies
 
-`token_frequencies(series, model=None)` accepts a Polars `Series`, normalizes
-`None` to an empty string, and calls the Rust `token_frequencies` helper. When
-`model` is omitted, token frequency counting uses the predefined
-`plain_words_en` backend so it matches the historical rule-based English word
-tokenizer. Passing any predefined tokenizer ID or Hugging Face model ID routes
-through the same model registry as `.text.tokenize(model=...)`.
+`token_frequencies(series, model=...)` accepts a Polars `Series`, normalizes
+`None` values to empty strings, and calls the Rust `token_frequencies` helper.
+Callers must pass an explicit predefined tokenizer ID or Hugging Face model ID;
+the model routes through the same registry as `.text.tokenize(model=...)`.
 
 `token_frequency_stats(corpus_0, corpus_1)` builds a Polars DataFrame with
 frequencies, expected counts, log likelihood, BIC-style Bayes factor,
@@ -64,20 +63,16 @@ post-processing over already-counted dictionaries.
 
 ## Model Helpers
 
-`models.py` contains curated tokenizer ids:
+`models.py` exposes inventory, not recommendation policy:
 
-- predefined local IDs: `plain_words_en`, `jieba`, `lindera-ja-ipadic`,
-  `lindera-ja-unidic`, `lindera-ko-dic`, exposed as `PREDEFINED_MODELS`,
-- English: `plain_words_en`,
-- Chinese: `jieba` through Lindera Jieba,
-- Japanese: `lindera-ja-ipadic`,
-- Korean: `lindera-ko-dic`,
-- multilingual: `xlm-roberta-base`,
-- fallback: `bert-base-multilingual-cased`.
+- `PREDEFINED_MODELS` maps predefined model IDs to supported language codes.
+  It includes `native:plain_words_en`, `huggingface:bert-base-uncased`,
+  `lindera:cc-cedict`, `lindera:jieba`, `lindera:ja-ipadic`,
+  `lindera:ja-ipadic-neologd`, `lindera:ja-unidic`, and `lindera:ko-dic`.
+- `LINDERA_MODELS_BY_LANGUAGE` groups the Lindera dictionary-backed IDs by
+  supported language: `zh`, `ja`, and `ko`.
 
-`recommended_tokenizer_for()` falls back to the multilingual model for unknown
-language codes. `prefetch_model()` and `list_loaded_models()` call the Rust
-registry wrappers.
+`prefetch_model()` and `list_loaded_models()` call the Rust registry wrappers.
 
 ## Plan Source Utilities
 
