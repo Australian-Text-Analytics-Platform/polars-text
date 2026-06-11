@@ -6,6 +6,7 @@ from .functions import (
     clean_text,
     concordance,
     sentence_count,
+    topic_modeling,
     word_count,
 )
 from .models import (
@@ -22,6 +23,7 @@ __all__ = [
     "char_count",
     "sentence_count",
     "concordance",
+    "topic_modeling",
     "token_frequencies",
     "token_frequency_stats",
     "LINDERA_MODELS_BY_LANGUAGE",

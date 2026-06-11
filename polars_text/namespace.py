@@ -57,3 +57,33 @@ class TextNamespace:
 
     def sentence_count(self) -> pl.Expr:
         return functions.sentence_count(self._expr)
+
+    def topic_modeling(
+        self,
+        *,
+        embedder_model: str | None = None,
+        max_tokens: int = 256,
+        overlap: int = 32,
+        reduce_dims: int = 5,
+        seed: int = 42,
+        min_cluster_size: int = 10,
+        min_samples: int | None = None,
+        top_k: int = 10,
+        vectorizer_model: str | None = None,
+        lowercase: bool = True,
+        stopwords: list[str] | None = None,
+    ) -> pl.Expr:
+        return functions.topic_modeling(
+            self._expr,
+            embedder_model=embedder_model,
+            max_tokens=max_tokens,
+            overlap=overlap,
+            reduce_dims=reduce_dims,
+            seed=seed,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            top_k=top_k,
+            vectorizer_model=vectorizer_model,
+            lowercase=lowercase,
+            stopwords=stopwords,
+        )

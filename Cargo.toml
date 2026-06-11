@@ -35,4 +35,22 @@ pyo3-polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0"
 ] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-tokenizers = "0.22.2"
+tokenizers = "0.23"
+
+# --- Topic-modeling pipeline (Rust BERTopic replacement) ---
+# candle: pure-Rust in-process embeddings (no ONNX runtime bundled). Used by
+# src/topic_modeling/embedding.rs to run the multilingual MiniLM encoder.
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+serde_json = "1"
+# text-splitter: industry-standard recursive/semantic chunking, tokenizer-budget
+# aware. Used by src/topic_modeling/chunking.rs.
+text-splitter = { version = "0.31", features = ["tokenizers"] }
+# pacmap: PaCMAP dimensionality reduction (ndarray 0.16). Used by
+# src/topic_modeling/reduce.rs. No PCA-to-50 fallback — PaCMAP only.
+pacmap = "0.2"
+ndarray = "0.16"
+# hdbscan: density-based clustering of reduced chunk embeddings into topics.
+# Used by src/topic_modeling/cluster.rs.
+hdbscan = "0.12"
