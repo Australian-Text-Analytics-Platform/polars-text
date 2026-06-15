@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3_polars::PolarsAllocator;
 
+mod cache;
 mod concordance;
 pub mod expressions;
 mod lindera_dict;
@@ -41,7 +42,7 @@ fn loaded_tokenizers_py() -> Vec<String> {
     tokenizer::loaded_model_ids()
 }
 
-/// Download/load the candle embedder for `repo_id` (default model if `None`) so
+/// Download/load the ONNX Runtime embedder for `repo_id` (default model if `None`) so
 /// a later `run_topic_modeling` call doesn't pay the load cost. Mirrors
 /// `prefetch_tokenizer`.
 #[pyfunction(name = "prefetch_embedder")]
@@ -49,7 +50,7 @@ fn loaded_tokenizers_py() -> Vec<String> {
 fn prefetch_embedder_py(repo_id: Option<String>) -> PyResult<()> {
     topic_modeling::embedding::ensure_embedder(repo_id.as_deref())
         .map(|_| ())
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
 }
 
 /// Repo ids of embedders currently resident in the in-process registry.

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import polars as pl
 from polars._typing import IntoExpr
 from polars.plugins import register_plugin_function
 
-from .token_cache import cached_tokenize_expr, uncached_tokenize_expr
 from .utils import PLUGIN_PATH
 
 
@@ -17,12 +17,17 @@ def _normalise_model(model: str | None) -> str:
 
 
 def _tokenize_kwargs(
-    *, lowercase: bool, remove_punct: bool, model: str
+    *,
+    lowercase: bool,
+    remove_punct: bool,
+    model: str,
+    cache: str | os.PathLike[str] | None,
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "lowercase": lowercase,
         "remove_punct": remove_punct,
         "model_id": model,
+        "cache": str(Path(cache)) if cache is not None else None,
     }
     return kwargs
 
@@ -42,21 +47,17 @@ def tokenize(
     persisted in a DuckDB cache at that location and reused by content hash.
     """
     model_id = _normalise_model(model)
-    if cache is None:
-        return uncached_tokenize_expr(
-            expr,
+    return register_plugin_function(
+        plugin_path=PLUGIN_PATH,
+        function_name="tokenize",
+        args=expr,
+        kwargs=_tokenize_kwargs(
             lowercase=lowercase,
             remove_punct=remove_punct,
             model=model_id,
-        )
-    if not isinstance(expr, pl.Expr):
-        expr = pl.col(expr) if isinstance(expr, str) else pl.lit(expr)
-    return cached_tokenize_expr(
-        expr,
-        cache=cache,
-        lowercase=lowercase,
-        remove_punct=remove_punct,
-        model=model_id,
+            cache=cache,
+        ),
+        is_elementwise=True,
     )
 
 
@@ -120,10 +121,38 @@ def sentence_count(expr: IntoExpr) -> pl.Expr:
     )
 
 
+def embedding(
+    expr: IntoExpr,
+    *,
+    embedder_model: str | None = None,
+    cache: str | os.PathLike[str] | None = None,
+    batch_size: int | None = None,
+) -> pl.Expr:
+    """Embed string or list-of-string values with an ONNX sentence model.
+
+    The Rust plugin owns model download/loading and only accepts Hugging Face
+    repositories that publish ONNX artifacts. If ``cache`` is provided, vectors
+    are persisted in the DuckDB file at that path and reused by text hash.
+    """
+    kwargs: dict[str, object] = {
+        "embedder_model": embedder_model,
+        "cache": str(Path(cache)) if cache is not None else None,
+        "batch_size": batch_size,
+    }
+    return register_plugin_function(
+        plugin_path=PLUGIN_PATH,
+        function_name="embedding",
+        args=expr,
+        kwargs=kwargs,
+        is_elementwise=True,
+    )
+
+
 def topic_modeling(
     expr: IntoExpr,
     *,
     embedder_model: str | None = None,
+    cache: str | os.PathLike[str] | None = None,
     max_tokens: int = 256,
     overlap: int = 32,
     reduce_dims: int = 5,
@@ -143,14 +172,15 @@ def topic_modeling(
 
     ``{dominant_topic: i32, topic_distribution: list[{topic_id, proportion}],
     representative_words: list[str], x: f32, y: f32, n_topics: u32,
-    n_chunks: u32}``
+    n_chunks: u32, stage_timings_ms: list[{stage, elapsed_ms}]}``
 
     Topic-level fields (``representative_words``/``x``/``y``) are replicated onto
-    every row under its dominant topic, and ``n_topics``/``n_chunks`` are global
-    counts replicated per row, so callers can recover the bubble chart and
-    per-corpus sizes with a plain ``group_by('dominant_topic')`` without any
-    extra orchestration. Outlier rows (``dominant_topic == -1``) get an empty
-    ``representative_words`` list and origin coords.
+    every row under its dominant topic, and ``n_topics``/``n_chunks`` plus
+    ``stage_timings_ms`` are global run metadata replicated per row, so callers
+    can recover the bubble chart and per-corpus sizes with a plain
+    ``group_by('dominant_topic')`` without any extra orchestration. Outlier rows
+    (``dominant_topic == -1``) get an empty ``representative_words`` list and
+    origin coords.
 
     The topic count is whatever HDBSCAN yields for ``min_cluster_size`` (the only
     native topic-count control); there is no post-fit merge to a requested count.
@@ -164,6 +194,7 @@ def topic_modeling(
         args=expr,
         kwargs={
             "embedder_model": embedder_model,
+            "cache": str(Path(cache)) if cache is not None else None,
             "max_tokens": max_tokens,
             "overlap": overlap,
             "reduce_dims": reduce_dims,
@@ -186,5 +217,6 @@ __all__ = [
     "word_count",
     "char_count",
     "sentence_count",
+    "embedding",
     "topic_modeling",
 ]

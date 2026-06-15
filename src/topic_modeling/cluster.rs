@@ -119,7 +119,10 @@ mod tests {
         assert_eq!(res.n_topics, 2, "labels: {:?}", res.labels);
         assert_eq!(*res.labels.last().unwrap(), OUTLIER_LABEL);
         // Real labels are contiguous from zero.
-        assert!(res.labels.iter().all(|&l| l == OUTLIER_LABEL || (0..2).contains(&l)));
+        assert!(res
+            .labels
+            .iter()
+            .all(|&l| l == OUTLIER_LABEL || (0..2).contains(&l)));
     }
 
     #[test]

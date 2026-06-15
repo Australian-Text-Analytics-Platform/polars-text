@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(docs.len(), 1);
         let d = &docs[0];
         assert_eq!(d.dominant_topic, 0); // topic 0 has the most chunks
-        // Proportions: topic 0 = 0.5, topic 1 = 0.25, outlier = 0.25, sorted asc.
+                                         // Proportions: topic 0 = 0.5, topic 1 = 0.25, outlier = 0.25, sorted asc.
         assert_eq!(d.topic_distribution.len(), 3);
         assert_eq!(d.topic_distribution[0].topic_id, OUTLIER_LABEL);
         let sum: f32 = d.topic_distribution.iter().map(|p| p.proportion).sum();
@@ -186,15 +186,27 @@ mod tests {
         let docs = vec![
             DocumentTopics {
                 topic_distribution: vec![
-                    TopicProportion { topic_id: 0, proportion: 0.5 },
-                    TopicProportion { topic_id: 1, proportion: 0.5 },
+                    TopicProportion {
+                        topic_id: 0,
+                        proportion: 0.5,
+                    },
+                    TopicProportion {
+                        topic_id: 1,
+                        proportion: 0.5,
+                    },
                 ],
                 dominant_topic: 0,
             },
             DocumentTopics {
                 topic_distribution: vec![
-                    TopicProportion { topic_id: OUTLIER_LABEL, proportion: 0.25 },
-                    TopicProportion { topic_id: 0, proportion: 0.75 },
+                    TopicProportion {
+                        topic_id: OUTLIER_LABEL,
+                        proportion: 0.25,
+                    },
+                    TopicProportion {
+                        topic_id: 0,
+                        proportion: 0.75,
+                    },
                 ],
                 dominant_topic: 0,
             },

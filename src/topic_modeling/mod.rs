@@ -4,7 +4,7 @@
 //! Pipeline (one uniform path for short and long text alike):
 //!   1. `chunking`  — split each document into token-budgeted semantic chunks
 //!      (a short document is simply one chunk).
-//!   2. `embedding` — candle multilingual sentence embeddings per chunk.
+//!   2. `embedding` — ONNX Runtime sentence embeddings per chunk.
 //!   3. `reduce`    — PaCMAP dimensionality reduction for clusterability.
 //!   4. `cluster`   — HDBSCAN groups chunks into topics (with `-1` outliers).
 //!   5. `ctfidf`    — c-TF-IDF keyword labels per topic.
@@ -28,11 +28,12 @@ pub mod cluster;
 pub mod coords;
 pub mod ctfidf;
 pub mod embedding;
+pub mod embedding_cache;
 pub mod plugin;
 pub mod reduce;
 pub mod rollup;
 
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path, time::Instant};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -41,20 +42,27 @@ use crate::tokenizer::PLAIN_WORDS_EN_MODEL_ID;
 use chunking::ChunkingConfig;
 use cluster::ClusterConfig;
 use ctfidf::CtfidfConfig;
+use embedding_cache::{get_or_insert_embeddings, CacheScope};
 use reduce::{ReduceConfig, MIN_POINTS_FOR_REDUCTION};
 
 /// Number of dimensions for the visualization-only reduction feeding the bubble
 /// chart. Always 2 (x, y).
 const COORD_DIMS: usize = 2;
 
+/// ORT inference batch size for topic-modeling chunks. This mirrors the public
+/// `.text.embedding(batch_size=None)` default so topic modeling is bounded even
+/// when a corpus yields thousands of chunks.
+const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
+
 /// All knobs for one topic-modeling run. The backend maps its public options
 /// (`min_topic_size`, `representative_words_count`, `random_seed`, sampling,
 /// CJK vectorizer choice) onto these fields.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    /// HF repo id of the candle embedder; `None` uses the default multilingual
-    /// model validated in Phase 0.
+    /// HF repo id of the ONNX embedder; `None` uses the default ONNX model.
     pub embedder_repo_id: Option<String>,
+    /// Optional path to the per-user DuckDB embedding cache (`embeddings.duckdb`).
+    pub embedding_cache_path: Option<String>,
     pub chunking: ChunkingConfig,
     /// PaCMAP clustering-space dimensionality (≈5–15).
     pub reduce_dims: usize,
@@ -73,6 +81,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             embedder_repo_id: None,
+            embedding_cache_path: None,
             chunking: ChunkingConfig::default(),
             reduce_dims: ReduceConfig::default().output_dims,
             seed: ReduceConfig::default().seed,
@@ -110,6 +119,13 @@ pub struct DocumentResult {
     pub topic_distribution: Vec<(i32, f32)>,
 }
 
+/// One measured native topic-modeling stage, in milliseconds.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageTiming {
+    pub stage: String,
+    pub elapsed_ms: f64,
+}
+
 /// Full pipeline output handed back to Python.
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicModelingResult {
@@ -117,6 +133,37 @@ pub struct TopicModelingResult {
     pub documents: Vec<DocumentResult>,
     pub n_chunks: usize,
     pub n_topics: usize,
+    pub stage_timings_ms: Vec<StageTiming>,
+}
+
+fn record_stage_timing(
+    stage_timings_ms: &mut Vec<StageTiming>,
+    stage: &'static str,
+    started_at: Instant,
+) {
+    stage_timings_ms.push(StageTiming {
+        stage: stage.to_string(),
+        elapsed_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+    });
+}
+
+fn encode_topic_embedding_batches(
+    texts: &[String],
+    mut encode_batch: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut vectors = Vec::with_capacity(texts.len());
+    for batch in texts.chunks(TOPIC_EMBEDDING_BATCH_SIZE) {
+        let encoded = encode_batch(batch)?;
+        if encoded.len() != batch.len() {
+            anyhow::bail!(
+                "topic embedding batch encoder returned {} vectors for {} texts",
+                encoded.len(),
+                batch.len()
+            );
+        }
+        vectors.extend(encoded);
+    }
+    Ok(vectors)
 }
 
 /// Run the full pipeline on `documents`, with `corpus_indices[d]` naming each
@@ -143,23 +190,54 @@ pub fn run(
         );
     }
 
+    let total_started_at = Instant::now();
+    let mut stage_timings_ms = Vec::new();
+
+    let stage_started_at = Instant::now();
     let embedder = embedding::ensure_embedder(cfg.embedder_repo_id.as_deref())?;
+    record_stage_timing(&mut stage_timings_ms, "embedder_load", stage_started_at);
+
+    let stage_started_at = Instant::now();
     let chunks = chunking::chunk_documents(documents, embedder.sizing_tokenizer(), &cfg.chunking)?;
+    record_stage_timing(&mut stage_timings_ms, "chunking", stage_started_at);
     let n_chunks = chunks.len();
 
-    // Stage 2-4 produce: a topic label per chunk, the topic count, and a 2D
+    // Materialize embeddings for every non-empty chunk set before the tiny-
+    // corpus guard so the DuckDB embedding cache observes all text pieces. The
+    // guard below skips only PaCMAP/HDBSCAN when there are too few points.
+    let embeddings: Vec<Vec<f32>> = if n_chunks == 0 {
+        Vec::new()
+    } else {
+        let stage_started_at = Instant::now();
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        let embeddings = if let Some(cache_path) = cfg.embedding_cache_path.as_deref() {
+            get_or_insert_embeddings(
+                Path::new(cache_path),
+                CacheScope {
+                    model_id: embedder.model_id(),
+                    revision: embedder.model_revision(),
+                    provider_id: embedder.provider_id(),
+                },
+                &texts,
+                |misses| encode_topic_embedding_batches(misses, |batch| embedder.encode(batch)),
+            )?
+        } else {
+            encode_topic_embedding_batches(&texts, |batch| embedder.encode(batch))?
+        };
+        record_stage_timing(&mut stage_timings_ms, "embedding", stage_started_at);
+        embeddings
+    };
+
+    // Stages 3-4 produce: a topic label per chunk, the topic count, and a 2D
     // coordinate per topic. The guard branches differ only in how labels/coords
     // are obtained — everything downstream is identical (no length branching).
-    let (labels, n_topics, coords): (Vec<i32>, usize, Vec<(f32, f32)>) =
-        if n_chunks == 0 {
-            (Vec::new(), 0, Vec::new())
-        } else if n_chunks < MIN_POINTS_FOR_REDUCTION {
-            // Too few chunks for PaCMAP to fit a neighbor graph: one topic.
-            (vec![0; n_chunks], 1, vec![(0.0, 0.0)])
-        } else {
-        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let embeddings = embedder.encode(&texts)?;
-
+    let (labels, n_topics, coords): (Vec<i32>, usize, Vec<(f32, f32)>) = if n_chunks == 0 {
+        (Vec::new(), 0, Vec::new())
+    } else if n_chunks < MIN_POINTS_FOR_REDUCTION {
+        // Too few chunks for PaCMAP to fit a neighbor graph: one topic.
+        (vec![0; n_chunks], 1, vec![(0.0, 0.0)])
+    } else {
+        let stage_started_at = Instant::now();
         let reduced = reduce::reduce(
             &embeddings,
             &ReduceConfig {
@@ -167,14 +245,18 @@ pub fn run(
                 seed: cfg.seed,
             },
         )?;
+        record_stage_timing(&mut stage_timings_ms, "reduce_clustering", stage_started_at);
 
         // The topic count is whatever HDBSCAN yields for the configured
         // `min_cluster_size` (the only native topic-count control); there is no
         // post-fit merge step.
+        let stage_started_at = Instant::now();
         let clustered = cluster::cluster(&reduced, &cfg.cluster)?;
         let labels = clustered.labels;
         let n_topics = clustered.n_topics;
+        record_stage_timing(&mut stage_timings_ms, "hdbscan", stage_started_at);
 
+        let stage_started_at = Instant::now();
         let two_d = reduce::reduce(
             &embeddings,
             &ReduceConfig {
@@ -182,7 +264,15 @@ pub fn run(
                 seed: cfg.seed,
             },
         )?;
+        record_stage_timing(
+            &mut stage_timings_ms,
+            "reduce_coordinates",
+            stage_started_at,
+        );
+
+        let stage_started_at = Instant::now();
         let coords = coords::topic_coords_2d(&two_d, &labels, n_topics);
+        record_stage_timing(&mut stage_timings_ms, "topic_coordinates", stage_started_at);
         (labels, n_topics, coords)
     };
 
@@ -201,16 +291,32 @@ pub fn run(
         .vectorizer_model_id
         .as_deref()
         .unwrap_or(PLAIN_WORDS_EN_MODEL_ID);
-    let term_counts =
-        ctfidf::count_topic_terms(&topic_texts, Some(vectorizer), cfg.lowercase, &cfg.stopwords)?;
+    let stage_started_at = Instant::now();
+    let term_counts = ctfidf::count_topic_terms(
+        &topic_texts,
+        Some(vectorizer),
+        cfg.lowercase,
+        &cfg.stopwords,
+    )?;
+    record_stage_timing(
+        &mut stage_timings_ms,
+        "ctfidf_count_terms",
+        stage_started_at,
+    );
+
+    let stage_started_at = Instant::now();
     let keywords = ctfidf::ctfidf_scores(&term_counts, &cfg.ctfidf);
+    record_stage_timing(&mut stage_timings_ms, "ctfidf_scores", stage_started_at);
 
     // Roll chunks up to documents and per-corpus soft sizes.
+    let stage_started_at = Instant::now();
     let chunk_doc_index: Vec<usize> = chunks.iter().map(|c| c.doc_index).collect();
     let doc_topics = rollup::rollup(documents.len(), &chunk_doc_index, &labels);
     let n_corpora = corpus_indices.iter().copied().max().map_or(0, |m| m + 1);
     let sizes = rollup::corpus_topic_sizes(&doc_topics, corpus_indices, n_corpora, n_topics);
+    record_stage_timing(&mut stage_timings_ms, "rollup", stage_started_at);
 
+    let stage_started_at = Instant::now();
     let topics = (0..n_topics)
         .map(|t| {
             let words = keywords
@@ -251,11 +357,48 @@ pub fn run(
                 .collect(),
         })
         .collect();
+    record_stage_timing(&mut stage_timings_ms, "assemble_topics", stage_started_at);
+    record_stage_timing(&mut stage_timings_ms, "total", total_started_at);
 
     Ok(TopicModelingResult {
         topics,
         documents: document_results,
         n_chunks,
         n_topics,
+        stage_timings_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn topic_embedding_batches_are_bounded_and_ordered() -> Result<()> {
+        let texts = (0..70)
+            .map(|index| format!("text-{index}"))
+            .collect::<Vec<_>>();
+        let mut batch_lengths = Vec::new();
+
+        let vectors = encode_topic_embedding_batches(&texts, |batch| {
+            batch_lengths.push(batch.len());
+            batch
+                .iter()
+                .map(|text| {
+                    let value = text
+                        .strip_prefix("text-")
+                        .context("test text prefix")?
+                        .parse::<f32>()
+                        .context("test text index parse")?;
+                    Ok(vec![value])
+                })
+                .collect()
+        })?;
+
+        assert_eq!(batch_lengths, vec![32, 32, 6]);
+        assert_eq!(vectors.first(), Some(&vec![0.0]));
+        assert_eq!(vectors.last(), Some(&vec![69.0]));
+        Ok(())
+    }
 }

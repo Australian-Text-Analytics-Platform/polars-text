@@ -37,6 +37,7 @@ Tokenization is available through the `text` namespace on expressions.
 ### Tokenization
 
 - `pl.col("text").text.tokenize(model="native:plain_words_en", lowercase=True, remove_punct=True, cache=None)`
+- `pl.col("text").text.embedding(embedder_model=None, cache=None, batch_size=None)`
 - `clean_text(expr)`
 - `word_count(expr)`
 - `char_count(expr)`
@@ -60,6 +61,27 @@ character offsets. Pass an explicit `native:`, `huggingface:`, or `lindera:`
 model ID. Pass `cache=Path("tokens.duckdb")` to persist tokenization results in
 a DuckDB cache and reuse them by content hash; leave `cache=None` to compute
 directly through the Rust plugin.
+
+### Embeddings
+
+`embedding` accepts a string expression or a list-of-string expression. String
+input returns `List(Float32)` per row; list input returns nested
+`List(List(Float32))` per row.
+
+```python
+df = pl.DataFrame({"text": ["A short document."], "chunks": [["first", "second"]]})
+
+out = df.select([
+    pl.col("text").text.embedding(cache="embeddings.duckdb").alias("embedding"),
+    pl.col("chunks").text.embedding(cache="embeddings.duckdb").alias("chunk_embeddings"),
+])
+```
+
+The Rust plugin downloads and loads Hugging Face ONNX sentence-transformer
+repositories automatically through `hf-hub`. Repositories without ONNX files are
+not supported. Passing `cache=Path("embeddings.duckdb")` persists vectors in a
+separate DuckDB cache keyed by model, revision, execution-provider label, and
+text hash.
 
 ## Concordance
 
@@ -118,6 +140,12 @@ Some features download tokenizer assets on first use and run on CPU:
   and `lindera:ko-dic` from official Lindera release zips
 
 The initial call may take longer while models download and cache.
+
+Embedding features download ONNX artifacts on first use. Some ONNX repositories
+store tensor data in sidecar files such as `onnx/model.onnx_data`; those files
+are fetched automatically when present. ONNX Runtime uses DirectML on Windows
+when available, XNNPACK acceleration on supported CPU platforms, and CPU
+fallback.
 
 ## Development
 

@@ -9,6 +9,8 @@
 - `char_count`,
 - `sentence_count`,
 - `concordance`,
+- `embedding`,
+- `topic_modeling`,
 - `token_frequencies`,
 - `token_frequency_stats`,
 - tokenizer model registry helpers.
@@ -20,7 +22,10 @@ expression namespace with Polars.
 
 `functions.py` wraps `polars.plugins.register_plugin_function()`. Each wrapper
 passes `PLUGIN_PATH`, the Rust function name, input expression, keyword
-arguments, and `is_elementwise=True`.
+arguments, and the appropriate elementwise flag. `PLUGIN_PATH` points to the
+exact imported `_internal` extension file, not just the package directory, so
+Polars does not accidentally load a stale ABI sibling library in editable
+development environments.
 
 Tokenization is available through the `.text` expression namespace. Callers must
 pass an explicit tokenizer model ID:
@@ -34,8 +39,29 @@ pl.col("text").text.tokenize(model="native:plain_words_en")
 
 `tokenize()` returns a list of structs with `token`, `start`, and `end`
 character offsets. Passing `cache=Path(...)` uses a DuckDB-backed cache at that
-path; `cache=None` computes directly through the Rust plugin. Wordflow uses the
-cached form only after resolving a per-user cache path in the backend.
+path; `cache=None` computes directly through the same Rust plugin. The Python
+wrapper only registers the expression; Rust owns cache lookup, locking, miss
+deduplication, and persistence. Wordflow uses the cached form only after
+resolving a per-user cache path in the backend.
+
+`embedding()` is available as `polars_text.embedding(...)` and
+`.text.embedding(...)`. It accepts string input and list-of-string input:
+
+```python
+pl.col("text").text.embedding(cache="embeddings.duckdb")
+pl.col("chunks").text.embedding(cache="embeddings.duckdb")
+```
+
+String input returns `List(Float32)` per row. List input returns nested
+`List(List(Float32))` per row. The Rust side owns Hugging Face downloads and
+only supports repositories with ONNX artifacts. It also fetches ONNX external
+data sidecars such as `onnx/model.onnx_data` when present.
+
+`topic_modeling()` is a whole-column expression, not an elementwise expression.
+It chunks documents, embeds chunks with the same ONNX Runtime embedder, reduces
+with PaCMAP, clusters with HDBSCAN, and returns one struct per source document.
+Passing `cache=Path(...)` points the Rust embedding stage at a separate
+`embeddings.duckdb` cache.
 
 ## Namespace API
 
@@ -46,7 +72,8 @@ cached form only after resolving a per-user cache path in the backend.
 ```
 
 The namespace is intentionally thin. It forwards to functions in
-`functions.py`, so tokenization behavior has a single implementation.
+`functions.py`, so tokenization, embedding, and topic-modeling behavior each
+have a single Python wrapper implementation.
 
 ## Token Frequencies
 

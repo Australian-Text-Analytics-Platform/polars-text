@@ -58,10 +58,25 @@ class TextNamespace:
     def sentence_count(self) -> pl.Expr:
         return functions.sentence_count(self._expr)
 
+    def embedding(
+        self,
+        *,
+        embedder_model: str | None = None,
+        cache: str | os.PathLike[str] | None = None,
+        batch_size: int | None = None,
+    ) -> pl.Expr:
+        return functions.embedding(
+            self._expr,
+            embedder_model=embedder_model,
+            cache=cache,
+            batch_size=batch_size,
+        )
+
     def topic_modeling(
         self,
         *,
         embedder_model: str | None = None,
+        cache: str | os.PathLike[str] | None = None,
         max_tokens: int = 256,
         overlap: int = 32,
         reduce_dims: int = 5,
@@ -73,9 +88,16 @@ class TextNamespace:
         lowercase: bool = True,
         stopwords: list[str] | None = None,
     ) -> pl.Expr:
+        """Cluster a document column and emit per-row topic structs.
+
+        Output includes dominant topic, topic distribution, representative words,
+        topic coordinates, run counts, and ``stage_timings_ms`` replicated onto
+        every row for native profiling.
+        """
         return functions.topic_modeling(
             self._expr,
             embedder_model=embedder_model,
+            cache=cache,
             max_tokens=max_tokens,
             overlap=overlap,
             reduce_dims=reduce_dims,

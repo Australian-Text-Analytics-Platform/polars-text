@@ -28,11 +28,7 @@ use crate::topic_modeling::cluster::OUTLIER_LABEL;
 /// `labels[i]` is its topic. `n_topics` bounds the output (topics are contiguous
 /// `0..n_topics`). A topic with no member chunks — which should not occur given
 /// clustering produced it — defaults to the origin so indexing stays aligned.
-pub fn topic_coords_2d(
-    points_2d: &[Vec<f32>],
-    labels: &[i32],
-    n_topics: usize,
-) -> Vec<(f32, f32)> {
+pub fn topic_coords_2d(points_2d: &[Vec<f32>], labels: &[i32], n_topics: usize) -> Vec<(f32, f32)> {
     debug_assert_eq!(points_2d.len(), labels.len());
 
     let mut sums = vec![(0.0f32, 0.0f32); n_topics];

@@ -2,4 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PLUGIN_PATH = Path(__file__).parent
+from . import _internal
+
+PLUGIN_PATH = Path(_internal.__file__).resolve()

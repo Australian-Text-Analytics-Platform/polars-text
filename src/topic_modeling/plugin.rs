@@ -42,6 +42,7 @@ use super::{run, RunConfig};
 #[derive(Deserialize)]
 struct TopicModelingKwargs {
     embedder_model: Option<String>,
+    cache: Option<String>,
     max_tokens: usize,
     overlap: usize,
     reduce_dims: usize,
@@ -62,6 +63,14 @@ fn distribution_struct_type() -> DataType {
     ])
 }
 
+/// Inner dtype of the run-level native stage timing list.
+fn stage_timing_struct_type() -> DataType {
+    DataType::Struct(vec![
+        Field::new("stage".into(), DataType::String),
+        Field::new("elapsed_ms".into(), DataType::Float64),
+    ])
+}
+
 /// Output dtype of the expression: one struct per input row.
 fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
     let dtype = DataType::Struct(vec![
@@ -78,6 +87,10 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
         Field::new("y".into(), DataType::Float32),
         Field::new("n_topics".into(), DataType::UInt32),
         Field::new("n_chunks".into(), DataType::UInt32),
+        Field::new(
+            "stage_timings_ms".into(),
+            DataType::List(Box::new(stage_timing_struct_type())),
+        ),
     ]);
     Ok(Field::new(input_fields[0].name().clone(), dtype))
 }
@@ -97,6 +110,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
 
     let cfg = RunConfig {
         embedder_repo_id: kwargs.embedder_model,
+        embedding_cache_path: kwargs.cache,
         chunking: super::chunking::ChunkingConfig {
             max_tokens: kwargs.max_tokens,
             overlap: kwargs.overlap,
@@ -107,14 +121,16 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
             min_cluster_size: kwargs.min_cluster_size,
             min_samples: kwargs.min_samples,
         },
-        ctfidf: super::ctfidf::CtfidfConfig { top_k: kwargs.top_k },
+        ctfidf: super::ctfidf::CtfidfConfig {
+            top_k: kwargs.top_k,
+        },
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
         stopwords: kwargs.stopwords.unwrap_or_default().into_iter().collect(),
     };
 
     let result = run(&documents, &corpus_indices, &cfg)
-        .map_err(|e| PolarsError::ComputeError(format!("topic_modeling failed: {e}").into()))?;
+        .map_err(|e| PolarsError::ComputeError(format!("topic_modeling failed: {e:#}").into()))?;
 
     // Topic id -> (representative_words, x, y) so each row can carry its
     // dominant topic's bubble-chart metadata.
@@ -201,8 +217,11 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
 
     // Build the shared inner string series for `representative_words` once.
     let word_inner = Series::new(PlSmallStr::EMPTY, word_flat);
-    let mut word_builder =
-        AnonymousOwnedListBuilder::new("representative_words".into(), n_rows, Some(DataType::String));
+    let mut word_builder = AnonymousOwnedListBuilder::new(
+        "representative_words".into(),
+        n_rows,
+        Some(DataType::String),
+    );
     for (start, end) in word_spans {
         if end == start {
             word_builder.append_empty();
@@ -218,6 +237,48 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
     let n_topics = vec![result.n_topics as u32; n_rows];
     let n_chunks = vec![result.n_chunks as u32; n_rows];
 
+    // Build the shared run-level timing list once and replicate it onto every
+    // row, matching how `n_topics` / `n_chunks` expose run-level metadata.
+    let timing_inner = StructChunked::from_series(
+        PlSmallStr::EMPTY,
+        result.stage_timings_ms.len(),
+        [
+            Series::new(
+                "stage".into(),
+                result
+                    .stage_timings_ms
+                    .iter()
+                    .map(|timing| timing.stage.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            Series::new(
+                "elapsed_ms".into(),
+                result
+                    .stage_timings_ms
+                    .iter()
+                    .map(|timing| timing.elapsed_ms)
+                    .collect::<Vec<_>>(),
+            ),
+        ]
+        .iter(),
+    )?
+    .into_series();
+    let mut timing_builder = AnonymousOwnedListBuilder::new(
+        "stage_timings_ms".into(),
+        n_rows,
+        Some(stage_timing_struct_type()),
+    );
+    for _ in 0..n_rows {
+        if result.stage_timings_ms.is_empty() {
+            timing_builder.append_empty();
+        } else {
+            timing_builder.append_series(&timing_inner).map_err(|e| {
+                PolarsError::ComputeError(format!("stage_timings_ms list build: {e}").into())
+            })?;
+        }
+    }
+    let timing_list = timing_builder.finish().into_series();
+
     let fields = [
         Series::new("dominant_topic".into(), dominant),
         dist_list,
@@ -226,6 +287,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         Series::new("y".into(), ys),
         Series::new("n_topics".into(), n_topics),
         Series::new("n_chunks".into(), n_chunks),
+        timing_list,
     ];
     let out = StructChunked::from_series(ca.name().clone(), n_rows, fields.iter())?.into_series();
     Ok(out)

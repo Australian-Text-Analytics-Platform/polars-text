@@ -9,6 +9,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0"
+duckdb = { version = "1.10503.1", features = ["bundled"] }
+fs2 = "0.4"
 hf-hub = "0.5"
 # Lindera dict download support: fetch official GitHub release zips on first use.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
@@ -38,15 +40,20 @@ serde = { version = "1", features = ["derive"] }
 tokenizers = "0.23"
 
 # --- Topic-modeling pipeline (Rust BERTopic replacement) ---
-# candle: pure-Rust in-process embeddings (no ONNX runtime bundled). Used by
-# src/topic_modeling/embedding.rs to run the multilingual MiniLM encoder.
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
+# ort: ONNX Runtime embeddings for Hugging Face ONNX sentence-transformer repos.
+# src/topic_modeling/embedding.rs owns automatic hf-hub downloads and runtime
+# inference. Candle was intentionally removed because acceleration needs ORT EPs.
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-native",
+    "api-24",
+    "directml",
+    "xnnpack",
+] }
 serde_json = "1"
-# text-splitter: industry-standard recursive/semantic chunking, tokenizer-budget
-# aware. Used by src/topic_modeling/chunking.rs.
-text-splitter = { version = "0.31", features = ["tokenizers"] }
+sha2 = "0.10"
 # pacmap: PaCMAP dimensionality reduction (ndarray 0.16). Used by
 # src/topic_modeling/reduce.rs. No PCA-to-50 fallback — PaCMAP only.
 pacmap = "0.2"
@@ -54,3 +61,6 @@ ndarray = "0.16"
 # hdbscan: density-based clustering of reduced chunk embeddings into topics.
 # Used by src/topic_modeling/cluster.rs.
 hdbscan = "0.12"
+
+[profile.release]
+strip = "symbols"

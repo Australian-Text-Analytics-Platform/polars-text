@@ -52,9 +52,7 @@ pub const MIN_POINTS_FOR_REDUCTION: usize = 12;
 pub fn reduce(points: &[Vec<f32>], cfg: &ReduceConfig) -> Result<Vec<Vec<f32>>> {
     let n = points.len();
     if n < MIN_POINTS_FOR_REDUCTION {
-        anyhow::bail!(
-            "reduce called with {n} points; need at least {MIN_POINTS_FOR_REDUCTION}"
-        );
+        anyhow::bail!("reduce called with {n} points; need at least {MIN_POINTS_FOR_REDUCTION}");
     }
     let dim = points[0].len();
     if dim == 0 {

@@ -6,9 +6,19 @@ from typing import Any, cast
 import duckdb
 import polars as pl
 import polars_text
-import polars_text.token_cache as token_cache
 
 MODEL_ID = "native:plain_words_en"
+
+
+def _cache_rows(cache_path: Path) -> list[tuple[Any, ...]]:
+    with duckdb.connect(str(cache_path), read_only=True) as conn:
+        return conn.execute(
+            """
+            SELECT model, params_hash, content_hash, tokens, start_offsets, end_offsets
+            FROM token_cache
+            ORDER BY content_hash
+            """
+        ).fetchall()
 
 
 def test_cached_tokenize_matches_uncached_output(tmp_path: Path) -> None:
@@ -44,25 +54,21 @@ def test_cache_schema_has_six_columns(tmp_path: Path) -> None:
     ]
 
 
-def test_warm_cache_does_not_retokenize(tmp_path: Path, monkeypatch: Any) -> None:
+def test_warm_cache_reuses_existing_rows(tmp_path: Path) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     base = pl.DataFrame({"text": ["hello world", "hello world"]}).lazy()
     expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     base.with_columns(expr.alias("tokens")).collect()
-
-    def fail(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("warm-cache run should not tokenize misses")
-
-    monkeypatch.setattr(token_cache, "_tokenize_misses", fail)
+    first_rows = _cache_rows(cache_path)
 
     warm = cast(pl.DataFrame, base.with_columns(expr.alias("tokens")).collect())
     assert warm.height == 2
     assert warm.to_dicts()[0]["tokens"][0]["token"]
+    assert _cache_rows(cache_path) == first_rows
 
 
 def test_filter_pushdown_only_tokenizes_surviving_rows(
     tmp_path: Path,
-    monkeypatch: Any,
 ) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     base = pl.DataFrame(
@@ -72,44 +78,39 @@ def test_filter_pushdown_only_tokenizes_surviving_rows(
         }
     ).lazy()
 
-    seen: list[list[str]] = []
-    real = token_cache._tokenize_misses
-
-    def spy(texts: list[str], **kwargs: Any) -> list[list[dict[str, Any]]]:
-        seen.append(list(texts))
-        return real(texts, **kwargs)
-
-    monkeypatch.setattr(token_cache, "_tokenize_misses", spy)
-
     expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     filtered = (
         base.with_columns(expr.alias("tokens")).filter(pl.col("id") == 3).collect()
     )
 
     assert cast(pl.DataFrame, filtered).height == 1
-    flat = sorted(text for batch in seen for text in batch)
-    assert flat == ["gamma"]
+    rows = _cache_rows(cache_path)
+    assert len(rows) == 1
+    assert rows[0][3] == ["gamma"]
 
 
 def test_repeated_texts_in_chunk_are_deduplicated(
     tmp_path: Path,
-    monkeypatch: Any,
 ) -> None:
     cache_path = tmp_path / "tokens.duckdb"
     base = pl.DataFrame({"text": ["same", "same", "same"]}).lazy()
-
-    seen: list[list[str]] = []
-    real = token_cache._tokenize_misses
-
-    def spy(texts: list[str], **kwargs: Any) -> list[list[dict[str, Any]]]:
-        seen.append(list(texts))
-        return real(texts, **kwargs)
-
-    monkeypatch.setattr(token_cache, "_tokenize_misses", spy)
 
     expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
     out = cast(pl.DataFrame, base.with_columns(expr.alias("tokens")).collect())
 
     assert out.height == 3
-    flat = [text for batch in seen for text in batch]
-    assert flat == ["same"]
+    rows = _cache_rows(cache_path)
+    assert len(rows) == 1
+    assert rows[0][3] == ["same"]
+
+
+def test_limit_pushdown_only_caches_materialized_rows(tmp_path: Path) -> None:
+    cache_path = tmp_path / "tokens.duckdb"
+    base = pl.DataFrame({"text": ["alpha", "beta", "gamma", "delta"]}).lazy()
+
+    expr = cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path)
+    out = cast(pl.DataFrame, base.limit(2).with_columns(expr.alias("tokens")).collect())
+
+    assert out.height == 2
+    rows = _cache_rows(cache_path)
+    assert sorted(row[3][0] for row in rows) == ["alpha", "beta"]
