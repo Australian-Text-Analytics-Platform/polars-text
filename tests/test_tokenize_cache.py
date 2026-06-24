@@ -3,22 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-import duckdb
 import polars as pl
 import polars_text
+from polars_text._internal import debug_token_cache_snapshot
 
 MODEL_ID = "native:plain_words_en"
+type TokenCacheDebugRow = tuple[str, str, str, list[str], list[int], list[int]]
 
 
-def _cache_rows(cache_path: Path) -> list[tuple[Any, ...]]:
-    with duckdb.connect(str(cache_path), read_only=True) as conn:
-        return conn.execute(
-            """
-            SELECT model, params_hash, content_hash, tokens, start_offsets, end_offsets
-            FROM token_cache
-            ORDER BY content_hash
-            """
-        ).fetchall()
+def _cache_columns(cache_path: Path) -> list[str]:
+    return debug_token_cache_snapshot(cache_path)[0]
+
+
+def _cache_rows(cache_path: Path) -> list[TokenCacheDebugRow]:
+    return debug_token_cache_snapshot(cache_path)[1]
 
 
 def test_cached_tokenize_matches_uncached_output(tmp_path: Path) -> None:
@@ -41,10 +39,7 @@ def test_cache_schema_has_six_columns(tmp_path: Path) -> None:
     df = pl.DataFrame({"text": ["hello world"]})
     df.select(cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID, cache=cache_path))
 
-    with duckdb.connect(str(cache_path), read_only=True) as conn:
-        rows = conn.execute("DESCRIBE token_cache").fetchall()
-
-    assert [row[0] for row in rows] == [
+    assert _cache_columns(cache_path) == [
         "model",
         "params_hash",
         "content_hash",

@@ -1,19 +1,29 @@
+#[cfg(feature = "tokenization")]
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "tokenization")]
 use std::path::Path;
 
+#[cfg(feature = "tokenization")]
 use anyhow::{Context, Result as AnyhowResult};
+#[cfg(feature = "tokenization")]
 use duckdb::{params, Connection, Error as DuckDbError};
+#[cfg(any(feature = "embedding", feature = "tokenization"))]
 use polars::chunked_array::builder::{AnonymousOwnedListBuilder, ListBuilderTrait};
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
 
+#[cfg(feature = "tokenization")]
 use crate::cache::{get_or_insert_text_values, hash_text, TextCacheTable};
+#[cfg(feature = "tokenization")]
 use crate::concordance::{
     concordance_for_text, concordance_struct_type, list_struct_output, struct_series_from_matches,
     ConcordanceKwargs,
 };
+#[cfg(feature = "tokenization")]
 use crate::tokenizer::{ensure_tokenizer_for_model, TokenizerBackend};
+#[cfg(feature = "embedding")]
 use crate::topic_modeling::embedding::{ensure_embedder, Embedder};
+#[cfg(feature = "embedding")]
 use crate::topic_modeling::embedding_cache::{get_or_insert_embeddings, CacheScope};
 
 fn string_output(input_fields: &[Field]) -> PolarsResult<Field> {
@@ -24,6 +34,7 @@ fn int_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), DataType::Int64))
 }
 
+#[cfg(feature = "embedding")]
 fn embedding_output(input_fields: &[Field]) -> PolarsResult<Field> {
     let dtype = match input_fields[0].dtype() {
         DataType::String => DataType::List(Box::new(DataType::Float32)),
@@ -172,6 +183,7 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
     })
 }
 
+#[cfg(feature = "tokenization")]
 #[polars_expr(output_type_func=list_struct_output)]
 pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
@@ -208,6 +220,7 @@ pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult
     Ok(list.into_series())
 }
 
+#[cfg(feature = "tokenization")]
 #[derive(serde::Deserialize)]
 struct TokenizeKwargs {
     lowercase: bool,
@@ -218,6 +231,7 @@ struct TokenizeKwargs {
     cache: Option<String>,
 }
 
+#[cfg(feature = "tokenization")]
 const TOKEN_CACHE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS token_cache (
     model VARCHAR NOT NULL,
@@ -230,12 +244,14 @@ CREATE TABLE IF NOT EXISTS token_cache (
 )
 "#;
 
+#[cfg(feature = "tokenization")]
 #[derive(serde::Serialize)]
 struct TokenCacheParams {
     lowercase: bool,
     remove_punct: bool,
 }
 
+#[cfg(feature = "tokenization")]
 #[derive(Clone)]
 struct TokenCacheEntry {
     tokens: Vec<String>,
@@ -243,6 +259,7 @@ struct TokenCacheEntry {
     ends: Vec<i64>,
 }
 
+#[cfg(feature = "tokenization")]
 impl TokenCacheEntry {
     fn from_offsets(offsets: Vec<(String, i64, i64)>) -> Self {
         let mut tokens = Vec::with_capacity(offsets.len());
@@ -281,11 +298,73 @@ impl TokenCacheEntry {
     }
 }
 
+#[cfg(feature = "tokenization")]
 struct TokenCacheTable<'a> {
     model_id: &'a str,
     params_hash: &'a str,
 }
 
+pub(crate) type TokenCacheDebugRow =
+    (String, String, String, Vec<String>, Vec<i64>, Vec<i64>);
+
+#[cfg(feature = "tokenization")]
+pub(crate) fn debug_token_cache_snapshot(
+    path: &Path,
+) -> AnyhowResult<(Vec<String>, Vec<TokenCacheDebugRow>)> {
+    let conn = Connection::open(path).with_context(|| format!("open cache {}", path.display()))?;
+
+    let mut schema_stmt = conn
+        .prepare("DESCRIBE token_cache")
+        .context("prepare token cache schema snapshot")?;
+    let schema_rows = schema_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("query token cache schema snapshot")?;
+    let mut columns = Vec::new();
+    for column in schema_rows {
+        columns.push(column.context("read token cache schema row")?);
+    }
+
+    let mut row_stmt = conn
+        .prepare(
+            r#"
+            SELECT model, params_hash, content_hash,
+                   to_json(tokens), to_json(start_offsets), to_json(end_offsets)
+            FROM token_cache
+            ORDER BY content_hash
+            "#,
+        )
+        .context("prepare token cache row snapshot")?;
+    let row_items = row_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .context("query token cache row snapshot")?;
+
+    let mut rows = Vec::new();
+    for row in row_items {
+        let (model, params_hash, content_hash, tokens_json, starts_json, ends_json) =
+            row.context("read token cache snapshot row")?;
+        rows.push((
+            model,
+            params_hash,
+            content_hash,
+            serde_json::from_str(&tokens_json).context("decode token cache snapshot tokens")?,
+            serde_json::from_str(&starts_json).context("decode token cache snapshot starts")?,
+            serde_json::from_str(&ends_json).context("decode token cache snapshot ends")?,
+        ));
+    }
+
+    Ok((columns, rows))
+}
+
+#[cfg(feature = "tokenization")]
 impl TextCacheTable for TokenCacheTable<'_> {
     type Value = TokenCacheEntry;
 
@@ -378,6 +457,7 @@ impl TextCacheTable for TokenCacheTable<'_> {
     }
 }
 
+#[cfg(feature = "tokenization")]
 fn token_params_hash(lowercase: bool, remove_punct: bool) -> AnyhowResult<String> {
     let params = TokenCacheParams {
         lowercase,
@@ -386,6 +466,7 @@ fn token_params_hash(lowercase: bool, remove_punct: bool) -> AnyhowResult<String
     Ok(hash_text(&serde_json::to_string(&params)?))
 }
 
+#[cfg(feature = "tokenization")]
 fn tokenize_uncached_entries(
     backend: &TokenizerBackend,
     texts: &[String],
@@ -402,6 +483,7 @@ fn tokenize_uncached_entries(
         .collect()
 }
 
+#[cfg(feature = "tokenization")]
 fn token_offset_struct_type() -> DataType {
     DataType::Struct(vec![
         Field::new("token".into(), DataType::String),
@@ -410,6 +492,7 @@ fn token_offset_struct_type() -> DataType {
     ])
 }
 
+#[cfg(feature = "tokenization")]
 fn list_token_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(
         input_fields[0].name().clone(),
@@ -421,6 +504,7 @@ fn list_token_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
 /// **all rows**. Used by the tokenize plugin so the per-row loop only has
 /// to remember each row's `[start_idx, end_idx)` slice into the flat struct
 /// rather than allocate three fresh Series + a fresh StructChunked per row.
+#[cfg(feature = "tokenization")]
 fn flat_struct_series_from_tokens(
     tok_col: Vec<String>,
     start_col: Vec<i64>,
@@ -435,6 +519,7 @@ fn flat_struct_series_from_tokens(
     Ok(StructChunked::from_series(PlSmallStr::EMPTY, n, fields.iter())?.into_series())
 }
 
+#[cfg(feature = "tokenization")]
 fn build_token_list_series(
     name: PlSmallStr,
     row_count: usize,
@@ -467,6 +552,7 @@ fn build_token_list_series(
     Ok(list.into_series())
 }
 
+#[cfg(feature = "embedding")]
 #[derive(serde::Deserialize)]
 struct EmbeddingKwargs {
     embedder_model: Option<String>,
@@ -476,6 +562,7 @@ struct EmbeddingKwargs {
     batch_size: Option<usize>,
 }
 
+#[cfg(feature = "embedding")]
 #[polars_expr(output_type_func=embedding_output)]
 pub fn embedding(inputs: &[Series], kwargs: EmbeddingKwargs) -> PolarsResult<Series> {
     let embedder = ensure_embedder(kwargs.embedder_model.as_deref())
@@ -495,6 +582,7 @@ pub fn embedding(inputs: &[Series], kwargs: EmbeddingKwargs) -> PolarsResult<Ser
     }
 }
 
+#[cfg(feature = "embedding")]
 fn encode_embedding_batches(
     embedder: &Embedder,
     texts: &[String],
@@ -522,6 +610,7 @@ fn encode_embedding_batches(
     encode_uncached_embedding_batches(embedder, texts, batch_size)
 }
 
+#[cfg(feature = "embedding")]
 fn encode_uncached_embedding_batches(
     embedder: &Embedder,
     texts: &[String],
@@ -537,6 +626,7 @@ fn encode_uncached_embedding_batches(
     Ok(vectors)
 }
 
+#[cfg(feature = "embedding")]
 fn build_embedding_vector_list(
     name: PlSmallStr,
     row_spans: Vec<(usize, usize)>,
@@ -561,6 +651,7 @@ fn build_embedding_vector_list(
     Ok(list.into_series())
 }
 
+#[cfg(feature = "embedding")]
 fn embed_string_series(
     input: &Series,
     embedder: &Embedder,
@@ -596,6 +687,7 @@ fn embed_string_series(
     build_embedding_vector_list(ca.name().clone(), row_spans, flat)
 }
 
+#[cfg(feature = "embedding")]
 fn embed_list_string_series(
     input: &Series,
     embedder: &Embedder,
@@ -659,6 +751,7 @@ fn embed_list_string_series(
     Ok(list.into_series())
 }
 
+#[cfg(feature = "tokenization")]
 #[polars_expr(output_type_func=list_token_struct_output)]
 pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;

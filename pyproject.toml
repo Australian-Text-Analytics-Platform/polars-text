@@ -4,7 +4,7 @@ version = "0.4.0"
 description = "Polars expression plugins for text analysis"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = ["duckdb>=1.4.0", "polars==1.40.0"]
+dependencies = ["polars==1.40.0"]
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

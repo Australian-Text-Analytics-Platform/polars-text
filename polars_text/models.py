@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Final
 
 from ._internal import (
+    compiled_features,
     loaded_tokenizers as _loaded_tokenizers,
 )
 from ._internal import (
@@ -63,6 +64,11 @@ def prefetch_model(model_id: str) -> None:
     pre-warm step before an analysis, so the first user-visible tokenize call
     does not block on Hugging Face or Lindera dictionary I/O.
     """
+    if "tokenization" not in compiled_features():
+        raise RuntimeError(
+            "prefetch_model requires the 'tokenization' feature; rebuild "
+            "polars-text with that feature or install the default full wheel"
+        )
     _prefetch_tokenizer(model_id)
 
 

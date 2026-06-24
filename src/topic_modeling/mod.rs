@@ -23,40 +23,61 @@
 //! bit-exact reduction, so it is validated by the manual harness (Phase 2),
 //! not CI.
 
+#[cfg(feature = "topic-modeling")]
 pub mod chunking;
+#[cfg(feature = "topic-modeling")]
 pub mod cluster;
+#[cfg(feature = "topic-modeling")]
 pub mod coords;
+#[cfg(feature = "topic-modeling")]
 pub mod ctfidf;
+#[cfg(feature = "embedding")]
 pub mod embedding;
+#[cfg(feature = "embedding")]
 pub mod embedding_cache;
+#[cfg(feature = "topic-modeling")]
 pub mod plugin;
+#[cfg(feature = "topic-modeling")]
 pub mod reduce;
+#[cfg(feature = "topic-modeling")]
 pub mod rollup;
 
+#[cfg(feature = "topic-modeling")]
 use std::{collections::HashSet, path::Path, time::Instant};
 
+#[cfg(feature = "topic-modeling")]
 use anyhow::Result;
+#[cfg(feature = "topic-modeling")]
 use serde::Serialize;
 
+#[cfg(feature = "topic-modeling")]
 use crate::tokenizer::PLAIN_WORDS_EN_MODEL_ID;
+#[cfg(feature = "topic-modeling")]
 use chunking::ChunkingConfig;
+#[cfg(feature = "topic-modeling")]
 use cluster::ClusterConfig;
+#[cfg(feature = "topic-modeling")]
 use ctfidf::CtfidfConfig;
+#[cfg(feature = "topic-modeling")]
 use embedding_cache::{get_or_insert_embeddings, CacheScope};
+#[cfg(feature = "topic-modeling")]
 use reduce::{ReduceConfig, MIN_POINTS_FOR_REDUCTION};
 
 /// Number of dimensions for the visualization-only reduction feeding the bubble
 /// chart. Always 2 (x, y).
+#[cfg(feature = "topic-modeling")]
 const COORD_DIMS: usize = 2;
 
 /// ORT inference batch size for topic-modeling chunks. This mirrors the public
 /// `.text.embedding(batch_size=None)` default so topic modeling is bounded even
 /// when a corpus yields thousands of chunks.
+#[cfg(feature = "topic-modeling")]
 const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// All knobs for one topic-modeling run. The backend maps its public options
 /// (`min_topic_size`, `representative_words_count`, `random_seed`, sampling,
 /// CJK vectorizer choice) onto these fields.
+#[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     /// HF repo id of the ONNX embedder; `None` uses the default ONNX model.
@@ -77,6 +98,7 @@ pub struct RunConfig {
     pub stopwords: HashSet<String>,
 }
 
+#[cfg(feature = "topic-modeling")]
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
@@ -95,6 +117,7 @@ impl Default for RunConfig {
 }
 
 /// One topic for the bubble chart and topic table.
+#[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicInfo {
     pub id: i32,
@@ -110,6 +133,7 @@ pub struct TopicInfo {
 }
 
 /// One document's topic outcome: the full distribution and its dominant topic.
+#[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentResult {
     pub doc_index: usize,
@@ -120,6 +144,7 @@ pub struct DocumentResult {
 }
 
 /// One measured native topic-modeling stage, in milliseconds.
+#[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct StageTiming {
     pub stage: String,
@@ -127,6 +152,7 @@ pub struct StageTiming {
 }
 
 /// Full pipeline output handed back to Python.
+#[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicModelingResult {
     pub topics: Vec<TopicInfo>,
@@ -136,6 +162,7 @@ pub struct TopicModelingResult {
     pub stage_timings_ms: Vec<StageTiming>,
 }
 
+#[cfg(feature = "topic-modeling")]
 fn record_stage_timing(
     stage_timings_ms: &mut Vec<StageTiming>,
     stage: &'static str,
@@ -147,6 +174,7 @@ fn record_stage_timing(
     });
 }
 
+#[cfg(feature = "topic-modeling")]
 fn encode_topic_embedding_batches(
     texts: &[String],
     mut encode_batch: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
@@ -177,6 +205,7 @@ fn encode_topic_embedding_batches(
 ///  3. Concatenate each topic's chunk text, then c-TF-IDF for keywords.
 ///  4. Roll chunk labels up to per-document distributions and per-corpus soft
 ///     sizes, and assemble the topic/document payload.
+#[cfg(feature = "topic-modeling")]
 pub fn run(
     documents: &[String],
     corpus_indices: &[usize],
@@ -369,7 +398,7 @@ pub fn run(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "topic-modeling"))]
 mod tests {
     use super::*;
     use anyhow::Context;

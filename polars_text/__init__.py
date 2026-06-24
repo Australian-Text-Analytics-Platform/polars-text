@@ -4,6 +4,7 @@ from . import namespace as _namespace  # noqa: F401
 from .functions import (
     char_count,
     clean_text,
+    compiled_features,
     concordance,
     embedding,
     sentence_count,
@@ -20,6 +21,7 @@ from .token_frequencies import token_frequencies, token_frequency_stats
 
 __all__ = [
     "clean_text",
+    "compiled_features",
     "word_count",
     "char_count",
     "sentence_count",

@@ -7,7 +7,16 @@ import polars as pl
 from polars._typing import IntoExpr
 from polars.plugins import register_plugin_function
 
+from ._internal import compiled_features
 from .utils import PLUGIN_PATH
+
+
+def _require_feature(feature: str, operation: str) -> None:
+    if feature not in compiled_features():
+        raise RuntimeError(
+            f"{operation} requires the '{feature}' feature; rebuild polars-text "
+            "with that feature or install the default full wheel"
+        )
 
 
 def _normalise_model(model: str | None) -> str:
@@ -46,6 +55,7 @@ def tokenize(
     ``lowercase=True``) text. If ``cache`` is a path, tokenization results are
     persisted in a DuckDB cache at that location and reused by content hash.
     """
+    _require_feature("tokenization", "tokenize")
     model_id = _normalise_model(model)
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
@@ -70,6 +80,7 @@ def concordance(
     regex: bool = False,
     case_sensitive: bool = False,
 ) -> pl.Expr:
+    _require_feature("tokenization", "concordance")
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
         function_name="concordance",
@@ -134,6 +145,7 @@ def embedding(
     repositories that publish ONNX artifacts. If ``cache`` is provided, vectors
     are persisted in the DuckDB file at that path and reused by text hash.
     """
+    _require_feature("embedding", "embedding")
     kwargs: dict[str, object] = {
         "embedder_model": embedder_model,
         "cache": str(Path(cache)) if cache is not None else None,
@@ -188,6 +200,7 @@ def topic_modeling(
     Pool multiple corpora by concatenating their columns into one before calling
     this, then split the per-row output by your own corpus-index column.
     """
+    _require_feature("topic-modeling", "topic_modeling")
     return register_plugin_function(
         plugin_path=PLUGIN_PATH,
         function_name="topic_modeling",
@@ -219,4 +232,5 @@ __all__ = [
     "sentence_count",
     "embedding",
     "topic_modeling",
+    "compiled_features",
 ]
