@@ -157,3 +157,7 @@ For release and publishing procedures, see `PUBLISH.md`.
 make build
 make test
 ```
+
+For faster Rust iteration, use feature-scoped targets such as
+`make check-tokenization`, `make build-tokenization`, or `make build-topic`.
+Leave `JOBS` unset for Cargo's default parallelism, or pass `JOBS=<n>` to cap it.

@@ -92,5 +92,11 @@ ndarray = { version = "0.16", optional = true }
 # Used by src/topic_modeling/cluster.rs.
 hdbscan = { version = "0.12", optional = true }
 
+[profile.dev]
+debug = 0
+
+[profile.dev.build-override]
+debug = 0
+
 [profile.release]
 strip = "symbols"

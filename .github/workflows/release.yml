@@ -1,7 +1,6 @@
 name: Package And Release
 
 on:
-    pull_request:
     push:
         tags:
             - "v*"
@@ -27,10 +26,6 @@ jobs:
     build_wheels:
         name: Build ${{ matrix.name }} Wheel
         runs-on: ${{ matrix.os }}
-        env:
-            RUSTC_WRAPPER: sccache
-            SCCACHE_GHA_ENABLED: "true"
-            SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
         strategy:
             fail-fast: false
             matrix:
@@ -60,17 +55,16 @@ jobs:
             - name: Cache Cargo build artifacts
               uses: Swatinem/rust-cache@v2
 
-            - name: Set up sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
-
             - name: Build wheel
               uses: PyO3/maturin-action@v1
               with:
+                  maturin-version: v1.14.1
                   target: ${{ matrix.target }}
                   manylinux: ${{ matrix.manylinux || '' }}
                   before-script-linux: ${{ matrix.before-script-linux || '' }}
                   rust-toolchain: stable
-                  args: --release --out dist --interpreter 3.14 --compatibility pypi --timings=html
+                  sccache: true
+                  args: --release --locked --out dist --interpreter 3.14 --compatibility pypi --timings
 
             - name: Upload Cargo timing report
               if: always()
@@ -115,6 +109,7 @@ jobs:
               uses: PyO3/maturin-action@v1
               with:
                   command: sdist
+                  maturin-version: v1.14.1
                   rust-toolchain: stable
                   args: --out dist
 

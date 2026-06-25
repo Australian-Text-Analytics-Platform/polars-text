@@ -21,15 +21,16 @@ and it matches both the official `maturin-action` examples and `maturin
 generate-ci` output.
 
 The workflow intentionally tracks the latest `v1` release of
-`PyO3/maturin-action` and `pypa/gh-action-pypi-publish`, and it lets
-`maturin-action` install its default latest `maturin` release instead of
-pinning an exact `maturin-version`.
+`PyO3/maturin-action` and `pypa/gh-action-pypi-publish`, but pins the
+installed `maturin` binary with `maturin-version`. The action-level pin keeps
+CI behavior stable while still letting patch releases of the GitHub actions
+arrive through their major-version tags.
 
 ## Release policy
 
 The workflow treats versions as follows:
 
-- Pull requests: build and validate artifacts only, no upload
+- Pull requests: build and validate artifacts in `ci.yml`, no upload
 - Tagged releases such as `v0.2.0`, `v0.2.0rc1`, or `v0.2.0b1`: publish to PyPI
 - Manual `workflow_dispatch` runs can publish the selected ref to TestPyPI
 
@@ -115,14 +116,9 @@ path with the current workflow.
 
 ## What the workflow does
 
-On every pull request, the release workflow:
-
-- builds Linux, macOS Apple Silicon, and Windows wheels
-- builds an `sdist`
-- runs `twine check --strict` on the built artifacts
-
-Full `pytest` coverage runs in the separate `CI` workflow on every branch push
-and pull request instead of being duplicated in the release workflow.
+On every pull request, the separate `CI` workflow builds and tests the platform
+wheel matrix. The release workflow is reserved for tags and manual dispatch so
+pull requests do not pay for a duplicate packaging matrix.
 
 On tags:
 

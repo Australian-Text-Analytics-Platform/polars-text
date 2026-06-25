@@ -12,17 +12,36 @@ make test
 `make build` runs `maturin develop --release`, installing the compiled extension
 into the active environment. `make test` runs `pytest -q`.
 
+For faster local iteration, build or check only the feature surface you changed:
+
+```bash
+make check-basic
+make check-tokenization
+make check-embedding
+make check-topic
+make build-basic
+make build-tokenization
+make build-embedding
+make build-topic
+```
+
+These targets pass `--no-default-features` and then enable only the named feature
+set. Leave `JOBS` unset to let Cargo use its default parallelism, or pass
+`JOBS=<n>` when you need an explicit limit.
+
 For compile-time profiling on a high-core local workstation:
 
 ```bash
 make timings-full
-make timings-lean
+make timings-basic
+make timings-tokenization
+make timings-embedding
+make timings-topic
 ```
 
-Both targets write Cargo's HTML timing report under `target/cargo-timings/`.
-`timings-full` builds the default full feature set. `timings-lean` builds with
-`--no-default-features` and is intended for fast iteration on the basic
-expression boundary.
+These targets write Cargo's HTML timing report under `target/cargo-timings/`.
+`timings-full` builds the default full feature set; the others mirror the
+feature-scoped local builds.
 
 ## Rust Feature Sets
 
@@ -64,9 +83,10 @@ load/save path in the backend and `docworkspace`.
 
 The package is built with maturin. `pyproject.toml` defines Python metadata and
 the extension module path; `Cargo.toml` defines the Rust crate version and
-Polars/PyO3 dependencies. Keep both versions aligned for releases. Release
-wheel jobs build the default `full` feature set, use Cargo and sccache caching,
-and upload `target/cargo-timings/cargo-timing.html` when Cargo produces it.
+Polars/PyO3 dependencies. Keep both versions aligned for releases. CI wheel jobs
+build the default `full` feature set with locked Cargo resolution, use
+maturin-action's sccache support, and upload
+`target/cargo-timings/cargo-timing.html` when Cargo produces it.
 
 Keep Python runtime dependencies limited to packages imported by the Python
 wrapper layer. DuckDB cache support is implemented by the Rust `duckdb` crate
@@ -76,9 +96,9 @@ the private `_internal.debug_token_cache_snapshot` helper instead.
 
 ## Release Process
 
-`PUBLISH.md` describes the trusted-publishing flow. CI builds platform wheels
-and one source distribution, then publishes only for explicit `v*` tags or
-manual TestPyPI dry runs.
+`PUBLISH.md` describes the trusted-publishing flow. The release workflow builds
+platform wheels and one source distribution only for explicit `v*` tags or
+manual TestPyPI dry runs, while the separate CI workflow covers pull requests.
 
 Before tagging, run local validation and make sure the Python package version,
 Rust crate version, and release tag agree.
