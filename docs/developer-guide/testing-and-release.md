@@ -7,6 +7,7 @@ From `polars-text/`:
 ```bash
 make build
 make test
+uvx ty check
 ```
 
 `make build` runs `maturin develop --release`, installing the compiled extension
