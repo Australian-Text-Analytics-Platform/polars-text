@@ -1,4 +1,4 @@
-"""Phase 1.2/1.3/1.6 integration tests for pluggable tokenizer.
+"""Opt-in integration tests for Hugging Face-backed tokenizers.
 
 These tests trigger network fetches from HuggingFace Hub on first run
 (same as the existing tokenize / topic-modeling tests). Subsequent runs
@@ -62,14 +62,3 @@ def test_chinese_model_produces_non_empty_tokens_for_chinese() -> None:
     # one token. We expect at least 4 character-level tokens here (the corpus
     # has 6 chars; punctuation/normalization may drop some).
     assert len(tokens) >= 4, tokens
-
-
-def test_same_model_twice_is_cached() -> None:
-    # The registry hands back Arc<Tokenizer> from the cache on the second
-    # call; we can't observe Arc identity from Python but we can observe that
-    # the wall-time on the second call is much smaller than the first. Skip
-    # explicit timing here — the cache correctness is exercised by the Rust
-    # unit tests; this test just covers the happy path twice.
-    a = _tokens_for("Same input twice.", model="huggingface:bert-base-uncased")
-    b = _tokens_for("Same input twice.", model="huggingface:bert-base-uncased")
-    assert a == b

@@ -1,9 +1,9 @@
-"""Phase 2.2 — `tokenize` emits `{token, start, end}` structs.
+"""`tokenize` emits `{token, start, end}` structs.
 
 Offsets are character positions into the lowercased (if `lowercase=True`,
 the default) processed text. The schema is `List[Struct{token: String,
-start: Int64, end: Int64}]` and forms the contract Phase 2 uses for the
-persisted tokenization column on workspace nodes.
+start: Int64, end: Int64}]` and forms the contract used for the persisted
+tokenization column on workspace nodes.
 """
 
 from __future__ import annotations

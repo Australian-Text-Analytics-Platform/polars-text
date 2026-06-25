@@ -1,4 +1,4 @@
-"""Phase 1.9: Lindera Jieba Chinese backend — word-level segmentation.
+"""Lindera Jieba Chinese backend word-level segmentation tests.
 
 Verifies that `model="lindera:jieba"` produces word-level Chinese tokens,
 distinct from the character-level fallback you get with

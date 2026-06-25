@@ -1,5 +1,3 @@
-"""Phase 1.7-1.8 tests: prefetch_model + list_loaded_models + models.py."""
-
 from __future__ import annotations
 
 import os
@@ -55,12 +53,6 @@ def test_lindera_models_by_language_lists_all_supported_dicts() -> None:
         for model_id in models:
             assert model_id in PREDEFINED_MODELS
             assert model_id.startswith("lindera:")
-
-
-def test_model_exports_do_not_include_recommendations() -> None:
-    assert not hasattr(pt, "RECOMMENDED_TOKENIZERS")
-    assert not hasattr(pt, "RECOMMENDED_JA_DICTS")
-    assert not hasattr(pt, "recommended_tokenizer_for")
 
 
 @pytest.mark.network

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ def test_embedding_is_exported_from_package() -> None:
 def test_plugin_path_points_to_imported_extension() -> None:
     assert PLUGIN_PATH.is_file()
     assert PLUGIN_PATH.name.startswith("_internal")
-    assert PLUGIN_PATH.suffix == ".so"
+    assert any(str(PLUGIN_PATH).endswith(suffix) for suffix in EXTENSION_SUFFIXES)
 
 
 def test_embedding_registers_plugin_kwargs(monkeypatch: Any, tmp_path: Path) -> None:

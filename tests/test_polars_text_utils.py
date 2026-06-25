@@ -29,11 +29,6 @@ def test_sentence_count() -> None:
     assert out["sc"].to_list() == [3, 0, 0]
 
 
-# ---------------------------------------------------------------------------
-# Phase 3.3 + 3.4: CJK / Unicode-aware counts. English is byte-identical.
-# ---------------------------------------------------------------------------
-
-
 def test_sentence_count_handles_cjk_terminators() -> None:
     df = pl.DataFrame(
         {
