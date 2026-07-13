@@ -150,8 +150,10 @@ fallback.
 ## Development
 
 Build the extension locally with maturin and then import as `polars_text`.
-
-For release and publishing procedures, see `PUBLISH.md`.
+See the repository-level
+[development](../docs/runbooks/polars-text-development.md) and
+[release](../docs/runbooks/polars-text-release.md) runbooks for complete
+procedures.
 
 ```bash
 make build
