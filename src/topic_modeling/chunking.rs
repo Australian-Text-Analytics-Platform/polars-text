@@ -1,25 +1,34 @@
-//! Paragraph/sentence/length chunking for the topic-modeling pipeline.
+//! Topic Segment construction for the topic-modeling pipeline.
 //!
-//! Why this exists: today's BERTopic path embeds whole documents with a
-//! 256-token model and silently truncates anything longer, so long documents
-//! lose most of their content before clustering. The Rust pipeline instead
-//! splits every document into token-budgeted chunks and embeds the chunks, so a
-//! long document contributes several points (and ultimately a multi-topic
-//! distribution) while a short document is simply one chunk. The whole pipeline
-//! runs one uniform path — short text is not special-cased, it just yields a
-//! single chunk here.
+//! A Topic Segment is the unit embedded and clustered by the native topic-
+//! modelling pipeline. Segmenting before embedding lets long documents
+//! contribute several points and ultimately a multi-topic distribution.
 //!
-//! Strategy: split paragraphs first, split oversized paragraphs into sentences,
-//! then split oversized sentences by token length. A small overlap carries
-//! trailing units into the next chunk when it fits, keeping topical context
-//! across chunk boundaries without hiding where the hard fallbacks happen.
+//! Automatic mode splits blank-line blocks, then Unicode sentences, then token-
+//! length units, and packs them with a bounded overlap. Paragraph and Sentence
+//! modes preserve their semantic boundaries and right-truncate oversized units.
 //!
 //! Called by: `topic_modeling::run` (orchestrator) before embedding.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use serde::Deserialize;
 use tokenizers::Tokenizer;
+use unicode_segmentation::UnicodeSegmentation;
 
-/// One chunk of a source document. `doc_index` ties the chunk back to its
+/// Selects how source documents become Topic Segments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentationMethod {
+    /// Hierarchically split and pack text up to the configured token budget.
+    #[default]
+    Automatic,
+    /// Treat every non-empty newline-delimited line as one segment.
+    Paragraph,
+    /// Treat every Unicode UAX #29 sentence as one segment.
+    Sentence,
+}
+
+/// One Topic Segment of a source document. `doc_index` ties the segment back to its
 /// document so `rollup` can aggregate chunk topic assignments into a
 /// per-document distribution; `chunk_index` is the chunk's ordinal within that
 /// document (0-based) for stable ordering and debugging.
@@ -30,13 +39,14 @@ pub struct Chunk {
     pub text: String,
 }
 
-/// Chunking knobs. `max_tokens` is the per-chunk token budget and should stay
+/// Segmentation knobs. `max_tokens` is the per-segment token budget and should stay
 /// within the embedding model's context window; we default to 256 for a balance
 /// of context and chunk count. `overlap` carries a few tokens across chunk seams
 /// so a topic spanning a boundary is not split blind; ~10-20% of `max_tokens`
 /// is the usual range. Overlap must be strictly less than `max_tokens`.
 #[derive(Debug, Clone)]
 pub struct ChunkingConfig {
+    pub method: SegmentationMethod,
     pub max_tokens: usize,
     pub overlap: usize,
 }
@@ -44,10 +54,18 @@ pub struct ChunkingConfig {
 impl Default for ChunkingConfig {
     fn default() -> Self {
         Self {
+            method: SegmentationMethod::Automatic,
             max_tokens: 256,
             overlap: 32,
         }
     }
+}
+
+/// Topic Segments and run-level information produced during segmentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkingResult {
+    pub chunks: Vec<Chunk>,
+    pub truncated_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +74,7 @@ struct ChunkUnit {
     tokens: usize,
 }
 
-/// Split every document into token-budgeted chunks.
+/// Split every document into token-budgeted Topic Segments.
 ///
 /// Flow: split each document into paragraphs, split only oversized paragraphs
 /// into sentences, split only oversized sentences by token length, then pack the
@@ -73,19 +91,49 @@ pub fn chunk_documents(
     docs: &[String],
     tokenizer: Tokenizer,
     cfg: &ChunkingConfig,
-) -> Result<Vec<Chunk>> {
+) -> Result<ChunkingResult> {
     if cfg.max_tokens == 0 {
-        anyhow::bail!("chunking max_tokens must be > 0");
+        bail!("chunking max_tokens must be > 0");
     }
 
     let mut chunks = Vec::with_capacity(docs.len());
+    let mut truncated_count = 0;
     for (doc_index, doc) in docs.iter().enumerate() {
-        chunks.extend(chunk_document(doc_index, doc, &tokenizer, cfg)?);
+        match cfg.method {
+            SegmentationMethod::Automatic => {
+                chunks.extend(chunk_document_automatic(doc_index, doc, &tokenizer, cfg)?);
+            }
+            SegmentationMethod::Paragraph => {
+                let units = doc.lines().map(str::trim).filter(|line| !line.is_empty());
+                append_semantic_segments(
+                    doc_index,
+                    units,
+                    &tokenizer,
+                    cfg.max_tokens,
+                    &mut chunks,
+                    &mut truncated_count,
+                )?;
+            }
+            SegmentationMethod::Sentence => {
+                let units = doc.unicode_sentences().map(str::trim);
+                append_semantic_segments(
+                    doc_index,
+                    units,
+                    &tokenizer,
+                    cfg.max_tokens,
+                    &mut chunks,
+                    &mut truncated_count,
+                )?;
+            }
+        }
     }
-    Ok(chunks)
+    Ok(ChunkingResult {
+        chunks,
+        truncated_count,
+    })
 }
 
-fn chunk_document(
+fn chunk_document_automatic(
     doc_index: usize,
     doc: &str,
     tokenizer: &Tokenizer,
@@ -94,6 +142,54 @@ fn chunk_document(
     chunk_document_with_counter(doc_index, doc, cfg, &mut |text| {
         count_tokens(tokenizer, text)
     })
+}
+
+fn append_semantic_segments<'a>(
+    doc_index: usize,
+    units: impl Iterator<Item = &'a str>,
+    tokenizer: &Tokenizer,
+    max_tokens: usize,
+    chunks: &mut Vec<Chunk>,
+    truncated_count: &mut usize,
+) -> Result<()> {
+    let mut chunk_index = 0;
+    for unit in units.filter(|unit| !unit.is_empty()) {
+        let (text, was_truncated) = truncate_to_token_prefix(unit, tokenizer, max_tokens)?;
+        if text.is_empty() {
+            continue;
+        }
+        chunks.push(Chunk {
+            doc_index,
+            chunk_index,
+            text,
+        });
+        chunk_index += 1;
+        *truncated_count += usize::from(was_truncated);
+    }
+    Ok(())
+}
+
+fn truncate_to_token_prefix(
+    text: &str,
+    tokenizer: &Tokenizer,
+    max_tokens: usize,
+) -> Result<(String, bool)> {
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|err| anyhow::anyhow!("segment tokenization failed: {err}"))?;
+    if encoding.len() <= max_tokens {
+        return Ok((text.to_string(), false));
+    }
+
+    let end = encoding
+        .get_offsets()
+        .get(max_tokens - 1)
+        .map(|(_, end)| *end)
+        .ok_or_else(|| anyhow::anyhow!("segment tokenizer returned no truncation boundary"))?;
+    if end == 0 || end > text.len() || !text.is_char_boundary(end) {
+        bail!("segment tokenizer returned an invalid UTF-8 truncation boundary");
+    }
+    Ok((text[..end].trim_end().to_string(), true))
 }
 
 fn chunk_document_with_counter(
@@ -312,30 +408,11 @@ fn split_paragraphs(text: &str) -> Vec<String> {
 }
 
 fn split_sentences(text: &str) -> Vec<String> {
-    let mut sentences = Vec::new();
-    let mut start = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if is_sentence_terminator(ch) {
-            let end = idx + ch.len_utf8();
-            let sentence = text[start..end].trim();
-            if !sentence.is_empty() {
-                sentences.push(sentence.to_string());
-            }
-            start = end;
-        }
-    }
-    let trailing = text[start..].trim();
-    if !trailing.is_empty() {
-        sentences.push(trailing.to_string());
-    }
-    sentences
-}
-
-fn is_sentence_terminator(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | '!' | '?' | '。' | '！' | '？' | '۔' | '؟' | '।' | '॥'
-    )
+    text.unicode_sentences()
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn count_tokens(tokenizer: &Tokenizer, text: &str) -> Result<usize> {
@@ -347,7 +424,29 @@ fn count_tokens(tokenizer: &Tokenizer, text: &str) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
     use super::*;
+
+    fn whitespace_tokenizer(words: &[&str]) -> Tokenizer {
+        let vocab = std::iter::once((String::from("[UNK]"), 0))
+            .chain(
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(index, word)| ((*word).to_string(), (index + 1) as u32)),
+            )
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token(String::from("[UNK]"))
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+    }
 
     fn chunk_with_counter(
         doc: &str,
@@ -372,6 +471,7 @@ mod tests {
     #[test]
     fn short_document_yields_single_chunk() {
         let cfg = ChunkingConfig {
+            method: SegmentationMethod::Automatic,
             max_tokens: 64,
             overlap: 0,
         };
@@ -390,6 +490,7 @@ mod tests {
     #[test]
     fn paragraph_boundaries_are_first_split() {
         let cfg = ChunkingConfig {
+            method: SegmentationMethod::Automatic,
             max_tokens: 3,
             overlap: 0,
         };
@@ -400,16 +501,18 @@ mod tests {
     #[test]
     fn sentence_boundaries_split_oversized_paragraphs() {
         let cfg = ChunkingConfig {
+            method: SegmentationMethod::Automatic,
             max_tokens: 3,
             overlap: 0,
         };
-        let chunks = chunk_with_counter("alpha beta. gamma delta.", cfg, word_tokens);
-        assert_eq!(chunks, vec!["alpha beta.", "gamma delta."]);
+        let chunks = chunk_with_counter("alpha beta. Gamma delta.", cfg, word_tokens);
+        assert_eq!(chunks, vec!["alpha beta.", "Gamma delta."]);
     }
 
     #[test]
     fn long_sentence_falls_back_to_token_length_chunks() {
         let cfg = ChunkingConfig {
+            method: SegmentationMethod::Automatic,
             max_tokens: 2,
             overlap: 0,
         };
@@ -420,20 +523,107 @@ mod tests {
     #[test]
     fn overlap_carries_suffix_units_into_next_chunk() {
         let cfg = ChunkingConfig {
+            method: SegmentationMethod::Automatic,
             max_tokens: 4,
             overlap: 2,
         };
-        let chunks = chunk_with_counter("a b. c d. e f.", cfg, word_tokens);
-        assert_eq!(chunks, vec!["a b. c d.", "c d. e f."]);
+        let chunks = chunk_with_counter("a b. C d. E f.", cfg, word_tokens);
+        assert_eq!(chunks, vec!["a b. C d.", "C d. E f."]);
     }
 
     #[test]
     fn cjk_sentence_punctuation_is_respected() {
         let cfg = ChunkingConfig {
+            method: SegmentationMethod::Automatic,
             max_tokens: 5,
             overlap: 0,
         };
         let chunks = chunk_with_counter("你好世界。再见世界！", cfg, char_tokens);
         assert_eq!(chunks, vec!["你好世界。", "再见世界！"]);
+    }
+
+    #[test]
+    fn paragraph_mode_keeps_one_nonempty_line_and_truncates_its_tail() {
+        let tokenizer = whitespace_tokenizer(&["one", "two", "three", "four", "five"]);
+        let cfg = ChunkingConfig {
+            method: SegmentationMethod::Paragraph,
+            max_tokens: 2,
+            overlap: 0,
+        };
+
+        let result = chunk_documents(
+            &[String::from("one two three\n\n four five")],
+            tokenizer,
+            &cfg,
+        )
+        .unwrap();
+        let texts = result
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            (texts, result.truncated_count),
+            (vec![String::from("one two"), String::from("four five")], 1)
+        );
+    }
+
+    #[test]
+    fn sentence_mode_uses_unicode_sentence_boundaries() {
+        let tokenizer = whitespace_tokenizer(&["Value", "is", "3", "14", "Next", "item"]);
+        let cfg = ChunkingConfig {
+            method: SegmentationMethod::Sentence,
+            max_tokens: 20,
+            overlap: 0,
+        };
+
+        let result = chunk_documents(
+            &[String::from("Value is 3.14. Next item.")],
+            tokenizer,
+            &cfg,
+        )
+        .unwrap();
+        let texts = result
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, vec!["Value is 3.14.", "Next item."]);
+    }
+
+    #[test]
+    fn sentence_mode_uses_uax_abbreviation_boundaries_without_heuristics() {
+        let tokenizer = whitespace_tokenizer(&["Mr", "Fox", "jumped"]);
+        let cfg = ChunkingConfig {
+            method: SegmentationMethod::Sentence,
+            max_tokens: 20,
+            overlap: 0,
+        };
+
+        let result = chunk_documents(&[String::from("Mr. Fox jumped.")], tokenizer, &cfg).unwrap();
+        let texts = result
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, vec!["Mr.", "Fox jumped."]);
+    }
+
+    #[test]
+    fn semantic_truncation_preserves_utf8_boundaries() {
+        let tokenizer = whitespace_tokenizer(&["猫", "狗", "鳥"]);
+        let cfg = ChunkingConfig {
+            method: SegmentationMethod::Paragraph,
+            max_tokens: 2,
+            overlap: 0,
+        };
+
+        let result = chunk_documents(&[String::from("猫 狗 鳥")], tokenizer, &cfg).unwrap();
+
+        assert_eq!(result.chunks[0].text, "猫 狗");
+        assert_eq!(result.truncated_count, 1);
     }
 }

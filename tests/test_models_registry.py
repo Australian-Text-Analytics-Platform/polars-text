@@ -39,9 +39,18 @@ def test_predefined_models_lists_supported_languages() -> None:
     assert PREDEFINED_MODELS["lindera:ko-dic"] == ("ko",)
 
 
+def test_predefined_chinese_models_prefer_jieba() -> None:
+    chinese_models = [
+        model_id
+        for model_id, languages in PREDEFINED_MODELS.items()
+        if "zh" in languages
+    ]
+    assert chinese_models == ["lindera:jieba", "lindera:cc-cedict"]
+
+
 def test_lindera_models_by_language_lists_all_supported_dicts() -> None:
     assert LINDERA_MODELS_BY_LANGUAGE == {
-        "zh": ("lindera:cc-cedict", "lindera:jieba"),
+        "zh": ("lindera:jieba", "lindera:cc-cedict"),
         "ja": (
             "lindera:ja-ipadic",
             "lindera:ja-ipadic-neologd",

@@ -43,6 +43,7 @@ use super::{run, RunConfig};
 struct TopicModelingKwargs {
     embedder_model: Option<String>,
     cache: Option<String>,
+    segmentation_method: super::chunking::SegmentationMethod,
     max_tokens: usize,
     overlap: usize,
     reduce_dims: usize,
@@ -87,6 +88,7 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
         Field::new("y".into(), DataType::Float32),
         Field::new("n_topics".into(), DataType::UInt32),
         Field::new("n_chunks".into(), DataType::UInt32),
+        Field::new("truncated_segment_count".into(), DataType::UInt32),
         Field::new(
             "stage_timings_ms".into(),
             DataType::List(Box::new(stage_timing_struct_type())),
@@ -112,6 +114,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         embedder_repo_id: kwargs.embedder_model,
         embedding_cache_path: kwargs.cache,
         chunking: super::chunking::ChunkingConfig {
+            method: kwargs.segmentation_method,
             max_tokens: kwargs.max_tokens,
             overlap: kwargs.overlap,
         },
@@ -236,6 +239,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
 
     let n_topics = vec![result.n_topics as u32; n_rows];
     let n_chunks = vec![result.n_chunks as u32; n_rows];
+    let truncated_segment_count = vec![result.truncated_segment_count as u32; n_rows];
 
     // Build the shared run-level timing list once and replicate it onto every
     // row, matching how `n_topics` / `n_chunks` expose run-level metadata.
@@ -287,6 +291,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         Series::new("y".into(), ys),
         Series::new("n_topics".into(), n_topics),
         Series::new("n_chunks".into(), n_chunks),
+        Series::new("truncated_segment_count".into(), truncated_segment_count),
         timing_list,
     ];
     let out = StructChunked::from_series(ca.name().clone(), n_rows, fields.iter())?.into_series();

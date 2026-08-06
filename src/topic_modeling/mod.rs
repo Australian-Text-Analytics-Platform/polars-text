@@ -2,13 +2,13 @@
 //! Python BERTopic path.
 //!
 //! Pipeline (one uniform path for short and long text alike):
-//!   1. `chunking`  — split each document into token-budgeted semantic chunks
-//!      (a short document is simply one chunk).
-//!   2. `embedding` — ONNX Runtime sentence embeddings per chunk.
+//!   1. `chunking`  — split each document into token-budgeted Topic Segments
+//!      (a short document is simply one segment).
+//!   2. `embedding` — ONNX Runtime sentence embeddings per segment.
 //!   3. `reduce`    — PaCMAP dimensionality reduction for clusterability.
-//!   4. `cluster`   — HDBSCAN groups chunks into topics (with `-1` outliers).
+//!   4. `cluster`   — HDBSCAN groups segments into topics (with `-1` outliers).
 //!   5. `ctfidf`    — c-TF-IDF keyword labels per topic.
-//!   6. `rollup`    — aggregate chunk topics into a per-document distribution
+//!   6. `rollup`    — aggregate segment topics into a per-document distribution
 //!      plus a dominant topic.
 //!   7. `coords`    — 2D topic-centroid coordinates for the bubble chart.
 //!
@@ -158,6 +158,7 @@ pub struct TopicModelingResult {
     pub topics: Vec<TopicInfo>,
     pub documents: Vec<DocumentResult>,
     pub n_chunks: usize,
+    pub truncated_segment_count: usize,
     pub n_topics: usize,
     pub stage_timings_ms: Vec<StageTiming>,
 }
@@ -227,7 +228,10 @@ pub fn run(
     record_stage_timing(&mut stage_timings_ms, "embedder_load", stage_started_at);
 
     let stage_started_at = Instant::now();
-    let chunks = chunking::chunk_documents(documents, embedder.sizing_tokenizer(), &cfg.chunking)?;
+    let chunking_result =
+        chunking::chunk_documents(documents, embedder.sizing_tokenizer(), &cfg.chunking)?;
+    let chunks = chunking_result.chunks;
+    let truncated_segment_count = chunking_result.truncated_count;
     record_stage_timing(&mut stage_timings_ms, "chunking", stage_started_at);
     let n_chunks = chunks.len();
 
@@ -393,6 +397,7 @@ pub fn run(
         topics,
         documents: document_results,
         n_chunks,
+        truncated_segment_count,
         n_topics,
         stage_timings_ms,
     })

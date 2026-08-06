@@ -26,7 +26,13 @@ embedding = [
     "dep:tokenizers",
     "cache",
 ]
-topic-modeling = ["embedding", "tokenization", "dep:hdbscan", "dep:pacmap"]
+topic-modeling = [
+    "embedding",
+    "tokenization",
+    "dep:hdbscan",
+    "dep:pacmap",
+    "dep:unicode-segmentation",
+]
 
 [dependencies]
 anyhow = "1.0"
@@ -67,6 +73,7 @@ serde = { version = "1", features = ["derive"] }
 tokenizers = { version = "0.23", default-features = false, features = [
     "onig",
 ], optional = true }
+unicode-segmentation = { version = "1.13.3", optional = true }
 
 # --- Topic-modeling pipeline (Rust BERTopic replacement) ---
 # ort: ONNX Runtime embeddings for Hugging Face ONNX sentence-transformer repos.

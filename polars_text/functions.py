@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import polars as pl
 from polars._typing import IntoExpr
@@ -165,6 +166,7 @@ def topic_modeling(
     *,
     embedder_model: str | None = None,
     cache: str | os.PathLike[str] | None = None,
+    segmentation_method: Literal["automatic", "paragraph", "sentence"] = "automatic",
     max_tokens: int = 256,
     overlap: int = 32,
     reduce_dims: int = 5,
@@ -184,7 +186,8 @@ def topic_modeling(
 
     ``{dominant_topic: i32, topic_distribution: list[{topic_id, proportion}],
     representative_words: list[str], x: f32, y: f32, n_topics: u32,
-    n_chunks: u32, stage_timings_ms: list[{stage, elapsed_ms}]}``
+    n_chunks: u32, truncated_segment_count: u32,
+    stage_timings_ms: list[{stage, elapsed_ms}]}``
 
     Topic-level fields (``representative_words``/``x``/``y``) are replicated onto
     every row under its dominant topic, and ``n_topics``/``n_chunks`` plus
@@ -208,6 +211,7 @@ def topic_modeling(
         kwargs={
             "embedder_model": embedder_model,
             "cache": str(Path(cache)) if cache is not None else None,
+            "segmentation_method": segmentation_method,
             "max_tokens": max_tokens,
             "overlap": overlap,
             "reduce_dims": reduce_dims,

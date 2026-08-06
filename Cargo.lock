@@ -3421,6 +3421,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokenizers",
+ "unicode-segmentation",
  "ureq 3.3.0",
  "zip 7.2.0",
 ]

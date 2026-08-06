@@ -22,8 +22,8 @@ from ._internal import (
 PREDEFINED_MODELS: Final[dict[str, tuple[str, ...]]] = {
     "native:plain_words_en": ("en",),
     "huggingface:bert-base-uncased": ("en",),
-    "lindera:cc-cedict": ("zh",),
     "lindera:jieba": ("zh",),
+    "lindera:cc-cedict": ("zh",),
     "lindera:ja-ipadic": ("ja",),
     "lindera:ja-ipadic-neologd": ("ja",),
     "lindera:ja-unidic": ("ja",),
@@ -47,7 +47,7 @@ PREDEFINED_MODEL_LABELS: Final[dict[str, str]] = {
 
 #: Lindera dictionary-backed tokenizer IDs grouped by supported language.
 LINDERA_MODELS_BY_LANGUAGE: Final[dict[str, tuple[str, ...]]] = {
-    "zh": ("lindera:cc-cedict", "lindera:jieba"),
+    "zh": ("lindera:jieba", "lindera:cc-cedict"),
     "ja": (
         "lindera:ja-ipadic",
         "lindera:ja-ipadic-neologd",

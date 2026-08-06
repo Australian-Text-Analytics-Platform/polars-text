@@ -1,6 +1,6 @@
 //! c-TF-IDF topic labeling: pick the words that best characterize each topic.
 //!
-//! Why this exists: a topic is just a set of chunks until it has human-readable
+//! Why this exists: a topic is just a set of Topic Segments until it has human-readable
 //! keywords. BERTopic's class-based TF-IDF (c-TF-IDF) treats each topic as one
 //! "document" (the concatenation of its chunks) and scores a term by how
 //! frequent it is *within* the topic versus *across* the whole corpus, so terms
@@ -20,7 +20,7 @@
 //! part we unit-test. The tokenization helper depends on downloaded model files
 //! and is exercised by the manual harness, not CI.
 //!
-//! Called by: `topic_modeling::run` after clustering, once chunk texts are
+//! Called by: `topic_modeling::run` after clustering, once Topic Segment texts are
 //! grouped by topic.
 
 use std::collections::{HashMap, HashSet};

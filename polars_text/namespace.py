@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 import polars as pl
 
@@ -77,6 +78,7 @@ class TextNamespace:
         *,
         embedder_model: str | None = None,
         cache: str | os.PathLike[str] | None = None,
+        segmentation_method: Literal["automatic", "paragraph", "sentence"] = "automatic",
         max_tokens: int = 256,
         overlap: int = 32,
         reduce_dims: int = 5,
@@ -98,6 +100,7 @@ class TextNamespace:
             self._expr,
             embedder_model=embedder_model,
             cache=cache,
+            segmentation_method=segmentation_method,
             max_tokens=max_tokens,
             overlap=overlap,
             reduce_dims=reduce_dims,
