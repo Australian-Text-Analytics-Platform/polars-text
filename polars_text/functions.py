@@ -173,10 +173,8 @@ def topic_modeling(
     seed: int = 42,
     min_cluster_size: int = 10,
     min_samples: int | None = None,
-    top_k: int = 10,
     vectorizer_model: str | None = None,
     lowercase: bool = True,
-    stopwords: list[str] | None = None,
 ) -> pl.Expr:
     """Cluster a whole document column into topics, one struct emitted per row.
 
@@ -185,7 +183,8 @@ def topic_modeling(
     and returns a per-row struct that lines up 1:1 with the input rows:
 
     ``{dominant_topic: i32, topic_distribution: list[{topic_id, proportion}],
-    representative_words: list[str], x: f32, y: f32, n_topics: u32,
+    representative_words: list[{word: str, occurrence_count: u64}], x: f32,
+    y: f32, n_topics: u32,
     n_chunks: u32, truncated_segment_count: u32,
     stage_timings_ms: list[{stage, elapsed_ms}]}``
 
@@ -218,10 +217,8 @@ def topic_modeling(
             "seed": seed,
             "min_cluster_size": min_cluster_size,
             "min_samples": min_samples,
-            "top_k": top_k,
             "vectorizer_model": vectorizer_model,
             "lowercase": lowercase,
-            "stopwords": stopwords,
         },
         is_elementwise=False,
     )

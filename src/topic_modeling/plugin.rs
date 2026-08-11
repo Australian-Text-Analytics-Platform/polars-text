@@ -34,7 +34,7 @@ use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
 use serde::Deserialize;
 
-use super::{run, RunConfig};
+use super::{ctfidf::RepresentativeWord, run, RunConfig};
 
 /// Keyword arguments mirroring the pipeline knobs. Defaults match
 /// `RunConfig::default` where applicable; the Python wrapper always sends every
@@ -50,10 +50,8 @@ struct TopicModelingKwargs {
     seed: u64,
     min_cluster_size: usize,
     min_samples: Option<usize>,
-    top_k: usize,
     vectorizer_model: Option<String>,
     lowercase: bool,
-    stopwords: Option<Vec<String>>,
 }
 
 /// Inner dtype of the per-document `topic_distribution` list elements.
@@ -61,6 +59,13 @@ fn distribution_struct_type() -> DataType {
     DataType::Struct(vec![
         Field::new("topic_id".into(), DataType::Int32),
         Field::new("proportion".into(), DataType::Float32),
+    ])
+}
+
+fn representative_word_struct_type() -> DataType {
+    DataType::Struct(vec![
+        Field::new("word".into(), DataType::String),
+        Field::new("occurrence_count".into(), DataType::UInt64),
     ])
 }
 
@@ -82,7 +87,7 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
         ),
         Field::new(
             "representative_words".into(),
-            DataType::List(Box::new(DataType::String)),
+            DataType::List(Box::new(representative_word_struct_type())),
         ),
         Field::new("x".into(), DataType::Float32),
         Field::new("y".into(), DataType::Float32),
@@ -124,12 +129,8 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
             min_cluster_size: kwargs.min_cluster_size,
             min_samples: kwargs.min_samples,
         },
-        ctfidf: super::ctfidf::CtfidfConfig {
-            top_k: kwargs.top_k,
-        },
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
-        stopwords: kwargs.stopwords.unwrap_or_default().into_iter().collect(),
     };
 
     let result = run(&documents, &corpus_indices, &cfg)
@@ -137,7 +138,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
 
     // Topic id -> (representative_words, x, y) so each row can carry its
     // dominant topic's bubble-chart metadata.
-    let topic_meta: HashMap<i32, (&Vec<String>, f32, f32)> = result
+    let topic_meta: HashMap<i32, (&Vec<RepresentativeWord>, f32, f32)> = result
         .topics
         .iter()
         .map(|t| (t.id, (&t.representative_words, t.x, t.y)))
@@ -154,8 +155,9 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
     let mut dist_props: Vec<f32> = Vec::new();
     let mut dist_spans: Vec<(usize, usize)> = Vec::with_capacity(n_rows);
 
-    // Flat column for the per-row `representative_words` list-of-string.
+    // Flat columns for the per-row `representative_words` list-of-struct.
     let mut word_flat: Vec<String> = Vec::new();
+    let mut occurrence_count_flat: Vec<u64> = Vec::new();
     let mut word_spans: Vec<(usize, usize)> = Vec::with_capacity(n_rows);
 
     // `result.documents` is in input order (doc_index 0..n_rows); iterate in
@@ -182,8 +184,9 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
 
         let word_start = word_flat.len();
         if let Some(words) = words {
-            for w in words.iter() {
-                word_flat.push(w.clone());
+            for term in words.iter() {
+                word_flat.push(term.word.clone());
+                occurrence_count_flat.push(term.occurrence_count as u64);
             }
         }
         word_spans.push((word_start, word_flat.len()));
@@ -218,12 +221,21 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
     }
     let dist_list = dist_builder.finish().into_series();
 
-    // Build the shared inner string series for `representative_words` once.
-    let word_inner = Series::new(PlSmallStr::EMPTY, word_flat);
+    // Build the shared inner struct for `representative_words` once.
+    let word_inner = StructChunked::from_series(
+        PlSmallStr::EMPTY,
+        word_flat.len(),
+        [
+            Series::new("word".into(), word_flat),
+            Series::new("occurrence_count".into(), occurrence_count_flat),
+        ]
+        .iter(),
+    )?
+    .into_series();
     let mut word_builder = AnonymousOwnedListBuilder::new(
         "representative_words".into(),
         n_rows,
-        Some(DataType::String),
+        Some(representative_word_struct_type()),
     );
     for (start, end) in word_spans {
         if end == start {
@@ -296,4 +308,26 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
     ];
     let out = StructChunked::from_series(ca.name().clone(), n_rows, fields.iter())?.into_series();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_uses_counted_representative_word_structs() {
+        let output = topic_modeling_output(&[Field::new("text".into(), DataType::String)])
+            .expect("topic output dtype");
+        let DataType::Struct(fields) = output.dtype() else {
+            panic!("topic output must be a struct")
+        };
+        let representative_words = fields
+            .iter()
+            .find(|field| field.name() == "representative_words")
+            .expect("representative_words field");
+        assert_eq!(
+            representative_words.dtype(),
+            &DataType::List(Box::new(representative_word_struct_type()))
+        );
+    }
 }

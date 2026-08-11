@@ -5,8 +5,8 @@
 //! "document" (the concatenation of its chunks) and scores a term by how
 //! frequent it is *within* the topic versus *across* the whole corpus, so terms
 //! that are common everywhere (and thus uninformative) are down-weighted without
-//! needing a hand-tuned stopword list — though we still accept one for the
-//! residual function words a multilingual tokenizer leaves behind.
+//! needing a hand-tuned stopword list. User stopwords are a presentation concern
+//! and do not alter this model output.
 //!
 //! Formula (BERTopic's `ClassTfidfTransformer`):
 //!   tf(t, c)  = count(t in c) / total_words(c)          (within-topic frequency)
@@ -23,39 +23,40 @@
 //! Called by: `topic_modeling::run` after clustering, once Topic Segment texts are
 //! grouped by topic.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::tokenizer::{ensure_tokenizer_for_model, TokenizerBackend};
 
-/// Labeling knobs. `top_k` is how many representative words to keep per topic
-/// (maps to the backend's `representative_words_count`).
-#[derive(Debug, Clone)]
-pub struct CtfidfConfig {
-    pub top_k: usize,
+/// Fixed candidate capacity retained for presentation-time filtering.
+pub const REPRESENTATIVE_WORD_CANDIDATE_LIMIT: usize = 100;
+
+/// A representative term in c-TF-IDF order.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepresentativeWord {
+    pub word: String,
+    pub occurrence_count: usize,
+    /// Used only while ranking. The plugin and serialized pipeline result omit it.
+    #[serde(skip)]
+    pub(crate) score: f32,
 }
 
-impl Default for CtfidfConfig {
-    fn default() -> Self {
-        Self { top_k: 10 }
-    }
-}
-
-/// Score terms per topic with c-TF-IDF and return the top-`k` `(word, score)`
-/// pairs for each topic, highest score first.
+/// Score terms per topic with c-TF-IDF and return the fixed candidate set for
+/// each topic, highest score first.
 ///
 /// `per_topic_counts[i]` is the term→count map for topic `i` (already tokenized
-/// and stopword-filtered by the caller). This is the deterministic core.
+/// by the caller). This is the deterministic core.
 ///
 /// Flow: derive per-topic word totals and the corpus-wide term frequency, then
 /// for every term in every topic compute `tf * idf`, sort each topic's terms by
-/// score (alphabetical tie-break for stable output), and truncate to `top_k`.
-pub fn ctfidf_scores(
+/// score (alphabetical tie-break for stable output), and truncate to the fixed
+/// representative-word candidate limit.
+pub fn representative_words(
     per_topic_counts: &[HashMap<String, usize>],
-    cfg: &CtfidfConfig,
-) -> Vec<Vec<(String, f32)>> {
+) -> Vec<Vec<RepresentativeWord>> {
     let n_topics = per_topic_counts.len();
     if n_topics == 0 {
         return Vec::new();
@@ -84,30 +85,35 @@ pub fn ctfidf_scores(
             if words == 0 {
                 return Vec::new();
             }
-            let mut scored: Vec<(String, f32)> = counts
+            let mut scored: Vec<RepresentativeWord> = counts
                 .iter()
                 .map(|(term, &count)| {
                     let tf = count as f64 / words as f64;
                     let f_t = corpus_freq[term.as_str()] as f64;
                     let idf = (1.0 + avg_words / f_t).ln();
-                    (term.clone(), (tf * idf) as f32)
+                    RepresentativeWord {
+                        word: term.clone(),
+                        occurrence_count: count,
+                        score: (tf * idf) as f32,
+                    }
                 })
                 .collect();
             // Highest score first; alphabetical tie-break keeps output stable.
             scored.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
+                b.score
+                    .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
+                    .then_with(|| a.word.cmp(&b.word))
             });
-            scored.truncate(cfg.top_k);
+            scored.truncate(REPRESENTATIVE_WORD_CANDIDATE_LIMIT);
             scored
         })
         .collect()
 }
 
 /// Tokenize each topic's concatenated text into a term→count map using the
-/// shared multilingual `TokenizerBackend`, dropping stopwords and (via the
-/// backend) punctuation. Mirrors the current Python pipeline's lindera-based
+/// shared multilingual `TokenizerBackend`, dropping punctuation via the
+/// backend. Mirrors the current Python pipeline's lindera-based
 /// "vectorizer corpora" so CJK topics get word-segmented, not split per byte.
 ///
 /// `model_id` selects the segmentation backend (`lindera:jieba` for Chinese,
@@ -117,22 +123,24 @@ pub fn count_topic_terms(
     topic_texts: &[String],
     model_id: Option<&str>,
     lowercase: bool,
-    stopwords: &HashSet<String>,
 ) -> Result<Vec<HashMap<String, usize>>> {
     let backend: Arc<TokenizerBackend> = ensure_tokenizer_for_model(model_id)?;
     topic_texts
         .iter()
         .map(|text| {
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for tok in backend.tokenize_text(text, false, lowercase, true)? {
-                if stopwords.contains(&tok) {
-                    continue;
-                }
-                *counts.entry(tok).or_insert(0) += 1;
-            }
-            Ok(counts)
+            Ok(count_tokens(
+                backend.tokenize_text(text, false, lowercase, true)?,
+            ))
         })
         .collect()
+}
+
+fn count_tokens(tokens: impl IntoIterator<Item = String>) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for token in tokens {
+        *counts.entry(token).or_insert(0) += 1;
+    }
+    counts
 }
 
 #[cfg(test)]
@@ -151,29 +159,65 @@ mod tests {
         // "shared" appears in both topics; "alpha"/"beta" are topic-specific.
         let topic_a = counts(&[("alpha", 5), ("shared", 5)]);
         let topic_b = counts(&[("beta", 5), ("shared", 5)]);
-        let res = ctfidf_scores(&[topic_a, topic_b], &CtfidfConfig { top_k: 5 });
+        let res = representative_words(&[topic_a, topic_b]);
 
         assert_eq!(res.len(), 2);
         // Topic A's top word is its distinctive term, not the shared one.
-        assert_eq!(res[0][0].0, "alpha");
-        assert_eq!(res[1][0].0, "beta");
+        assert_eq!(res[0][0].word, "alpha");
+        assert_eq!(res[1][0].word, "beta");
         // The shared term scores strictly lower within each topic.
-        let a_alpha = res[0].iter().find(|(t, _)| t == "alpha").unwrap().1;
-        let a_shared = res[0].iter().find(|(t, _)| t == "shared").unwrap().1;
+        let a_alpha = res[0]
+            .iter()
+            .find(|term| term.word == "alpha")
+            .unwrap()
+            .score;
+        let a_shared = res[0]
+            .iter()
+            .find(|term| term.word == "shared")
+            .unwrap()
+            .score;
         assert!(a_alpha > a_shared);
     }
 
     #[test]
-    fn respects_top_k_and_is_sorted_descending() {
-        let topic = counts(&[("a", 1), ("b", 2), ("c", 3), ("d", 4)]);
-        let res = ctfidf_scores(&[topic], &CtfidfConfig { top_k: 2 });
-        assert_eq!(res[0].len(), 2);
-        assert!(res[0][0].1 >= res[0][1].1);
+    fn retains_counts_and_truncates_to_fixed_candidate_limit() {
+        let topic = (0..105)
+            .map(|index| (format!("term-{index:03}"), index + 1))
+            .collect::<HashMap<_, _>>();
+        let res = representative_words(&[topic]);
+        assert_eq!(res[0].len(), REPRESENTATIVE_WORD_CANDIDATE_LIMIT);
+        assert!(res[0][0].score >= res[0][1].score);
+        assert!(res[0].iter().all(|term| term.occurrence_count > 0));
+        assert_eq!(res[0][0].occurrence_count, 105);
+    }
+
+    #[test]
+    fn breaks_equal_score_ties_alphabetically() {
+        let res = representative_words(&[counts(&[("beta", 2), ("alpha", 2)])]);
+        assert_eq!(
+            res[0]
+                .iter()
+                .map(|term| term.word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn counts_repeated_overlap_tokens_as_occurrences() {
+        let counts = count_tokens(
+            ["boundary", "next", "boundary"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(counts["boundary"], 2);
+        assert_eq!(counts["next"], 1);
     }
 
     #[test]
     fn empty_topic_yields_no_words() {
-        let res = ctfidf_scores(&[HashMap::new()], &CtfidfConfig::default());
-        assert_eq!(res, vec![Vec::<(String, f32)>::new()]);
+        let res = representative_words(&[HashMap::new()]);
+        assert_eq!(res.len(), 1);
+        assert!(res[0].is_empty());
     }
 }

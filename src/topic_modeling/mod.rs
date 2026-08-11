@@ -43,7 +43,7 @@ pub mod reduce;
 pub mod rollup;
 
 #[cfg(feature = "topic-modeling")]
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{path::Path, time::Instant};
 
 #[cfg(feature = "topic-modeling")]
 use anyhow::Result;
@@ -57,7 +57,7 @@ use chunking::ChunkingConfig;
 #[cfg(feature = "topic-modeling")]
 use cluster::ClusterConfig;
 #[cfg(feature = "topic-modeling")]
-use ctfidf::CtfidfConfig;
+use ctfidf::RepresentativeWord;
 #[cfg(feature = "topic-modeling")]
 use embedding_cache::{get_or_insert_embeddings, CacheScope};
 #[cfg(feature = "topic-modeling")]
@@ -75,8 +75,8 @@ const COORD_DIMS: usize = 2;
 const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// All knobs for one topic-modeling run. The backend maps its public options
-/// (`min_topic_size`, `representative_words_count`, `random_seed`, sampling,
-/// CJK vectorizer choice) onto these fields.
+/// (`min_topic_size`, `random_seed`, sampling, CJK vectorizer choice) onto these
+/// fields.
 #[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -90,12 +90,10 @@ pub struct RunConfig {
     /// Seed shared by both PaCMAP passes for reproducibility.
     pub seed: u64,
     pub cluster: ClusterConfig,
-    pub ctfidf: CtfidfConfig,
     /// Tokenizer model id used to segment topic text for c-TF-IDF (e.g.
     /// `lindera:jieba` for Chinese). `None` falls back to English plain words.
     pub vectorizer_model_id: Option<String>,
     pub lowercase: bool,
-    pub stopwords: HashSet<String>,
 }
 
 #[cfg(feature = "topic-modeling")]
@@ -108,10 +106,8 @@ impl Default for RunConfig {
             reduce_dims: ReduceConfig::default().output_dims,
             seed: ReduceConfig::default().seed,
             cluster: ClusterConfig::default(),
-            ctfidf: CtfidfConfig::default(),
             vectorizer_model_id: None,
             lowercase: true,
-            stopwords: HashSet::new(),
         }
     }
 }
@@ -121,8 +117,7 @@ impl Default for RunConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicInfo {
     pub id: i32,
-    pub representative_words: Vec<String>,
-    pub representative_scores: Vec<f32>,
+    pub representative_words: Vec<RepresentativeWord>,
     /// Per-corpus soft size (summed document proportions).
     pub size: Vec<f32>,
     pub total_size: f32,
@@ -325,12 +320,7 @@ pub fn run(
         .as_deref()
         .unwrap_or(PLAIN_WORDS_EN_MODEL_ID);
     let stage_started_at = Instant::now();
-    let term_counts = ctfidf::count_topic_terms(
-        &topic_texts,
-        Some(vectorizer),
-        cfg.lowercase,
-        &cfg.stopwords,
-    )?;
+    let term_counts = ctfidf::count_topic_terms(&topic_texts, Some(vectorizer), cfg.lowercase)?;
     record_stage_timing(
         &mut stage_timings_ms,
         "ctfidf_count_terms",
@@ -338,7 +328,7 @@ pub fn run(
     );
 
     let stage_started_at = Instant::now();
-    let keywords = ctfidf::ctfidf_scores(&term_counts, &cfg.ctfidf);
+    let keywords = ctfidf::representative_words(&term_counts);
     record_stage_timing(&mut stage_timings_ms, "ctfidf_scores", stage_started_at);
 
     // Roll chunks up to documents and per-corpus soft sizes.
@@ -352,21 +342,13 @@ pub fn run(
     let stage_started_at = Instant::now();
     let topics = (0..n_topics)
         .map(|t| {
-            let words = keywords
-                .get(t)
-                .map(|kw| kw.iter().map(|(w, _)| w.clone()).collect())
-                .unwrap_or_default();
-            let scores = keywords
-                .get(t)
-                .map(|kw| kw.iter().map(|(_, s)| *s).collect())
-                .unwrap_or_default();
+            let representative_words = keywords.get(t).cloned().unwrap_or_default();
             let size: Vec<f32> = (0..n_corpora).map(|c| sizes[c][t]).collect();
             let total_size = size.iter().sum();
             let (x, y) = coords.get(t).copied().unwrap_or((0.0, 0.0));
             TopicInfo {
                 id: t as i32,
-                representative_words: words,
-                representative_scores: scores,
+                representative_words,
                 size,
                 total_size,
                 chunk_count: chunk_counts[t],

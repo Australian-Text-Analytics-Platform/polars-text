@@ -85,10 +85,8 @@ class TextNamespace:
         seed: int = 42,
         min_cluster_size: int = 10,
         min_samples: int | None = None,
-        top_k: int = 10,
         vectorizer_model: str | None = None,
         lowercase: bool = True,
-        stopwords: list[str] | None = None,
     ) -> pl.Expr:
         """Cluster a document column and emit per-row topic structs.
 
@@ -107,8 +105,6 @@ class TextNamespace:
             seed=seed,
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
-            top_k=top_k,
             vectorizer_model=vectorizer_model,
             lowercase=lowercase,
-            stopwords=stopwords,
         )
