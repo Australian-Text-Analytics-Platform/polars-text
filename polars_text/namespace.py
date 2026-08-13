@@ -37,6 +37,7 @@ class TextNamespace:
         num_right_tokens: int = 5,
         regex: bool = False,
         case_sensitive: bool = False,
+        remove_punct: bool = False,
     ) -> pl.Expr:
         return functions.concordance(
             self._expr,
@@ -45,6 +46,7 @@ class TextNamespace:
             num_right_tokens=num_right_tokens,
             regex=regex,
             case_sensitive=case_sensitive,
+            remove_punct=remove_punct,
         )
 
     def clean_text(self) -> pl.Expr:

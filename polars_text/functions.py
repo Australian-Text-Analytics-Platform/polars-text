@@ -80,6 +80,7 @@ def concordance(
     num_right_tokens: int = 5,
     regex: bool = False,
     case_sensitive: bool = False,
+    remove_punct: bool = False,
 ) -> pl.Expr:
     _require_feature("tokenization", "concordance")
     return register_plugin_function(
@@ -92,6 +93,7 @@ def concordance(
             "num_right_tokens": num_right_tokens,
             "regex": regex,
             "case_sensitive": case_sensitive,
+            "remove_punct": remove_punct,
         },
         is_elementwise=True,
     )

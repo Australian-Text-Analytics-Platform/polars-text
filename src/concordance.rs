@@ -1,5 +1,5 @@
 use crate::offsets::byte_spans_to_char_spans;
-use crate::tokenizer::tokenize_plain_text;
+use crate::tokenizer::{tokenize_plain_text, tokenize_plain_text_with_offsets};
 use anyhow::Result;
 use polars::prelude::*;
 use regex::RegexBuilder;
@@ -12,6 +12,8 @@ pub struct ConcordanceKwargs {
     pub num_right_tokens: i64,
     pub regex: bool,
     pub case_sensitive: bool,
+    #[serde(default)]
+    pub remove_punct: bool,
 }
 
 pub fn list_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
@@ -53,6 +55,54 @@ fn detokenize(tokens: &[String]) -> String {
         return String::new();
     }
     tokens.join(" ")
+}
+
+fn char_offset_to_byte_offset(text: &str, char_offset: i64) -> usize {
+    if char_offset <= 0 {
+        return 0;
+    }
+
+    text.char_indices()
+        .nth(char_offset as usize)
+        .map_or(text.len(), |(byte_offset, _)| byte_offset)
+}
+
+fn raw_context_windows(
+    left_text: &str,
+    right_text: &str,
+    left_take: usize,
+    right_take: usize,
+) -> (String, String, String, String) {
+    let left_tokens = tokenize_plain_text_with_offsets(left_text, false, true);
+    let right_tokens = tokenize_plain_text_with_offsets(right_text, false, true);
+
+    let left_start = left_tokens.len().saturating_sub(left_take);
+    let left_slice = if left_take == 0 {
+        &left_tokens[0..0]
+    } else {
+        &left_tokens[left_start..]
+    };
+    let right_end = right_take.min(right_tokens.len());
+    let right_slice = &right_tokens[..right_end];
+
+    let left_context = left_slice
+        .first()
+        .map_or_else(String::new, |(_, start, _)| {
+            left_text[char_offset_to_byte_offset(left_text, *start)..].to_string()
+        });
+    let right_context = right_slice.last().map_or_else(String::new, |(_, _, end)| {
+        right_text[..char_offset_to_byte_offset(right_text, *end)].to_string()
+    });
+    let l1 = left_slice
+        .last()
+        .map(|(token, _, _)| token.clone())
+        .unwrap_or_default();
+    let r1 = right_slice
+        .first()
+        .map(|(token, _, _)| token.clone())
+        .unwrap_or_default();
+
+    (left_context, right_context, l1, r1)
 }
 
 pub fn concordance_for_text(text: &str, kwargs: &ConcordanceKwargs) -> Result<Vec<Series>> {
@@ -98,34 +148,34 @@ pub fn concordance_for_text(text: &str, kwargs: &ConcordanceKwargs) -> Result<Ve
         let left_text = &text[..start_byte];
         let right_text = &text[end_byte..];
 
-        let left_tokens = tokenize_plain_text(left_text, false, false);
-        let right_tokens = tokenize_plain_text(right_text, false, false);
-
         let left_take = kwargs.num_left_tokens.max(0) as usize;
         let right_take = kwargs.num_right_tokens.max(0) as usize;
 
-        let left_slice = if left_take == 0 {
-            Vec::new()
-        } else if left_tokens.len() <= left_take {
-            left_tokens.clone()
+        let (left_context, right_context, l1, r1) = if kwargs.remove_punct {
+            raw_context_windows(left_text, right_text, left_take, right_take)
         } else {
-            left_tokens[left_tokens.len() - left_take..].to_vec()
+            let left_tokens = tokenize_plain_text(left_text, false, false);
+            let right_tokens = tokenize_plain_text(right_text, false, false);
+            let left_start = left_tokens.len().saturating_sub(left_take);
+            let left_slice = if left_take == 0 {
+                &left_tokens[0..0]
+            } else {
+                &left_tokens[left_start..]
+            };
+            let right_end = right_take.min(right_tokens.len());
+            let right_slice = &right_tokens[..right_end];
+
+            (
+                detokenize(left_slice),
+                detokenize(right_slice),
+                left_slice.last().cloned().unwrap_or_default(),
+                right_slice.first().cloned().unwrap_or_default(),
+            )
         };
 
-        let right_slice = if right_take == 0 {
-            Vec::new()
-        } else if right_tokens.len() <= right_take {
-            right_tokens.clone()
-        } else {
-            right_tokens[..right_take].to_vec()
-        };
-
-        let l1 = left_slice.last().cloned().unwrap_or_default();
-        let r1 = right_slice.first().cloned().unwrap_or_default();
-
-        left_contexts.push(detokenize(&left_slice));
+        left_contexts.push(left_context);
         matched_texts.push(matched.clone());
-        right_contexts.push(detokenize(&right_slice));
+        right_contexts.push(right_context);
         start_indices.push(start_idx);
         end_indices.push(end_idx);
         l1_vals.push(l1);

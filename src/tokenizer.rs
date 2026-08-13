@@ -320,6 +320,16 @@ pub fn tokenize_plain_text(text: &str, lowercase: bool, remove_punctuation: bool
         .unwrap_or_default()
 }
 
+pub fn tokenize_plain_text_with_offsets(
+    text: &str,
+    lowercase: bool,
+    remove_punctuation: bool,
+) -> Vec<(String, i64, i64)> {
+    TokenizerBackend::PlainWordsEn
+        .tokenize_text_with_offsets(text, lowercase, remove_punctuation)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

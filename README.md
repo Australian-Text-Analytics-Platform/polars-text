@@ -42,7 +42,7 @@ Tokenization is available through the `text` namespace on expressions.
 - `word_count(expr)`
 - `char_count(expr)`
 - `sentence_count(expr)`
-- `concordance(expr, search_word, num_left_tokens=5, num_right_tokens=5, regex=False, case_sensitive=False)`
+- `concordance(expr, search_word, num_left_tokens=5, num_right_tokens=5, regex=False, case_sensitive=False, remove_punct=False)`
 
 ### Namespace usage
 
@@ -61,6 +61,11 @@ character offsets. Pass an explicit `native:`, `huggingface:`, or `lindera:`
 model ID. Pass `cache=Path("tokens.duckdb")` to persist tokenization results in
 a DuckDB cache and reuse them by content hash; leave `cache=None` to compute
 directly through the Rust plugin.
+
+Pass `remove_punct=True` to `concordance` to exclude punctuation and
+symbol-only tokens from context counts and L1/R1. The returned contexts retain
+the original punctuation and whitespace between lexical tokens and the match;
+literal and regular-expression matching are unchanged.
 
 ### Embeddings
 
