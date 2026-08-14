@@ -90,11 +90,10 @@ class TextNamespace:
         vectorizer_model: str | None = None,
         lowercase: bool = True,
     ) -> pl.Expr:
-        """Cluster a document column and emit per-row topic structs.
+        """Cluster a document column and emit one run-level topic struct.
 
-        Output includes dominant topic, topic distribution, representative words,
-        topic coordinates, run counts, and ``stage_timings_ms`` replicated onto
-        every row for native profiling.
+        Output contains separate document outcomes and complete topic metadata,
+        plus segment counts, truncation reporting, and native stage timings.
         """
         return functions.topic_modeling(
             self._expr,

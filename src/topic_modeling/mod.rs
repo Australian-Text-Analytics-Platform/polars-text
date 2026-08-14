@@ -118,11 +118,6 @@ impl Default for RunConfig {
 pub struct TopicInfo {
     pub id: i32,
     pub representative_words: Vec<RepresentativeWord>,
-    /// Per-corpus soft size (summed document proportions).
-    pub size: Vec<f32>,
-    pub total_size: f32,
-    /// Raw chunk count assigned to this topic (the hard count, for `meta`).
-    pub chunk_count: usize,
     pub x: f32,
     pub y: f32,
 }
@@ -132,9 +127,9 @@ pub struct TopicInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentResult {
     pub doc_index: usize,
-    pub corpus_index: usize,
     pub dominant_topic: i32,
-    /// `(topic_id, proportion)` pairs summing to 1 over the document's chunks.
+    /// `(topic_id, proportion)` pairs summing to 1 over the retained character
+    /// length of the document's Topic Segments.
     pub topic_distribution: Vec<(i32, f32)>,
 }
 
@@ -154,7 +149,6 @@ pub struct TopicModelingResult {
     pub documents: Vec<DocumentResult>,
     pub n_chunks: usize,
     pub truncated_segment_count: usize,
-    pub n_topics: usize,
     pub stage_timings_ms: Vec<StageTiming>,
 }
 
@@ -190,8 +184,7 @@ fn encode_topic_embedding_batches(
     Ok(vectors)
 }
 
-/// Run the full pipeline on `documents`, with `corpus_indices[d]` naming each
-/// document's corpus (0-based; use all-zeros for a single corpus).
+/// Run the full pipeline on `documents`.
 ///
 /// Flow:
 ///  1. Load the embedder and chunk every document with its sizing tokenizer.
@@ -199,22 +192,10 @@ fn encode_topic_embedding_batches(
 ///     separately reduce(2D) for coordinates. Too few chunks collapse to one
 ///     trivial topic (numeric guard); zero chunks yield no topics.
 ///  3. Concatenate each topic's chunk text, then c-TF-IDF for keywords.
-///  4. Roll chunk labels up to per-document distributions and per-corpus soft
-///     sizes, and assemble the topic/document payload.
+///  4. Roll segment labels up to length-weighted per-document distributions,
+///     then assemble the topic/document payload.
 #[cfg(feature = "topic-modeling")]
-pub fn run(
-    documents: &[String],
-    corpus_indices: &[usize],
-    cfg: &RunConfig,
-) -> Result<TopicModelingResult> {
-    if documents.len() != corpus_indices.len() {
-        anyhow::bail!(
-            "documents ({}) and corpus_indices ({}) length mismatch",
-            documents.len(),
-            corpus_indices.len()
-        );
-    }
-
+pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult> {
     let total_started_at = Instant::now();
     let mut stage_timings_ms = Vec::new();
 
@@ -306,13 +287,11 @@ pub fn run(
 
     // c-TF-IDF: one "document" per topic = its chunks concatenated.
     let mut topic_texts = vec![String::new(); n_topics];
-    let mut chunk_counts = vec![0usize; n_topics];
     for (chunk, &label) in chunks.iter().zip(&labels) {
         if label >= 0 && (label as usize) < n_topics {
             let t = label as usize;
             topic_texts[t].push_str(&chunk.text);
             topic_texts[t].push(' ');
-            chunk_counts[t] += 1;
         }
     }
     let vectorizer = cfg
@@ -331,27 +310,22 @@ pub fn run(
     let keywords = ctfidf::representative_words(&term_counts);
     record_stage_timing(&mut stage_timings_ms, "ctfidf_scores", stage_started_at);
 
-    // Roll chunks up to documents and per-corpus soft sizes.
+    // Roll Topic Segments up to documents by retained Unicode-character length.
+    // Automatic overlap deliberately repeats source text as another observation.
     let stage_started_at = Instant::now();
     let chunk_doc_index: Vec<usize> = chunks.iter().map(|c| c.doc_index).collect();
-    let doc_topics = rollup::rollup(documents.len(), &chunk_doc_index, &labels);
-    let n_corpora = corpus_indices.iter().copied().max().map_or(0, |m| m + 1);
-    let sizes = rollup::corpus_topic_sizes(&doc_topics, corpus_indices, n_corpora, n_topics);
+    let chunk_weights: Vec<usize> = chunks.iter().map(|c| c.text.chars().count()).collect();
+    let doc_topics = rollup::rollup(documents.len(), &chunk_doc_index, &labels, &chunk_weights);
     record_stage_timing(&mut stage_timings_ms, "rollup", stage_started_at);
 
     let stage_started_at = Instant::now();
     let topics = (0..n_topics)
         .map(|t| {
             let representative_words = keywords.get(t).cloned().unwrap_or_default();
-            let size: Vec<f32> = (0..n_corpora).map(|c| sizes[c][t]).collect();
-            let total_size = size.iter().sum();
             let (x, y) = coords.get(t).copied().unwrap_or((0.0, 0.0));
             TopicInfo {
                 id: t as i32,
                 representative_words,
-                size,
-                total_size,
-                chunk_count: chunk_counts[t],
                 x,
                 y,
             }
@@ -363,7 +337,6 @@ pub fn run(
         .enumerate()
         .map(|(i, dt)| DocumentResult {
             doc_index: i,
-            corpus_index: corpus_indices[i],
             dominant_topic: dt.dominant_topic,
             topic_distribution: dt
                 .topic_distribution
@@ -380,7 +353,6 @@ pub fn run(
         documents: document_results,
         n_chunks,
         truncated_segment_count,
-        n_topics,
         stage_timings_ms,
     })
 }

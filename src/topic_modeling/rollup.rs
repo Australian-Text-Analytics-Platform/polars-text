@@ -4,11 +4,12 @@
 //! *documents*. A long document legitimately spans several topics, so instead of
 //! collapsing it to a single id (the old BERTopic behavior that the long-text
 //! redesign explicitly removes), we report the normalized mix of topics across
-//! its chunks. A short document yields one chunk and therefore a near-one-hot
-//! distribution — the same code path, no length branching.
+//! its segments. Each segment contributes the Unicode-character length of its
+//! retained text. A short document yields one segment and therefore a near-one-
+//! hot distribution — the same code path, no length branching.
 //!
 //! Outlier handling: HDBSCAN's `-1` chunks are kept in the proportions so they
-//! sum to 1 over every chunk of the document (an all-outlier document is honest
+//! sum to 1 over every weighted segment of the document (an all-outlier document is honest
 //! about being unclusterable), but `dominant_topic` prefers a real topic and
 //! only falls back to `-1` when the document has no clustered chunk at all.
 //!
@@ -17,14 +18,16 @@
 //! always produces identical output. Fully unit-tested.
 //!
 //! Called by: `topic_modeling::run` after clustering, feeding the per-document
-//! payload and the per-corpus soft sizes used by the bubble chart.
+//! payload.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use crate::topic_modeling::cluster::OUTLIER_LABEL;
 
 /// One topic's share of a document, proportions summing to 1 across the
-/// document's chunks. `topic_id` may be `OUTLIER_LABEL` (`-1`).
+/// document's retained segment characters. `topic_id` may be `OUTLIER_LABEL`
+/// (`-1`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopicProportion {
     pub topic_id: i32,
@@ -43,31 +46,39 @@ pub struct DocumentTopics {
 ///
 /// `n_docs` is the document count (some documents may own zero chunks, e.g.
 /// empty/whitespace input — those get an empty distribution and `-1` dominant).
-/// `chunk_doc_index[i]` is the owning document of chunk `i`; `chunk_labels[i]`
-/// is its topic. The two chunk slices must be the same length.
+/// `segment_doc_index[i]` is the owning document of segment `i`;
+/// `segment_labels[i]` is its topic; and `segment_weights[i]` is the Unicode-
+/// character length of its retained text. The three segment slices must have
+/// the same length.
 ///
-/// Flow: tally each document's chunk labels, divide by the chunk count to get
-/// proportions, choose the highest-proportion non-outlier topic as dominant, and
-/// emit the distribution sorted by topic id.
+/// Flow: sum each document's segment weights by label, divide by the total
+/// retained-character weight to get proportions, choose the highest-weight
+/// non-outlier topic as dominant, and emit the distribution sorted by topic id.
 pub fn rollup(
     n_docs: usize,
-    chunk_doc_index: &[usize],
-    chunk_labels: &[i32],
+    segment_doc_index: &[usize],
+    segment_labels: &[i32],
+    segment_weights: &[usize],
 ) -> Vec<DocumentTopics> {
-    debug_assert_eq!(chunk_doc_index.len(), chunk_labels.len());
+    debug_assert_eq!(segment_doc_index.len(), segment_labels.len());
+    debug_assert_eq!(segment_doc_index.len(), segment_weights.len());
 
-    // Per-document topic counts in ascending-id order (BTreeMap = stable output).
+    // Per-document topic weights in ascending-id order (BTreeMap = stable output).
     let mut per_doc: Vec<BTreeMap<i32, usize>> = vec![BTreeMap::new(); n_docs];
-    for (&doc, &label) in chunk_doc_index.iter().zip(chunk_labels) {
+    for ((&doc, &label), &weight) in segment_doc_index
+        .iter()
+        .zip(segment_labels)
+        .zip(segment_weights)
+    {
         if doc < n_docs {
-            *per_doc[doc].entry(label).or_insert(0) += 1;
+            *per_doc[doc].entry(label).or_insert(0) += weight;
         }
     }
 
     per_doc
         .into_iter()
-        .map(|counts| {
-            let total: usize = counts.values().sum();
+        .map(|weights| {
+            let total: usize = weights.values().sum();
             if total == 0 {
                 return DocumentTopics {
                     topic_distribution: Vec::new(),
@@ -75,21 +86,21 @@ pub fn rollup(
                 };
             }
 
-            let distribution: Vec<TopicProportion> = counts
+            let distribution: Vec<TopicProportion> = weights
                 .iter()
-                .map(|(&topic_id, &count)| TopicProportion {
+                .map(|(&topic_id, &weight)| TopicProportion {
                     topic_id,
-                    proportion: count as f32 / total as f32,
+                    proportion: weight as f32 / total as f32,
                 })
                 .collect();
 
             // Dominant = most-represented real topic; outliers only win if the
             // document has no clustered chunk at all. BTreeMap iteration is
             // ascending, so the first max found is the smallest-id winner.
-            let dominant_topic = counts
+            let dominant_topic = weights
                 .iter()
                 .filter(|(&id, _)| id != OUTLIER_LABEL)
-                .max_by_key(|(_, &c)| c)
+                .min_by_key(|(&id, &weight)| (Reverse(weight), id))
                 .map(|(&id, _)| id)
                 .unwrap_or(OUTLIER_LABEL);
 
@@ -101,36 +112,6 @@ pub fn rollup(
         .collect()
 }
 
-/// Sum document proportions into per-corpus, per-topic "soft sizes" — the bubble
-/// chart's redefined `size[]`. Outlier mass is dropped (the bubble chart shows
-/// real topics only); chunk counts live elsewhere in `meta`.
-///
-/// `doc_corpus[d]` is document `d`'s corpus index; `n_corpora`/`n_topics` bound
-/// the output. Returns `sizes[corpus][topic_id]`.
-pub fn corpus_topic_sizes(
-    docs: &[DocumentTopics],
-    doc_corpus: &[usize],
-    n_corpora: usize,
-    n_topics: usize,
-) -> Vec<Vec<f32>> {
-    let mut sizes = vec![vec![0.0f32; n_topics]; n_corpora];
-    for (doc, &corpus) in docs.iter().zip(doc_corpus) {
-        if corpus >= n_corpora {
-            continue;
-        }
-        for tp in &doc.topic_distribution {
-            if tp.topic_id == OUTLIER_LABEL {
-                continue;
-            }
-            let t = tp.topic_id as usize;
-            if t < n_topics {
-                sizes[corpus][t] += tp.proportion;
-            }
-        }
-    }
-    sizes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,7 +119,7 @@ mod tests {
     #[test]
     fn long_doc_gets_multi_topic_distribution() {
         // Document 0 has 4 chunks: topics 0,0,1,-1.
-        let docs = rollup(1, &[0, 0, 0, 0], &[0, 0, 1, OUTLIER_LABEL]);
+        let docs = rollup(1, &[0, 0, 0, 0], &[0, 0, 1, OUTLIER_LABEL], &[1, 1, 1, 1]);
         assert_eq!(docs.len(), 1);
         let d = &docs[0];
         assert_eq!(d.dominant_topic, 0); // topic 0 has the most chunks
@@ -151,7 +132,7 @@ mod tests {
 
     #[test]
     fn short_doc_is_near_one_hot() {
-        let docs = rollup(1, &[0], &[2]);
+        let docs = rollup(1, &[0], &[2], &[5]);
         assert_eq!(docs[0].dominant_topic, 2);
         assert_eq!(
             docs[0].topic_distribution,
@@ -165,7 +146,7 @@ mod tests {
     #[test]
     fn document_with_no_chunks_is_outlier() {
         // Two docs, only doc 1 has a chunk; doc 0 is empty.
-        let docs = rollup(2, &[1], &[0]);
+        let docs = rollup(2, &[1], &[0], &[3]);
         assert_eq!(docs[0].dominant_topic, OUTLIER_LABEL);
         assert!(docs[0].topic_distribution.is_empty());
         assert_eq!(docs[1].dominant_topic, 0);
@@ -173,46 +154,47 @@ mod tests {
 
     #[test]
     fn all_outlier_document_falls_back_to_outlier_dominant() {
-        let docs = rollup(1, &[0, 0], &[OUTLIER_LABEL, OUTLIER_LABEL]);
+        let docs = rollup(1, &[0, 0], &[OUTLIER_LABEL, OUTLIER_LABEL], &[2, 3]);
         assert_eq!(docs[0].dominant_topic, OUTLIER_LABEL);
         assert_eq!(docs[0].topic_distribution[0].topic_id, OUTLIER_LABEL);
         assert!((docs[0].topic_distribution[0].proportion - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn soft_sizes_sum_proportions_per_corpus_excluding_outliers() {
-        // Corpus 0: doc with 0.5/0.5 across topics 0 and 1.
-        // Corpus 1: doc fully on topic 0, plus outlier mass that must be ignored.
-        let docs = vec![
-            DocumentTopics {
-                topic_distribution: vec![
-                    TopicProportion {
-                        topic_id: 0,
-                        proportion: 0.5,
-                    },
-                    TopicProportion {
-                        topic_id: 1,
-                        proportion: 0.5,
-                    },
-                ],
-                dominant_topic: 0,
-            },
-            DocumentTopics {
-                topic_distribution: vec![
-                    TopicProportion {
-                        topic_id: OUTLIER_LABEL,
-                        proportion: 0.25,
-                    },
-                    TopicProportion {
-                        topic_id: 0,
-                        proportion: 0.75,
-                    },
-                ],
-                dominant_topic: 0,
-            },
-        ];
-        let sizes = corpus_topic_sizes(&docs, &[0, 1], 2, 2);
-        assert_eq!(sizes[0], vec![0.5, 0.5]);
-        assert_eq!(sizes[1], vec![0.75, 0.0]); // outlier 0.25 dropped
+    fn unequal_segment_lengths_control_distribution_and_dominance() {
+        let docs = rollup(1, &[0, 0], &[0, 1], &[2, 8]);
+        assert_eq!(docs[0].dominant_topic, 1);
+        assert_eq!(docs[0].topic_distribution[0].proportion, 0.2);
+        assert_eq!(docs[0].topic_distribution[1].proportion, 0.8);
+    }
+
+    #[test]
+    fn outlier_weight_is_included_in_normalization_but_not_dominance() {
+        let docs = rollup(1, &[0, 0, 0], &[OUTLIER_LABEL, 0, 1], &[8, 1, 1]);
+        assert_eq!(docs[0].dominant_topic, 0);
+        let sum: f32 = docs[0]
+            .topic_distribution
+            .iter()
+            .map(|entry| entry.proportion)
+            .sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weighted_dominance_ties_choose_smaller_topic_id() {
+        let docs = rollup(1, &[0, 0], &[4, 2], &[3, 3]);
+        assert_eq!(docs[0].dominant_topic, 2);
+    }
+
+    #[test]
+    fn repeated_overlap_text_contributes_weight_for_each_segment() {
+        let segment_texts = ["alpha overlap", "overlap beta"];
+        let weights = segment_texts
+            .iter()
+            .map(|text| text.chars().count())
+            .collect::<Vec<_>>();
+        let docs = rollup(1, &[0, 0], &[0, 1], &weights);
+        let expected = weights[0] as f32 / weights.iter().sum::<usize>() as f32;
+        assert_eq!(docs[0].topic_distribution[0].proportion, expected);
     }
 }

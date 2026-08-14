@@ -108,6 +108,8 @@ def test_topic_modeling_registers_pipeline_kwargs(
     assert call["kwargs"]["segmentation_method"] == "paragraph"
     assert call["kwargs"]["max_tokens"] == 64
     assert call["kwargs"]["overlap"] == 8
+    assert call["is_elementwise"] is False
+    assert call["returns_scalar"] is True
 
 
 def test_topic_modeling_namespace_delegates_pipeline_kwargs(

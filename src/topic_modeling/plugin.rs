@@ -1,44 +1,17 @@
-//! Polars plugin expression wrapping the topic-modeling pipeline so it can be
-//! used like every other `.text` function, e.g.
+//! Scalar Polars expression wrapping the whole topic-modeling pipeline.
 //!
-//! ```python
-//! lf.with_columns(
-//!     pl.col("document").text.topic_modeling(seed=42).alias("topic")
-//! )
-//! ```
-//!
-//! Design (keeps the backend thin):
-//! - The expression runs on the **whole** document column (it is *not*
-//!   elementwise — clustering needs every document at once) and returns a
-//!   **per-row struct** so the result lines up 1:1 with the input rows and can
-//!   be appended with `with_columns`.
-//! - Topic-level metadata that cannot be recovered by a `group_by`
-//!   (`representative_words`, the bubble-chart `x`/`y` centroid, and the global
-//!   `raw_n_topics`/`n_topics` counts) is **replicated onto each row** under its
-//!   dominant topic. The backend then derives the bubble chart and per-corpus
-//!   sizes with plain Polars `group_by` over `dominant_topic` (+ its own
-//!   `corpus_index` column), so no orchestration logic leaks into Python.
-//! - Corpus pooling is a backend concern: concatenate the 1-2 node columns into
-//!   one column, run this expression once, then split the per-row output by a
-//!   backend-side `corpus_index` column. The pipeline itself always clusters the
-//!   pooled column as a single corpus.
-//!
-//! Used by: `polars_text.functions.topic_modeling` /
-//! `polars_text.namespace.TextNamespace.topic_modeling`, which the backend
-//! topic-modeling worker calls.
-
-use std::collections::HashMap;
+//! Clustering needs the complete document column, so one invocation returns one
+//! run-level struct. Document outcomes and complete topic metadata live in
+//! separate nested lists; topic metadata is never inferred from dominant-topic
+//! rows.
 
 use polars::chunked_array::builder::{AnonymousOwnedListBuilder, ListBuilderTrait};
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
 use serde::Deserialize;
 
-use super::{ctfidf::RepresentativeWord, run, RunConfig};
+use super::{run, RunConfig, TopicModelingResult};
 
-/// Keyword arguments mirroring the pipeline knobs. Defaults match
-/// `RunConfig::default` where applicable; the Python wrapper always sends every
-/// field.
 #[derive(Deserialize)]
 struct TopicModelingKwargs {
     embedder_model: Option<String>,
@@ -54,11 +27,21 @@ struct TopicModelingKwargs {
     lowercase: bool,
 }
 
-/// Inner dtype of the per-document `topic_distribution` list elements.
 fn distribution_struct_type() -> DataType {
     DataType::Struct(vec![
         Field::new("topic_id".into(), DataType::Int32),
         Field::new("proportion".into(), DataType::Float32),
+    ])
+}
+
+fn document_struct_type() -> DataType {
+    DataType::Struct(vec![
+        Field::new("doc_index".into(), DataType::UInt32),
+        Field::new("dominant_topic".into(), DataType::Int32),
+        Field::new(
+            "topic_distribution".into(),
+            DataType::List(Box::new(distribution_struct_type())),
+        ),
     ])
 }
 
@@ -69,7 +52,18 @@ fn representative_word_struct_type() -> DataType {
     ])
 }
 
-/// Inner dtype of the run-level native stage timing list.
+fn topic_struct_type() -> DataType {
+    DataType::Struct(vec![
+        Field::new("id".into(), DataType::Int32),
+        Field::new(
+            "representative_words".into(),
+            DataType::List(Box::new(representative_word_struct_type())),
+        ),
+        Field::new("x".into(), DataType::Float32),
+        Field::new("y".into(), DataType::Float32),
+    ])
+}
+
 fn stage_timing_struct_type() -> DataType {
     DataType::Struct(vec![
         Field::new("stage".into(), DataType::String),
@@ -77,21 +71,16 @@ fn stage_timing_struct_type() -> DataType {
     ])
 }
 
-/// Output dtype of the expression: one struct per input row.
 fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
     let dtype = DataType::Struct(vec![
-        Field::new("dominant_topic".into(), DataType::Int32),
         Field::new(
-            "topic_distribution".into(),
-            DataType::List(Box::new(distribution_struct_type())),
+            "documents".into(),
+            DataType::List(Box::new(document_struct_type())),
         ),
         Field::new(
-            "representative_words".into(),
-            DataType::List(Box::new(representative_word_struct_type())),
+            "topics".into(),
+            DataType::List(Box::new(topic_struct_type())),
         ),
-        Field::new("x".into(), DataType::Float32),
-        Field::new("y".into(), DataType::Float32),
-        Field::new("n_topics".into(), DataType::UInt32),
         Field::new("n_chunks".into(), DataType::UInt32),
         Field::new("truncated_segment_count".into(), DataType::UInt32),
         Field::new(
@@ -102,6 +91,33 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), dtype))
 }
 
+fn build_list_from_spans(
+    name: &str,
+    inner: &Series,
+    spans: &[(usize, usize)],
+    inner_type: DataType,
+) -> PolarsResult<Series> {
+    let mut builder = AnonymousOwnedListBuilder::new(name.into(), spans.len(), Some(inner_type));
+    for &(start, end) in spans {
+        if start == end {
+            builder.append_empty();
+        } else {
+            builder.append_series(&inner.slice(start as i64, end - start))?;
+        }
+    }
+    Ok(builder.finish().into_series())
+}
+
+fn build_single_list(name: &str, inner: &Series, inner_type: DataType) -> PolarsResult<Series> {
+    let mut builder = AnonymousOwnedListBuilder::new(name.into(), 1, Some(inner_type));
+    if inner.is_empty() {
+        builder.append_empty();
+    } else {
+        builder.append_series(inner)?;
+    }
+    Ok(builder.finish().into_series())
+}
+
 #[polars_expr(output_type_func=topic_modeling_output)]
 pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
@@ -109,11 +125,6 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         .into_iter()
         .map(|opt| opt.unwrap_or("").to_string())
         .collect();
-    let n_rows = documents.len();
-
-    // The expression always clusters the column it receives as one corpus; the
-    // backend handles multi-corpus pooling/splitting via a separate column.
-    let corpus_indices = vec![0usize; n_rows];
 
     let cfg = RunConfig {
         embedder_repo_id: kwargs.embedder_model,
@@ -133,128 +144,133 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         lowercase: kwargs.lowercase,
     };
 
-    let result = run(&documents, &corpus_indices, &cfg)
-        .map_err(|e| PolarsError::ComputeError(format!("topic_modeling failed: {e:#}").into()))?;
+    let result = run(&documents, &cfg).map_err(|error| {
+        PolarsError::ComputeError(format!("topic_modeling failed: {error:#}").into())
+    })?;
 
-    // Topic id -> (representative_words, x, y) so each row can carry its
-    // dominant topic's bubble-chart metadata.
-    let topic_meta: HashMap<i32, (&Vec<RepresentativeWord>, f32, f32)> = result
-        .topics
-        .iter()
-        .map(|t| (t.id, (&t.representative_words, t.x, t.y)))
-        .collect();
+    topic_modeling_result_to_series(ca.name().clone(), &result)
+}
 
-    let mut dominant: Vec<i32> = Vec::with_capacity(n_rows);
-    let mut xs: Vec<f32> = Vec::with_capacity(n_rows);
-    let mut ys: Vec<f32> = Vec::with_capacity(n_rows);
-
-    // Flat columns for the per-row `topic_distribution` list-of-struct, built
-    // once then sliced per row (the tokenize/concordance pattern — O(1) slices
-    // instead of a fresh StructChunked per row).
-    let mut dist_topic_ids: Vec<i32> = Vec::new();
-    let mut dist_props: Vec<f32> = Vec::new();
-    let mut dist_spans: Vec<(usize, usize)> = Vec::with_capacity(n_rows);
-
-    // Flat columns for the per-row `representative_words` list-of-struct.
-    let mut word_flat: Vec<String> = Vec::new();
-    let mut occurrence_count_flat: Vec<u64> = Vec::new();
-    let mut word_spans: Vec<(usize, usize)> = Vec::with_capacity(n_rows);
-
-    // `result.documents` is in input order (doc_index 0..n_rows); iterate in
-    // lock-step with the input rows.
-    for doc in &result.documents {
-        let topic = doc.dominant_topic;
-        dominant.push(topic);
-
-        let (words, x, y) = match topic_meta.get(&topic) {
-            Some((words, x, y)) => (Some(*words), *x, *y),
-            // Outliers (topic == -1) and any unmapped id get empty metadata and
-            // origin coords (the backend's existing default for missing coords).
-            None => (None, 0.0_f32, 0.0_f32),
-        };
-        xs.push(x);
-        ys.push(y);
-
-        let dist_start = dist_topic_ids.len();
-        for (tid, prop) in &doc.topic_distribution {
-            dist_topic_ids.push(*tid);
-            dist_props.push(*prop);
+fn topic_modeling_result_to_series(
+    name: PlSmallStr,
+    result: &TopicModelingResult,
+) -> PolarsResult<Series> {
+    let mut distribution_topic_ids = Vec::new();
+    let mut distribution_proportions = Vec::new();
+    let mut distribution_spans = Vec::with_capacity(result.documents.len());
+    for document in &result.documents {
+        let start = distribution_topic_ids.len();
+        for &(topic_id, proportion) in &document.topic_distribution {
+            distribution_topic_ids.push(topic_id);
+            distribution_proportions.push(proportion);
         }
-        dist_spans.push((dist_start, dist_topic_ids.len()));
-
-        let word_start = word_flat.len();
-        if let Some(words) = words {
-            for term in words.iter() {
-                word_flat.push(term.word.clone());
-                occurrence_count_flat.push(term.occurrence_count as u64);
-            }
-        }
-        word_spans.push((word_start, word_flat.len()));
+        distribution_spans.push((start, distribution_topic_ids.len()));
     }
-
-    // Build the shared inner struct for `topic_distribution` once.
-    let dist_inner = StructChunked::from_series(
+    let distribution_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
-        dist_topic_ids.len(),
+        distribution_topic_ids.len(),
         [
-            Series::new("topic_id".into(), dist_topic_ids),
-            Series::new("proportion".into(), dist_props),
+            Series::new("topic_id".into(), distribution_topic_ids),
+            Series::new("proportion".into(), distribution_proportions),
         ]
         .iter(),
     )?
     .into_series();
+    let distributions = build_list_from_spans(
+        "topic_distribution",
+        &distribution_inner,
+        &distribution_spans,
+        distribution_struct_type(),
+    )?;
+    let document_inner = StructChunked::from_series(
+        PlSmallStr::EMPTY,
+        result.documents.len(),
+        [
+            Series::new(
+                "doc_index".into(),
+                result
+                    .documents
+                    .iter()
+                    .map(|document| document.doc_index as u32)
+                    .collect::<Vec<_>>(),
+            ),
+            Series::new(
+                "dominant_topic".into(),
+                result
+                    .documents
+                    .iter()
+                    .map(|document| document.dominant_topic)
+                    .collect::<Vec<_>>(),
+            ),
+            distributions,
+        ]
+        .iter(),
+    )?
+    .into_series();
+    let document_list = build_single_list("documents", &document_inner, document_struct_type())?;
 
-    let mut dist_builder = AnonymousOwnedListBuilder::new(
-        "topic_distribution".into(),
-        n_rows,
-        Some(distribution_struct_type()),
-    );
-    for (start, end) in dist_spans {
-        if end == start {
-            dist_builder.append_empty();
-        } else {
-            let slice = dist_inner.slice(start as i64, end - start);
-            dist_builder.append_series(&slice).map_err(|e| {
-                PolarsError::ComputeError(format!("topic_distribution list build: {e}").into())
-            })?;
+    let mut words = Vec::new();
+    let mut occurrence_counts = Vec::new();
+    let mut word_spans = Vec::with_capacity(result.topics.len());
+    for topic in &result.topics {
+        let start = words.len();
+        for representative_word in &topic.representative_words {
+            words.push(representative_word.word.as_str());
+            occurrence_counts.push(representative_word.occurrence_count as u64);
         }
+        word_spans.push((start, words.len()));
     }
-    let dist_list = dist_builder.finish().into_series();
-
-    // Build the shared inner struct for `representative_words` once.
     let word_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
-        word_flat.len(),
+        words.len(),
         [
-            Series::new("word".into(), word_flat),
-            Series::new("occurrence_count".into(), occurrence_count_flat),
+            Series::new("word".into(), words),
+            Series::new("occurrence_count".into(), occurrence_counts),
         ]
         .iter(),
     )?
     .into_series();
-    let mut word_builder = AnonymousOwnedListBuilder::new(
-        "representative_words".into(),
-        n_rows,
-        Some(representative_word_struct_type()),
-    );
-    for (start, end) in word_spans {
-        if end == start {
-            word_builder.append_empty();
-        } else {
-            let slice = word_inner.slice(start as i64, end - start);
-            word_builder.append_series(&slice).map_err(|e| {
-                PolarsError::ComputeError(format!("representative_words list build: {e}").into())
-            })?;
-        }
-    }
-    let word_list = word_builder.finish().into_series();
+    let representative_words = build_list_from_spans(
+        "representative_words",
+        &word_inner,
+        &word_spans,
+        representative_word_struct_type(),
+    )?;
+    let topic_inner = StructChunked::from_series(
+        PlSmallStr::EMPTY,
+        result.topics.len(),
+        [
+            Series::new(
+                "id".into(),
+                result
+                    .topics
+                    .iter()
+                    .map(|topic| topic.id)
+                    .collect::<Vec<_>>(),
+            ),
+            representative_words,
+            Series::new(
+                "x".into(),
+                result
+                    .topics
+                    .iter()
+                    .map(|topic| topic.x)
+                    .collect::<Vec<_>>(),
+            ),
+            Series::new(
+                "y".into(),
+                result
+                    .topics
+                    .iter()
+                    .map(|topic| topic.y)
+                    .collect::<Vec<_>>(),
+            ),
+        ]
+        .iter(),
+    )?
+    .into_series();
+    let topic_list = build_single_list("topics", &topic_inner, topic_struct_type())?;
 
-    let n_topics = vec![result.n_topics as u32; n_rows];
-    let n_chunks = vec![result.n_chunks as u32; n_rows];
-    let truncated_segment_count = vec![result.truncated_segment_count as u32; n_rows];
-
-    // Build the shared run-level timing list once and replicate it onto every
-    // row, matching how `n_topics` / `n_chunks` expose run-level metadata.
     let timing_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
         result.stage_timings_ms.len(),
@@ -279,55 +295,103 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         .iter(),
     )?
     .into_series();
-    let mut timing_builder = AnonymousOwnedListBuilder::new(
-        "stage_timings_ms".into(),
-        n_rows,
-        Some(stage_timing_struct_type()),
-    );
-    for _ in 0..n_rows {
-        if result.stage_timings_ms.is_empty() {
-            timing_builder.append_empty();
-        } else {
-            timing_builder.append_series(&timing_inner).map_err(|e| {
-                PolarsError::ComputeError(format!("stage_timings_ms list build: {e}").into())
-            })?;
-        }
-    }
-    let timing_list = timing_builder.finish().into_series();
+    let timing_list = build_single_list(
+        "stage_timings_ms",
+        &timing_inner,
+        stage_timing_struct_type(),
+    )?;
 
     let fields = [
-        Series::new("dominant_topic".into(), dominant),
-        dist_list,
-        word_list,
-        Series::new("x".into(), xs),
-        Series::new("y".into(), ys),
-        Series::new("n_topics".into(), n_topics),
-        Series::new("n_chunks".into(), n_chunks),
-        Series::new("truncated_segment_count".into(), truncated_segment_count),
+        document_list,
+        topic_list,
+        Series::new("n_chunks".into(), [result.n_chunks as u32]),
+        Series::new(
+            "truncated_segment_count".into(),
+            [result.truncated_segment_count as u32],
+        ),
         timing_list,
     ];
-    let out = StructChunked::from_series(ca.name().clone(), n_rows, fields.iter())?.into_series();
-    Ok(out)
+    Ok(StructChunked::from_series(name, 1, fields.iter())?.into_series())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topic_modeling::ctfidf::RepresentativeWord;
+    use crate::topic_modeling::{DocumentResult, TopicInfo};
 
     #[test]
-    fn output_uses_counted_representative_word_structs() {
+    fn output_contains_separate_run_level_document_and_topic_lists() {
         let output = topic_modeling_output(&[Field::new("text".into(), DataType::String)])
             .expect("topic output dtype");
         let DataType::Struct(fields) = output.dtype() else {
             panic!("topic output must be a struct")
         };
-        let representative_words = fields
-            .iter()
-            .find(|field| field.name() == "representative_words")
-            .expect("representative_words field");
         assert_eq!(
-            representative_words.dtype(),
-            &DataType::List(Box::new(representative_word_struct_type()))
+            fields,
+            &vec![
+                Field::new(
+                    "documents".into(),
+                    DataType::List(Box::new(document_struct_type())),
+                ),
+                Field::new(
+                    "topics".into(),
+                    DataType::List(Box::new(topic_struct_type())),
+                ),
+                Field::new("n_chunks".into(), DataType::UInt32),
+                Field::new("truncated_segment_count".into(), DataType::UInt32),
+                Field::new(
+                    "stage_timings_ms".into(),
+                    DataType::List(Box::new(stage_timing_struct_type())),
+                ),
+            ]
         );
+    }
+
+    #[test]
+    fn scalar_result_preserves_topic_metadata_when_topic_never_dominates() {
+        let result = TopicModelingResult {
+            documents: vec![DocumentResult {
+                doc_index: 0,
+                dominant_topic: 0,
+                topic_distribution: vec![(0, 0.6), (1, 0.4)],
+            }],
+            topics: vec![
+                TopicInfo {
+                    id: 0,
+                    representative_words: Vec::new(),
+                    x: 0.0,
+                    y: 0.0,
+                },
+                TopicInfo {
+                    id: 1,
+                    representative_words: vec![RepresentativeWord {
+                        word: "hidden".to_string(),
+                        occurrence_count: 2,
+                        score: 1.0,
+                    }],
+                    x: 1.0,
+                    y: 1.0,
+                },
+            ],
+            n_chunks: 2,
+            truncated_segment_count: 0,
+            stage_timings_ms: Vec::new(),
+        };
+
+        let series = topic_modeling_result_to_series("topic".into(), &result)
+            .expect("serialize topic result");
+        let topics = series
+            .struct_()
+            .expect("outer struct")
+            .field_by_name("topics")
+            .expect("topics field");
+        let topic_rows = topics
+            .list()
+            .expect("topic list")
+            .get_as_series(0)
+            .expect("scalar topic rows");
+
+        assert_eq!((series.len(), topic_rows.len()), (1, 2));
     }
 }

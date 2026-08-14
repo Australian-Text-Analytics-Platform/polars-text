@@ -624,6 +624,7 @@ mod tests {
         let result = chunk_documents(&[String::from("猫 狗 鳥")], tokenizer, &cfg).unwrap();
 
         assert_eq!(result.chunks[0].text, "猫 狗");
+        assert_eq!(result.chunks[0].text.chars().count(), 3);
         assert_eq!(result.truncated_count, 1);
     }
 }

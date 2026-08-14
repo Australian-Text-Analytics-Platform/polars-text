@@ -106,6 +106,28 @@ concordance = (
 out = df.select(concordance)
 ```
 
+## Topic modelling
+
+`topic_modeling` consumes a complete document column and returns one scalar run
+result. The result keeps document outcomes separate from complete topic
+metadata:
+
+```text
+{
+  documents: [{doc_index, dominant_topic, topic_distribution}],
+  topics: [{id, representative_words, x, y}],
+  n_chunks,
+  truncated_segment_count,
+  stage_timings_ms
+}
+```
+
+Automatic, Paragraph, and Sentence modes differ only when constructing Topic
+Segments. All modes then share embedding, clustering, c-TF-IDF, and document
+rollup. Clustering treats every segment as one observation. Rollup weights each
+segment by the Unicode-character length of its retained text; Automatic overlap
+counts repeated text again.
+
 ## Token frequencies and stats
 
 Compute corpus token counts and compare corpora with standard statistics.

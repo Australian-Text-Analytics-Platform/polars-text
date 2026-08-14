@@ -178,31 +178,27 @@ def topic_modeling(
     vectorizer_model: str | None = None,
     lowercase: bool = True,
 ) -> pl.Expr:
-    """Cluster a whole document column into topics, one struct emitted per row.
+    """Cluster a whole document column and emit one run-level result struct.
 
     Unlike the other ``.text`` helpers this is **not** elementwise: clustering
     needs every document at once, so the expression consumes the entire column
-    and returns a per-row struct that lines up 1:1 with the input rows:
+    and returns exactly one struct:
 
-    ``{dominant_topic: i32, topic_distribution: list[{topic_id, proportion}],
-    representative_words: list[{word: str, occurrence_count: u64}], x: f32,
-    y: f32, n_topics: u32,
-    n_chunks: u32, truncated_segment_count: u32,
-    stage_timings_ms: list[{stage, elapsed_ms}]}``
+    ``{documents: list[{doc_index, dominant_topic, topic_distribution}],
+    topics: list[{id, representative_words, x, y}], n_chunks,
+    truncated_segment_count, stage_timings_ms}``
 
-    Topic-level fields (``representative_words``/``x``/``y``) are replicated onto
-    every row under its dominant topic, and ``n_topics``/``n_chunks`` plus
-    ``stage_timings_ms`` are global run metadata replicated per row, so callers
-    can recover the bubble chart and per-corpus sizes with a plain
-    ``group_by('dominant_topic')`` without any extra orchestration. Outlier rows
-    (``dominant_topic == -1``) get an empty ``representative_words`` list and
-    origin coords.
+    The complete topic list is independent of document dominance, so metadata
+    remains available for topics that occur in distributions but never dominate
+    a document. Document proportions are weighted by retained Topic Segment
+    Unicode-character length; clustering itself remains one observation per
+    segment.
 
     The topic count is whatever HDBSCAN yields for ``min_cluster_size`` (the only
     native topic-count control); there is no post-fit merge to a requested count.
 
     Pool multiple corpora by concatenating their columns into one before calling
-    this, then split the per-row output by your own corpus-index column.
+    this, then split ``documents`` by your own corpus-index mapping.
     """
     _require_feature("topic-modeling", "topic_modeling")
     return register_plugin_function(
@@ -223,6 +219,7 @@ def topic_modeling(
             "lowercase": lowercase,
         },
         is_elementwise=False,
+        returns_scalar=True,
     )
 
 
