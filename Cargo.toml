@@ -32,6 +32,8 @@ topic-modeling = [
     "dep:hdbscan",
     "dep:pacmap",
     "dep:unicode-segmentation",
+    "dep:rmp-serde",
+    "dep:zstd",
 ]
 
 [dependencies]
@@ -68,6 +70,8 @@ pyo3-polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0"
 ] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+rmp-serde = { version = "1.3", optional = true }
+zstd = { version = "0.13", optional = true }
 # Keep `onig` regex support, but avoid tokenizers' default `esaxx_fast` C++
 # path: esaxx-rs forces /MT on MSVC, conflicting with usearch/cxx's /MD.
 tokenizers = { version = "0.23", default-features = false, features = [

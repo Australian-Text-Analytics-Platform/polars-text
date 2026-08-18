@@ -83,6 +83,7 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
         ),
         Field::new("n_chunks".into(), DataType::UInt32),
         Field::new("truncated_segment_count".into(), DataType::UInt32),
+        Field::new("clustering_context".into(), DataType::Binary),
         Field::new(
             "stage_timings_ms".into(),
             DataType::List(Box::new(stage_timing_struct_type())),
@@ -309,6 +310,10 @@ fn topic_modeling_result_to_series(
             "truncated_segment_count".into(),
             [result.truncated_segment_count as u32],
         ),
+        Series::new(
+            "clustering_context".into(),
+            [result.clustering_context.as_slice()],
+        ),
         timing_list,
     ];
     Ok(StructChunked::from_series(name, 1, fields.iter())?.into_series())
@@ -340,6 +345,7 @@ mod tests {
                 ),
                 Field::new("n_chunks".into(), DataType::UInt32),
                 Field::new("truncated_segment_count".into(), DataType::UInt32),
+                Field::new("clustering_context".into(), DataType::Binary),
                 Field::new(
                     "stage_timings_ms".into(),
                     DataType::List(Box::new(stage_timing_struct_type())),
@@ -377,6 +383,7 @@ mod tests {
             n_chunks: 2,
             truncated_segment_count: 0,
             stage_timings_ms: Vec::new(),
+            clustering_context: vec![1, 2, 3],
         };
 
         let series = topic_modeling_result_to_series("topic".into(), &result)

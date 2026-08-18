@@ -38,6 +38,8 @@ pub mod embedding_cache;
 #[cfg(feature = "topic-modeling")]
 pub mod plugin;
 #[cfg(feature = "topic-modeling")]
+pub mod projection;
+#[cfg(feature = "topic-modeling")]
 pub mod reduce;
 #[cfg(feature = "topic-modeling")]
 pub mod rollup;
@@ -75,8 +77,8 @@ const COORD_DIMS: usize = 2;
 const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// All knobs for one topic-modeling run. The backend maps its public options
-/// (`min_topic_size`, `random_seed`, sampling, CJK vectorizer choice) onto these
-/// fields.
+/// (`random_seed`, sampling, CJK vectorizer choice) onto these fields and fixes
+/// the natural HDBSCAN leaf size internally.
 #[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -150,6 +152,8 @@ pub struct TopicModelingResult {
     pub n_chunks: usize,
     pub truncated_segment_count: usize,
     pub stage_timings_ms: Vec<StageTiming>,
+    #[serde(skip)]
+    pub clustering_context: Vec<u8>,
 }
 
 #[cfg(feature = "topic-modeling")]
@@ -240,11 +244,21 @@ pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult>
     // Stages 3-4 produce: a topic label per chunk, the topic count, and a 2D
     // coordinate per topic. The guard branches differ only in how labels/coords
     // are obtained — everything downstream is identical (no length branching).
-    let (labels, n_topics, coords): (Vec<i32>, usize, Vec<(f32, f32)>) = if n_chunks == 0 {
-        (Vec::new(), 0, Vec::new())
+    let (labels, n_topics, reduced_5d, reduced_2d): (
+        Vec<i32>,
+        usize,
+        Vec<Vec<f32>>,
+        Vec<Vec<f32>>,
+    ) = if n_chunks == 0 {
+        (Vec::new(), 0, Vec::new(), Vec::new())
     } else if n_chunks < MIN_POINTS_FOR_REDUCTION {
         // Too few chunks for PaCMAP to fit a neighbor graph: one topic.
-        (vec![0; n_chunks], 1, vec![(0.0, 0.0)])
+        (
+            vec![0; n_chunks],
+            1,
+            vec![vec![0.0; cfg.reduce_dims]; n_chunks],
+            vec![vec![0.0; COORD_DIMS]; n_chunks],
+        )
     } else {
         let stage_started_at = Instant::now();
         let reduced = reduce::reduce(
@@ -256,9 +270,8 @@ pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult>
         )?;
         record_stage_timing(&mut stage_timings_ms, "reduce_clustering", stage_started_at);
 
-        // The topic count is whatever HDBSCAN yields for the configured
-        // `min_cluster_size` (the only native topic-count control); there is no
-        // post-fit merge step.
+        // HDBSCAN establishes the natural maximum-resolution leaves. The
+        // projection context built below can merge those real topics later.
         let stage_started_at = Instant::now();
         let clustered = cluster::cluster(&reduced, &cfg.cluster)?;
         let labels = clustered.labels;
@@ -280,9 +293,9 @@ pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult>
         );
 
         let stage_started_at = Instant::now();
-        let coords = coords::topic_coords_2d(&two_d, &labels, n_topics);
+        let _coords = coords::topic_coords_2d(&two_d, &labels, n_topics);
         record_stage_timing(&mut stage_timings_ms, "topic_coordinates", stage_started_at);
-        (labels, n_topics, coords)
+        (labels, n_topics, reduced, two_d)
     };
 
     // c-TF-IDF: one "document" per topic = its chunks concatenated.
@@ -306,55 +319,26 @@ pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult>
         stage_started_at,
     );
 
-    let stage_started_at = Instant::now();
-    let keywords = ctfidf::representative_words(&term_counts);
-    record_stage_timing(&mut stage_timings_ms, "ctfidf_scores", stage_started_at);
-
-    // Roll Topic Segments up to documents by retained Unicode-character length.
-    // Automatic overlap deliberately repeats source text as another observation.
-    let stage_started_at = Instant::now();
     let chunk_doc_index: Vec<usize> = chunks.iter().map(|c| c.doc_index).collect();
     let chunk_weights: Vec<usize> = chunks.iter().map(|c| c.text.chars().count()).collect();
-    let doc_topics = rollup::rollup(documents.len(), &chunk_doc_index, &labels, &chunk_weights);
-    record_stage_timing(&mut stage_timings_ms, "rollup", stage_started_at);
-
     let stage_started_at = Instant::now();
-    let topics = (0..n_topics)
-        .map(|t| {
-            let representative_words = keywords.get(t).cloned().unwrap_or_default();
-            let (x, y) = coords.get(t).copied().unwrap_or((0.0, 0.0));
-            TopicInfo {
-                id: t as i32,
-                representative_words,
-                x,
-                y,
-            }
-        })
-        .collect();
-
-    let document_results = doc_topics
-        .into_iter()
-        .enumerate()
-        .map(|(i, dt)| DocumentResult {
-            doc_index: i,
-            dominant_topic: dt.dominant_topic,
-            topic_distribution: dt
-                .topic_distribution
-                .into_iter()
-                .map(|p| (p.topic_id, p.proportion))
-                .collect(),
-        })
-        .collect();
-    record_stage_timing(&mut stage_timings_ms, "assemble_topics", stage_started_at);
-    record_stage_timing(&mut stage_timings_ms, "total", total_started_at);
-
-    Ok(TopicModelingResult {
-        topics,
-        documents: document_results,
+    let context = projection::prepare_context(
+        documents.len(),
+        &labels,
+        &reduced_5d,
+        &reduced_2d,
+        &chunk_doc_index,
+        &chunk_weights,
+        &term_counts,
         n_chunks,
         truncated_segment_count,
-        stage_timings_ms,
-    })
+    )?;
+    let mut result = projection::project(&context, n_topics)?;
+    record_stage_timing(&mut stage_timings_ms, "ctfidf_scores", stage_started_at);
+    record_stage_timing(&mut stage_timings_ms, "total", total_started_at);
+    result.stage_timings_ms = stage_timings_ms;
+    result.clustering_context = projection::serialize_context(&context)?;
+    Ok(result)
 }
 
 #[cfg(all(test, feature = "topic-modeling"))]

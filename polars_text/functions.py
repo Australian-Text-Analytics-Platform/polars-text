@@ -186,7 +186,7 @@ def topic_modeling(
 
     ``{documents: list[{doc_index, dominant_topic, topic_distribution}],
     topics: list[{id, representative_words, x, y}], n_chunks,
-    truncated_segment_count, stage_timings_ms}``
+    truncated_segment_count, stage_timings_ms, clustering_context}``
 
     The complete topic list is independent of document dominance, so metadata
     remains available for topics that occur in distributions but never dominate
@@ -194,8 +194,10 @@ def topic_modeling(
     Unicode-character length; clustering itself remains one observation per
     segment.
 
-    The topic count is whatever HDBSCAN yields for ``min_cluster_size`` (the only
-    native topic-count control); there is no post-fit merge to a requested count.
+    ``min_cluster_size`` controls the natural HDBSCAN leaves in this low-level
+    API. The opaque clustering context can project those real Topics downward
+    without rerunning model stages; Wordflow deliberately fixes this argument
+    internally and exposes only the Result-time cluster count.
 
     Pool multiple corpora by concatenating their columns into one before calling
     this, then split ``documents`` by your own corpus-index mapping.

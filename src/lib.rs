@@ -32,6 +32,7 @@ fn _internal(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
     _m.add_function(wrap_pyfunction!(debug_token_cache_snapshot_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(prefetch_embedder_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(loaded_embedders_py, _m)?)?;
+    _m.add_function(wrap_pyfunction!(project_topic_modeling_context_py, _m)?)?;
     Ok(())
 }
 
@@ -180,6 +181,34 @@ fn loaded_embedders_py() -> Vec<String> {
 #[cfg(feature = "embedding")]
 fn loaded_embedders_py_impl() -> Vec<String> {
     topic_modeling::embedding::loaded_embedder_ids()
+}
+
+#[pyfunction(name = "project_topic_modeling_context")]
+#[pyo3(signature = (context, cluster_count))]
+fn project_topic_modeling_context_py(context: Vec<u8>, cluster_count: usize) -> PyResult<String> {
+    project_topic_modeling_context_py_impl(&context, cluster_count)
+}
+
+#[cfg(feature = "topic-modeling")]
+fn project_topic_modeling_context_py_impl(
+    context: &[u8],
+    cluster_count: usize,
+) -> PyResult<String> {
+    let result = topic_modeling::projection::project_serialized_context(context, cluster_count)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
+    serde_json::to_string(&result)
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
+}
+
+#[cfg(not(feature = "topic-modeling"))]
+fn project_topic_modeling_context_py_impl(
+    _context: &[u8],
+    _cluster_count: usize,
+) -> PyResult<String> {
+    Err(feature_disabled(
+        "project_topic_modeling_context",
+        "topic-modeling",
+    ))
 }
 
 #[cfg(not(feature = "embedding"))]

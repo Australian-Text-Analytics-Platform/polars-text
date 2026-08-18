@@ -25,8 +25,8 @@ use hdbscan::{DistanceMetric, Hdbscan, HdbscanHyperParams};
 pub const OUTLIER_LABEL: i32 = -1;
 
 /// Clustering knobs. `min_cluster_size` is the smallest group of chunks that
-/// counts as a topic — the backend maps its public `min_topic_size` option onto
-/// this, and the topic count is whatever HDBSCAN yields for it. `min_samples`
+/// counts as a natural topic. Wordflow fixes this private fit setting at 10 and
+/// exposes merge-only Result projection separately. `min_samples`
 /// controls how conservative the noise classification is; `None` lets HDBSCAN
 /// default it to `min_cluster_size`.
 #[derive(Debug, Clone)]

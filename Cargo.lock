@@ -3417,6 +3417,7 @@ dependencies = [
  "pyo3",
  "pyo3-polars",
  "regex",
+ "rmp-serde",
  "serde",
  "serde_json",
  "sha2",
@@ -3424,6 +3425,7 @@ dependencies = [
  "unicode-segmentation",
  "ureq 3.3.0",
  "zip 7.2.0",
+ "zstd",
 ]
 
 [[package]]
