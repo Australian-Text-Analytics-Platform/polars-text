@@ -33,6 +33,7 @@ fn _internal(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
     _m.add_function(wrap_pyfunction!(prefetch_embedder_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(loaded_embedders_py, _m)?)?;
     _m.add_function(wrap_pyfunction!(project_topic_modeling_context_py, _m)?)?;
+    _m.add_function(wrap_pyfunction!(project_topic_modeling_basis_py, _m)?)?;
     Ok(())
 }
 
@@ -207,6 +208,44 @@ fn project_topic_modeling_context_py_impl(
 ) -> PyResult<String> {
     Err(feature_disabled(
         "project_topic_modeling_context",
+        "topic-modeling",
+    ))
+}
+
+#[pyfunction(name = "project_topic_modeling_basis")]
+#[pyo3(signature = (context, cluster_count, corpus_sizes))]
+fn project_topic_modeling_basis_py(
+    context: Vec<u8>,
+    cluster_count: usize,
+    corpus_sizes: Vec<usize>,
+) -> PyResult<String> {
+    project_topic_modeling_basis_py_impl(&context, cluster_count, &corpus_sizes)
+}
+
+#[cfg(feature = "topic-modeling")]
+fn project_topic_modeling_basis_py_impl(
+    context: &[u8],
+    cluster_count: usize,
+    corpus_sizes: &[usize],
+) -> PyResult<String> {
+    let basis = topic_modeling::projection::project_serialized_context_basis(
+        context,
+        cluster_count,
+        corpus_sizes,
+    )
+    .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
+    serde_json::to_string(&basis)
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
+}
+
+#[cfg(not(feature = "topic-modeling"))]
+fn project_topic_modeling_basis_py_impl(
+    _context: &[u8],
+    _cluster_count: usize,
+    _corpus_sizes: &[usize],
+) -> PyResult<String> {
+    Err(feature_disabled(
+        "project_topic_modeling_basis",
         "topic-modeling",
     ))
 }

@@ -5,7 +5,7 @@
 //! aggregate sufficient statistics, so Result queries never need source text,
 //! embeddings, PaCMAP, or HDBSCAN.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +53,18 @@ pub struct TopicClusteringContext {
     segments: Vec<SegmentFact>,
     n_chunks: usize,
     truncated_segment_count: usize,
+}
+
+/// Compact, N-independent input for Result-time Topic bubble counts.
+///
+/// Each activation is `[corpus_index, topic_id, minimum_n, row_count]`, where
+/// `minimum_n` is one plus the number of strictly higher positive real-Topic
+/// shares in the row. Equal shares therefore activate at the same cutoff.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicProjectionBasis {
+    pub topics: Vec<TopicInfo>,
+    pub activations: Vec<[usize; 4]>,
+    pub has_outlier: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +470,100 @@ pub fn project_serialized_context(
     project(&deserialize_context(bytes)?, cluster_count)
 }
 
+pub fn project_basis(
+    context: &TopicClusteringContext,
+    cluster_count: usize,
+    corpus_sizes: &[usize],
+) -> Result<TopicProjectionBasis> {
+    let projected = project(context, cluster_count)?;
+    let document_count = corpus_sizes.iter().try_fold(0usize, |total, size| {
+        total
+            .checked_add(*size)
+            .context("Topic corpus sizes overflow")
+    })?;
+    if document_count != projected.documents.len() {
+        bail!("Topic projection documents do not align with corpus sizes");
+    }
+
+    let corpus_by_document = corpus_sizes
+        .iter()
+        .enumerate()
+        .flat_map(|(corpus_index, size)| std::iter::repeat_n(corpus_index, *size))
+        .collect::<Vec<_>>();
+    let mut activation_counts = BTreeMap::<(usize, usize, usize), usize>::new();
+    let mut has_outlier = false;
+    for (expected_index, document) in projected.documents.iter().enumerate() {
+        if document.doc_index != expected_index {
+            bail!("Topic projection document indices are invalid");
+        }
+        has_outlier |= document.dominant_topic == OUTLIER_LABEL;
+        if document
+            .topic_distribution
+            .iter()
+            .any(|&(topic_id, proportion)| {
+                topic_id < OUTLIER_LABEL
+                    || topic_id >= cluster_count as i32
+                    || !proportion.is_finite()
+                    || proportion < 0.0
+            })
+        {
+            bail!("Topic projection distribution contains an invalid entry");
+        }
+        let mut ranked = document
+            .topic_distribution
+            .iter()
+            .filter_map(|&(topic_id, proportion)| {
+                (topic_id >= 0 && proportion > 0.0).then_some((topic_id, proportion))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut rank_start = 0;
+        while rank_start < ranked.len() {
+            let proportion = ranked[rank_start].1;
+            let mut rank_end = rank_start + 1;
+            while rank_end < ranked.len() && ranked[rank_end].1 == proportion {
+                rank_end += 1;
+            }
+            let minimum_n = rank_start + 1;
+            for &(topic_id, _) in &ranked[rank_start..rank_end] {
+                *activation_counts
+                    .entry((
+                        corpus_by_document[document.doc_index],
+                        topic_id as usize,
+                        minimum_n,
+                    ))
+                    .or_insert(0) += 1;
+            }
+            rank_start = rank_end;
+        }
+    }
+
+    Ok(TopicProjectionBasis {
+        topics: projected.topics,
+        activations: activation_counts
+            .into_iter()
+            .map(|((corpus_index, topic_id, minimum_n), count)| {
+                [corpus_index, topic_id, minimum_n, count]
+            })
+            .collect(),
+        has_outlier,
+    })
+}
+
+pub fn project_serialized_context_basis(
+    bytes: &[u8],
+    cluster_count: usize,
+    corpus_sizes: &[usize],
+) -> Result<TopicProjectionBasis> {
+    project_basis(&deserialize_context(bytes)?, cluster_count, corpus_sizes)
+}
+
 pub fn natural_cluster_count(context: &TopicClusteringContext) -> usize {
     context.natural_cluster_count
 }
@@ -539,5 +645,36 @@ mod tests {
             .find(|(id, _)| *id == OUTLIER_LABEL)
             .unwrap();
         assert!((outlier.1 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compact_basis_aggregates_ties_without_serializing_documents() {
+        let context = fixture();
+        let basis = project_basis(&context, 3, &[1, 1]).unwrap();
+        let full_json = serde_json::to_vec(&project(&context, 3).unwrap()).unwrap();
+        let basis_json = serde_json::to_vec(&basis).unwrap();
+
+        assert_eq!(basis.topics.len(), 3);
+        assert_eq!(
+            basis.activations,
+            vec![[0, 0, 1, 1], [0, 1, 1, 1], [1, 2, 1, 1]]
+        );
+        assert!(!basis.has_outlier);
+        assert!(basis_json.len() < full_json.len());
+    }
+
+    #[test]
+    fn compact_basis_marks_all_outlier_documents_and_validates_corpora() {
+        let mut context = fixture();
+        context.document_count = 3;
+        context.segments.push(SegmentFact {
+            document_index: 2,
+            leaf_id: OUTLIER_LABEL,
+            retained_character_weight: 1,
+        });
+
+        let basis = project_basis(&context, 3, &[1, 1, 1]).unwrap();
+        assert!(basis.has_outlier);
+        assert!(project_basis(&context, 3, &[2]).is_err());
     }
 }
