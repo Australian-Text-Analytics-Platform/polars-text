@@ -304,8 +304,7 @@ struct TokenCacheTable<'a> {
     params_hash: &'a str,
 }
 
-pub(crate) type TokenCacheDebugRow =
-    (String, String, String, Vec<String>, Vec<i64>, Vec<i64>);
+pub(crate) type TokenCacheDebugRow = (String, String, String, Vec<String>, Vec<i64>, Vec<i64>);
 
 #[cfg(feature = "tokenization")]
 pub(crate) fn debug_token_cache_snapshot(

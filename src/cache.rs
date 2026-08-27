@@ -281,6 +281,19 @@ CREATE TABLE IF NOT EXISTS string_cache (
     }
 
     #[test]
+    fn json_extension_is_statically_linked() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        let install_mode: String = conn.query_row(
+            "SELECT install_mode FROM duckdb_extensions() WHERE extension_name = 'json'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(install_mode, "STATICALLY_LINKED");
+        Ok(())
+    }
+
+    #[test]
     fn cache_flow_computes_unique_misses_and_preserves_order() -> Result<()> {
         let path = temp_cache_path("flow");
         let table = StringTable { namespace: "a" };

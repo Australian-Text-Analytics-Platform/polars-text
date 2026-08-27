@@ -1,6 +1,6 @@
 [package]
 name = "polars_text"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 
 [lib]
@@ -38,7 +38,7 @@ topic-modeling = [
 
 [dependencies]
 anyhow = "1.0"
-duckdb = { version = "1.10504.0", features = ["bundled"], optional = true }
+duckdb = { version = "1.10504.0", features = ["bundled", "json"], optional = true }
 fs2 = { version = "0.4", optional = true }
 hf-hub = { version = "0.5", optional = true }
 # Lindera dict download support: fetch official GitHub release zips on first use.
