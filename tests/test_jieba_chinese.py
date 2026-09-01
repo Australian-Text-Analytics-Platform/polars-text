@@ -77,8 +77,12 @@ def test_jieba_handles_mixed_zh_en_text() -> None:
 
 
 def test_jieba_is_exposed_for_zh_inventory() -> None:
-    assert _LINDERA_JIEBA_MODEL_ID in polars_text.LINDERA_MODELS_BY_LANGUAGE["zh"]
-    assert polars_text.PREDEFINED_MODELS[_LINDERA_JIEBA_MODEL_ID] == ("zh",)
+    model = next(
+        model
+        for model in polars_text.TOKENIZER_MODELS
+        if model.model_id == _LINDERA_JIEBA_MODEL_ID
+    )
+    assert model.languages == ("zh",)
 
 
 def test_jieba_does_not_pollute_english_default() -> None:

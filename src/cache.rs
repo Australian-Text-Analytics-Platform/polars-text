@@ -8,16 +8,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use fs2::FileExt;
-use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 
-static CACHE_PATH_LOCKS: Lazy<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static CACHE_PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_META_TABLE: &str = "polars_text_cache_meta";
 
 /// Stable SHA-256 content hash used by every text cache table.
 pub fn hash_text(value: &str) -> String {
@@ -28,7 +29,7 @@ pub fn hash_text(value: &str) -> String {
 
 /// Table-specific codec and namespace for one cached value type.
 pub trait TextCacheTable {
-    type Value: Clone;
+    type Value;
 
     /// SQL that creates this table and its primary key if it does not exist.
     fn schema_sql(&self) -> &'static str;
@@ -38,11 +39,11 @@ pub trait TextCacheTable {
         &self,
         conn: &Connection,
         hashes: &[String],
-    ) -> Result<HashMap<String, Self::Value>>;
+    ) -> Result<HashMap<String, Arc<Self::Value>>>;
 
     /// Persist newly computed values. Implementations should use conflict-safe
     /// insert semantics so duplicate miss computation is harmless.
-    fn persist_new(&self, conn: &Connection, entries: &[(String, Self::Value)]) -> Result<()>;
+    fn persist_new(&self, conn: &Connection, entries: &[(String, Arc<Self::Value>)]) -> Result<()>;
 }
 
 /// Return values for `texts`, computing and inserting only unique cache misses.
@@ -51,7 +52,7 @@ pub fn get_or_insert_text_values<T>(
     table: &T,
     texts: &[String],
     compute_misses: impl FnOnce(&[String]) -> Result<Vec<T::Value>>,
-) -> Result<Vec<T::Value>>
+) -> Result<Vec<Arc<T::Value>>>
 where
     T: TextCacheTable,
 {
@@ -60,7 +61,7 @@ where
     }
 
     let hashes = texts.iter().map(|text| hash_text(text)).collect::<Vec<_>>();
-    let mut cached = with_cache_lock(path, || {
+    let mut cached = with_file_lock(path, || {
         let conn = open_cache(path, table.schema_sql())?;
         table.fetch_cached(&conn, &hashes)
     })?;
@@ -84,9 +85,9 @@ where
         let entries = miss_hashes
             .iter()
             .cloned()
-            .zip(computed.iter().cloned())
+            .zip(computed.into_iter().map(Arc::new))
             .collect::<Vec<_>>();
-        with_cache_lock(path, || {
+        with_file_lock(path, || {
             let conn = open_cache(path, table.schema_sql())?;
             table.persist_new(&conn, &entries)
         })?;
@@ -100,16 +101,16 @@ where
         .map(|hash| {
             cached
                 .get(hash)
-                .cloned()
+                .map(Arc::clone)
                 .ok_or_else(|| anyhow::anyhow!("cache missing computed hash {hash}"))
         })
         .collect()
 }
 
-fn unique_misses<V: Clone>(
+fn unique_misses<V>(
     texts: &[String],
     hashes: &[String],
-    cached: &HashMap<String, V>,
+    cached: &HashMap<String, Arc<V>>,
 ) -> (Vec<String>, Vec<String>) {
     let mut seen_misses = HashSet::new();
     let mut miss_hashes = Vec::new();
@@ -128,13 +129,101 @@ fn open_cache(path: &Path, schema_sql: &str) -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create cache dir {}", parent.display()))?;
     }
+    if !cache_schema_is_current(path)? {
+        rebuild_cache(path, schema_sql)?;
+    }
     let conn = Connection::open(path).with_context(|| format!("open cache {}", path.display()))?;
     conn.execute_batch(schema_sql)
         .context("initialize cache schema")?;
     Ok(conn)
 }
 
-fn with_cache_lock<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
+fn cache_schema_is_current(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = match Connection::open(path) {
+        Ok(conn) => conn,
+        Err(_) => return Ok(false),
+    };
+    let query = format!("SELECT schema_version FROM {CACHE_META_TABLE} LIMIT 1");
+    match conn.query_row(&query, [], |row| row.get::<_, u32>(0)) {
+        Ok(version) => Ok(version == CACHE_SCHEMA_VERSION),
+        Err(_) => Ok(false),
+    }
+}
+
+fn rebuild_cache(path: &Path, schema_sql: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".polars-text-cache-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary cache in {}", parent.display()))?;
+    let temporary = temporary.into_temp_path();
+    let temporary_path = temporary.to_path_buf();
+    std::fs::remove_file(&temporary_path)
+        .with_context(|| format!("prepare temporary cache {}", temporary_path.display()))?;
+
+    let initialize = (|| -> Result<()> {
+        let conn = Connection::open(&temporary_path)
+            .with_context(|| format!("open temporary cache {}", temporary_path.display()))?;
+        conn.execute_batch(&format!(
+            "BEGIN;\nCREATE TABLE {CACHE_META_TABLE} (schema_version INTEGER NOT NULL);\nINSERT INTO {CACHE_META_TABLE} VALUES ({CACHE_SCHEMA_VERSION});\n{schema_sql};\nCOMMIT;"
+        ))
+        .context("initialize replacement cache schema")?;
+        drop(conn);
+        Ok(())
+    })();
+    initialize?;
+
+    remove_if_exists(&wal_path_for(path))?;
+    temporary.persist(path).map_err(|error| {
+        anyhow::anyhow!(
+            "atomically replace cache {} with {}: {}",
+            path.display(),
+            temporary_path.display(),
+            error
+        )
+    })?;
+    Ok(())
+}
+
+fn wal_path_for(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".wal");
+    PathBuf::from(value)
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// Load unique hashes into a connection-local table for one set-based lookup.
+pub fn stage_requested_hashes(conn: &Connection, hashes: &[String]) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS requested_hashes;\nCREATE TEMP TABLE requested_hashes (content_hash VARCHAR PRIMARY KEY);",
+    )
+    .context("create requested cache hash table")?;
+    let mut appender = conn
+        .appender("requested_hashes")
+        .context("open requested hash appender")?;
+    let mut seen = HashSet::new();
+    for hash in hashes {
+        if seen.insert(hash.as_str()) {
+            appender
+                .append_row([hash.as_str()])
+                .context("append requested cache hash")?;
+        }
+    }
+    appender.flush().context("flush requested cache hashes")?;
+    Ok(())
+}
+
+pub(crate) fn with_file_lock<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create cache lock dir {}", parent.display()))?;
@@ -199,6 +288,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .with_context(|| format!("open cache lock file {}", path.display()))
 }
@@ -206,7 +296,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use duckdb::{params, Error as DuckDbError};
+    use duckdb::params;
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -235,32 +325,54 @@ CREATE TABLE IF NOT EXISTS string_cache (
             &self,
             conn: &Connection,
             hashes: &[String],
-        ) -> Result<HashMap<String, Self::Value>> {
+        ) -> Result<HashMap<String, Arc<Self::Value>>> {
+            stage_requested_hashes(conn, hashes)?;
             let mut out = HashMap::new();
             let mut stmt = conn.prepare(
-                "SELECT value FROM string_cache WHERE namespace = ? AND content_hash = ?",
+                "SELECT cache.content_hash, cache.value
+                 FROM string_cache AS cache
+                 INNER JOIN requested_hashes AS requested USING (content_hash)
+                 WHERE cache.namespace = ?",
             )?;
-            for hash in hashes.iter().collect::<HashSet<_>>() {
-                let result = stmt.query_row(params![self.namespace, hash], |row| row.get(0));
-                match result {
-                    Ok(value) => {
-                        out.insert(hash.clone(), value);
-                    }
-                    Err(DuckDbError::QueryReturnedNoRows) => {}
-                    Err(err) => return Err(err).context("read string cache row"),
-                }
+            let mut rows = stmt.query(params![self.namespace])?;
+            while let Some(row) = rows.next()? {
+                let hash: String = row.get(0)?;
+                let value: String = row.get(1)?;
+                out.insert(hash, Arc::new(value));
             }
             Ok(out)
         }
 
-        fn persist_new(&self, conn: &Connection, entries: &[(String, Self::Value)]) -> Result<()> {
-            let mut stmt = conn.prepare(
-                "INSERT OR IGNORE INTO string_cache (namespace, content_hash, value) VALUES (?, ?, ?)",
+        fn persist_new(
+            &self,
+            conn: &Connection,
+            entries: &[(String, Arc<Self::Value>)],
+        ) -> Result<()> {
+            conn.execute_batch(
+                "BEGIN;
+                 DROP TABLE IF EXISTS staged_string_cache;
+                 CREATE TEMP TABLE staged_string_cache (
+                    namespace VARCHAR, content_hash VARCHAR, value VARCHAR
+                 );",
             )?;
-            for (hash, value) in entries {
-                stmt.execute(params![self.namespace, hash, value])?;
+            let result = (|| -> Result<()> {
+                let mut appender = conn.appender("staged_string_cache")?;
+                for (hash, value) in entries {
+                    appender.append_row(params![self.namespace, hash, value.as_str()])?;
+                }
+                appender.flush()?;
+                drop(appender);
+                conn.execute_batch(
+                    "INSERT OR IGNORE INTO string_cache
+                     SELECT namespace, content_hash, value FROM staged_string_cache;
+                     COMMIT;",
+                )?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = conn.execute_batch("ROLLBACK");
             }
-            Ok(())
+            result
         }
     }
 
@@ -306,12 +418,11 @@ CREATE TABLE IF NOT EXISTS string_cache (
 
         assert_eq!(misses_seen, vec!["alpha".to_string(), "beta".to_string()]);
         assert_eq!(
-            values,
-            vec![
-                "value:alpha".to_string(),
-                "value:beta".to_string(),
-                "value:alpha".to_string()
-            ]
+            values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["value:alpha", "value:beta", "value:alpha"]
         );
 
         let mut second_misses = Vec::new();
@@ -347,16 +458,100 @@ CREATE TABLE IF NOT EXISTS string_cache (
                         .map(|text| format!("inner:{text}"))
                         .collect())
                 })?;
-            assert_eq!(inner_values, vec!["inner:inner-text".to_string()]);
+            assert_eq!(inner_values[0].as_str(), "inner:inner-text");
             nested_completed.set(true);
             Ok(misses.iter().map(|text| format!("outer:{text}")).collect())
         })?;
 
         assert!(nested_completed.get());
-        assert_eq!(outer_values, vec!["outer:outer-text".to_string()]);
+        assert_eq!(outer_values[0].as_str(), "outer:outer-text");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(lock_path_for(&path));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_database_is_replaced_completely() -> Result<()> {
+        let path = temp_cache_path("legacy-replacement");
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch("CREATE TABLE unrelated_user_table (value INTEGER);")?;
+        drop(legacy);
+
+        let table = StringTable { namespace: "new" };
+        let values = get_or_insert_text_values(&path, &table, &["alpha".to_string()], |misses| {
+            Ok(misses.iter().map(|text| format!("new:{text}")).collect())
+        })?;
+        assert_eq!(values[0].as_str(), "new:alpha");
+
+        let current = Connection::open(&path)?;
+        let unrelated_count: u64 = current.query_row(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'unrelated_user_table'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unrelated_count, 0);
+        let schema_version: u32 = current.query_row(
+            &format!("SELECT schema_version FROM {CACHE_META_TABLE}"),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(schema_version, CACHE_SCHEMA_VERSION);
+        drop(current);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(lock_path_for(&path));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_replacement_initialization_preserves_original_bytes() -> Result<()> {
+        let path = temp_cache_path("failed-replacement");
+        let original = b"not a duckdb database but still user-owned bytes";
+        std::fs::write(&path, original)?;
+
+        let error = rebuild_cache(&path, "THIS IS NOT VALID SQL").unwrap_err();
+        assert!(error.to_string().contains("replacement cache"));
+        assert_eq!(std::fs::read(&path)?, original);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_all_unique_rows() -> Result<()> {
+        let path = Arc::new(temp_cache_path("concurrent-writers"));
+        let mut handles = Vec::new();
+        for texts in [
+            vec!["alpha".to_string(), "shared".to_string()],
+            vec!["beta".to_string(), "shared".to_string()],
+        ] {
+            let path = Arc::clone(&path);
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                let table = StringTable {
+                    namespace: "concurrent",
+                };
+                get_or_insert_text_values(&path, &table, &texts, |misses| {
+                    Ok(misses.iter().map(|text| format!("value:{text}")).collect())
+                })?;
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("cache writer thread panicked"))??;
+        }
+
+        let conn = Connection::open(path.as_ref())?;
+        let row_count: u64 = conn.query_row(
+            "SELECT count(*) FROM string_cache WHERE namespace = 'concurrent'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(row_count, 3);
+        drop(conn);
+        let _ = std::fs::remove_file(path.as_ref());
+        let _ = std::fs::remove_file(lock_path_for(path.as_ref()));
         Ok(())
     }
 }

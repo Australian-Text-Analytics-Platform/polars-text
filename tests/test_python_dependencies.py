@@ -5,7 +5,6 @@ import tomllib
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -13,7 +12,10 @@ def _imports_duckdb(path: Path) -> bool:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            if any(alias.name == "duckdb" or alias.name.startswith("duckdb.") for alias in node.names):
+            if any(
+                alias.name == "duckdb" or alias.name.startswith("duckdb.")
+                for alias in node.names
+            ):
                 return True
         elif isinstance(node, ast.ImportFrom) and (
             node.module == "duckdb" or (node.module or "").startswith("duckdb.")
@@ -26,7 +28,7 @@ class PythonDependencyTests(unittest.TestCase):
     def test_runtime_dependencies_only_include_imported_runtime_packages(self) -> None:
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-        self.assertEqual(pyproject["project"]["dependencies"], ["polars==1.40.0"])
+        self.assertEqual(pyproject["project"]["dependencies"], ["polars==1.44.1"])
 
     def test_python_sources_do_not_import_duckdb_package(self) -> None:
         python_files = [

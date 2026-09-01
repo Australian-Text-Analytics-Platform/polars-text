@@ -5,7 +5,7 @@ from typing import Literal
 
 import polars as pl
 
-from . import functions
+from . import _expressions
 
 
 @pl.api.register_expr_namespace("text")
@@ -18,59 +18,59 @@ class TextNamespace:
         *,
         model: str,
         lowercase: bool = True,
-        remove_punct: bool = True,
+        remove_punctuation: bool = True,
         cache: str | os.PathLike[str] | None = None,
     ) -> pl.Expr:
-        return functions.tokenize(
+        return _expressions.tokenize(
             self._expr,
             model=model,
             lowercase=lowercase,
-            remove_punct=remove_punct,
+            remove_punctuation=remove_punctuation,
             cache=cache,
         )
 
     def concordance(
         self,
-        search_word: str,
+        query: str,
         *,
-        num_left_tokens: int = 5,
-        num_right_tokens: int = 5,
+        left_tokens: int = 5,
+        right_tokens: int = 5,
         regex: bool = False,
         case_sensitive: bool = False,
-        remove_punct: bool = False,
+        ignore_punctuation: bool = False,
     ) -> pl.Expr:
-        return functions.concordance(
+        return _expressions.concordance(
             self._expr,
-            search_word,
-            num_left_tokens=num_left_tokens,
-            num_right_tokens=num_right_tokens,
+            query,
+            left_tokens=left_tokens,
+            right_tokens=right_tokens,
             regex=regex,
             case_sensitive=case_sensitive,
-            remove_punct=remove_punct,
+            ignore_punctuation=ignore_punctuation,
         )
 
     def clean_text(self) -> pl.Expr:
-        return functions.clean_text(self._expr)
+        return _expressions.clean_text(self._expr)
 
     def word_count(self) -> pl.Expr:
-        return functions.word_count(self._expr)
+        return _expressions.word_count(self._expr)
 
     def char_count(self) -> pl.Expr:
-        return functions.char_count(self._expr)
+        return _expressions.char_count(self._expr)
 
     def sentence_count(self) -> pl.Expr:
-        return functions.sentence_count(self._expr)
+        return _expressions.sentence_count(self._expr)
 
     def embedding(
         self,
         *,
-        embedder_model: str | None = None,
+        model: str | None = None,
         cache: str | os.PathLike[str] | None = None,
         batch_size: int | None = None,
     ) -> pl.Expr:
-        return functions.embedding(
+        return _expressions.embedding(
             self._expr,
-            embedder_model=embedder_model,
+            model=model,
             cache=cache,
             batch_size=batch_size,
         )
@@ -78,34 +78,28 @@ class TextNamespace:
     def topic_modeling(
         self,
         *,
-        embedder_model: str | None = None,
-        cache: str | os.PathLike[str] | None = None,
-        segmentation_method: Literal["automatic", "paragraph", "sentence"] = "automatic",
+        embedding_model: str | None = None,
+        embedding_cache: str | os.PathLike[str] | None = None,
+        segmentation: Literal["automatic", "line", "sentence"] = "automatic",
         max_tokens: int = 256,
-        overlap: int = 32,
-        reduce_dims: int = 5,
         seed: int = 42,
-        min_cluster_size: int = 10,
-        min_samples: int | None = None,
-        vectorizer_model: str | None = None,
+        min_topic_size: int = 10,
+        tokenizer_model: str | None = None,
         lowercase: bool = True,
     ) -> pl.Expr:
         """Cluster a document column and emit one run-level topic struct.
 
-        Output contains separate document outcomes and complete topic metadata,
-        plus segment counts, truncation reporting, and native stage timings.
+        Output contains separate document outcomes, complete topic metadata,
+        segment counts, and an optional projection context.
         """
-        return functions.topic_modeling(
+        return _expressions.topic_modeling(
             self._expr,
-            embedder_model=embedder_model,
-            cache=cache,
-            segmentation_method=segmentation_method,
+            embedding_model=embedding_model,
+            embedding_cache=embedding_cache,
+            segmentation=segmentation,
             max_tokens=max_tokens,
-            overlap=overlap,
-            reduce_dims=reduce_dims,
             seed=seed,
-            min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
-            vectorizer_model=vectorizer_model,
+            min_topic_size=min_topic_size,
+            tokenizer_model=tokenizer_model,
             lowercase=lowercase,
         )

@@ -10,36 +10,32 @@
 //! only safetensors/PyTorch weights, loading fails with a clear error rather
 //! than attempting conversion at runtime.
 //!
-//! Called by: `topic_modeling::run` for chunk embeddings and, through the
-//! expression plugin, `polars_text.functions.embedding` / `.text.embedding`.
+//! Called by: `topic_modeling::run` for Topic Segment embeddings and, through
+//! the expression plugin, `.text.embedding`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
+#[cfg(target_os = "linux")]
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use hf_hub::{Repo, RepoType};
-use once_cell::sync::OnceCell;
 use ort::ep;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionInputValue};
-use ort::value::Tensor;
+use ort::value::{Tensor, ValueType};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-/// Default ONNX embedder. This model is popular, has published ONNX weights,
-/// and its model card documents mean pooling + L2 normalization for sentence
-/// embeddings. It is English-focused; a multilingual ONNX default can replace
-/// it after benchmarking.
-pub const DEFAULT_EMBEDDER_REPO_ID: &str = "onnx-community/all-MiniLM-L6-v2-ONNX";
-
-/// Hard truncation cap for the embedding tokenizer. Chunks are already sized to
-/// the chunk budget, but capping here protects against a pathological single
-/// token blob exceeding the model's positional range.
-const EMBED_TRUNCATION_MAX: usize = 512;
+/// Canonical Sentence Transformers default with a published ONNX artifact.
+pub const DEFAULT_EMBEDDER_REPO_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const EMBEDDING_PIPELINE_VERSION: &str = "sentence-transformers-v2";
 
 const EMBEDDING_THREADS_ENV: &str = "POLARS_TEXT_EMBEDDING_THREADS";
 
@@ -49,11 +45,88 @@ pub struct Embedder {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
     input_names: Vec<String>,
-    output_name: String,
-    hidden_size: usize,
+    output: EmbeddingOutput,
+    pooling: PoolingConfig,
+    normalize: bool,
+    embedding_dim: usize,
+    max_length: usize,
     model_id: String,
     provider_id: String,
-    model_revision: String,
+    cache_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+enum EmbeddingOutput {
+    TokenEmbeddings(String),
+    SentenceEmbedding(String),
+}
+
+impl EmbeddingOutput {
+    fn name(&self) -> &str {
+        match self {
+            Self::TokenEmbeddings(name) | Self::SentenceEmbedding(name) => name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SentenceTransformerModule {
+    idx: usize,
+    path: String,
+    #[serde(rename = "type")]
+    module_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PoolingConfig {
+    word_embedding_dimension: usize,
+    #[serde(default)]
+    pooling_mode_cls_token: bool,
+    #[serde(default)]
+    pooling_mode_max_tokens: bool,
+    #[serde(default)]
+    pooling_mode_mean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_mean_sqrt_len_tokens: bool,
+    #[serde(default)]
+    pooling_mode_weightedmean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_lasttoken: bool,
+}
+
+impl PoolingConfig {
+    fn enabled_count(&self) -> usize {
+        [
+            self.pooling_mode_cls_token,
+            self.pooling_mode_max_tokens,
+            self.pooling_mode_mean_tokens,
+            self.pooling_mode_mean_sqrt_len_tokens,
+            self.pooling_mode_weightedmean_tokens,
+            self.pooling_mode_lasttoken,
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+    }
+}
+
+struct PinnedRepo {
+    repo: ApiRepo,
+    snapshot_root: PathBuf,
+    revision: String,
+}
+
+impl PinnedRepo {
+    fn get(&self, filename: &str) -> Result<PathBuf> {
+        let cached = self.snapshot_root.join(filename);
+        if cached.exists() {
+            Ok(cached)
+        } else {
+            self.repo
+                .get(filename)
+                .with_context(|| format!("fetch {filename} at revision {}", self.revision))
+        }
+    }
 }
 
 impl Embedder {
@@ -61,7 +134,7 @@ impl Embedder {
     /// Some ONNX repos omit this field; those still encode correctly and infer
     /// the real dimensionality from ORT output at runtime.
     pub fn dim(&self) -> usize {
-        self.hidden_size
+        self.embedding_dim
     }
 
     /// Hugging Face repo id used for model download and embedding cache keys.
@@ -74,13 +147,18 @@ impl Embedder {
         &self.provider_id
     }
 
-    /// Model revision label used for cache keys. Currently `main` because the
-    /// public API only accepts a model id and relies on hf-hub defaults.
-    pub fn model_revision(&self) -> &str {
-        &self.model_revision
+    /// Immutable Hugging Face snapshot used for every model artifact.
+    /// Complete embedding-pipeline identity used by persistent caches.
+    pub fn cache_fingerprint(&self) -> &str {
+        &self.cache_fingerprint
     }
 
-    /// A tokenizer clone with truncation/padding disabled for chunk-size measurement.
+    /// Canonical maximum input length declared by the model.
+    pub fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    /// A tokenizer clone with truncation/padding disabled for segment-size measurement.
     pub fn sizing_tokenizer(&self) -> Tokenizer {
         tokenizer_for_sizing(&self.tokenizer)
     }
@@ -108,7 +186,7 @@ impl Embedder {
             .max()
             .unwrap_or(0);
         if seq == 0 {
-            return Ok(vec![vec![0.0; self.hidden_size]; batch]);
+            return Ok(vec![vec![0.0; self.embedding_dim]; batch]);
         }
 
         let mut ids = Vec::with_capacity(batch * seq);
@@ -145,16 +223,28 @@ impl Embedder {
         let outputs = session
             .run(inputs)
             .context("ONNX embedding inference failed")?;
-        let output = if outputs.contains_key(self.output_name.as_str()) {
-            &outputs[self.output_name.as_str()]
-        } else {
-            &outputs[0]
-        };
+        let output = outputs.get(self.output.name()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "ONNX inference did not return declared output {}",
+                self.output.name()
+            )
+        })?;
         let (shape, data) = output
             .try_extract_tensor::<f32>()
             .context("extract ONNX embedding tensor")?;
         let dims: Vec<usize> = shape.iter().map(|dim| *dim as usize).collect();
-        embeddings_from_output(&dims, data, batch, seq, &mask)
+        embeddings_from_output(
+            &self.output,
+            &self.pooling,
+            self.normalize,
+            OutputBatch {
+                dims: &dims,
+                data,
+                batch,
+                sequence_length: seq,
+                attention_mask: &mask,
+            },
+        )
     }
 }
 
@@ -165,33 +255,70 @@ fn tokenizer_for_sizing(tokenizer: &Tokenizer) -> Tokenizer {
     tok
 }
 
-fn embeddings_from_output(
-    dims: &[usize],
-    data: &[f32],
+struct OutputBatch<'a> {
+    dims: &'a [usize],
+    data: &'a [f32],
     batch: usize,
-    seq: usize,
-    mask: &[i64],
-) -> Result<Vec<Vec<f32>>> {
-    match dims {
-        [out_batch, dim] if *out_batch == batch => Ok(normalize_rows(data, batch, *dim)),
-        [out_batch, out_seq, dim] if *out_batch == batch && *out_seq == seq => {
-            mean_pool_normalize(data, batch, seq, *dim, mask)
-        }
-        other => anyhow::bail!(
-            "unsupported ONNX embedding output shape {:?}; expected [batch, dim] or [batch, seq, dim]",
-            other
-        ),
-    }
+    sequence_length: usize,
+    attention_mask: &'a [i64],
 }
 
-/// Mean-pool `(batch, seq, dim)` hidden states over a `(batch, seq)` mask, then
-/// L2-normalize each row. Kept pure so tests do not need ONNX Runtime.
-fn mean_pool_normalize(
+fn embeddings_from_output(
+    output: &EmbeddingOutput,
+    pooling: &PoolingConfig,
+    normalize: bool,
+    batch: OutputBatch<'_>,
+) -> Result<Vec<Vec<f32>>> {
+    let OutputBatch {
+        dims,
+        data,
+        batch,
+        sequence_length: seq,
+        attention_mask: mask,
+    } = batch;
+    let expected_dimension = pooling
+        .word_embedding_dimension
+        .checked_mul(pooling.enabled_count())
+        .ok_or_else(|| anyhow::anyhow!("metadata-derived embedding dimension overflow"))?;
+    let mut rows = match (output, dims) {
+        (EmbeddingOutput::SentenceEmbedding(_), [out_batch, dim]) if *out_batch == batch => {
+            if *dim != expected_dimension {
+                anyhow::bail!(
+                    "sentence embedding output width {dim} does not match metadata-derived width {expected_dimension}"
+                );
+            }
+            if data.len() != batch * dim {
+                anyhow::bail!(
+                    "sentence embedding tensor length {} does not match shape [{batch}, {dim}]",
+                    data.len()
+                );
+            }
+            data.chunks_exact(*dim).map(<[f32]>::to_vec).collect()
+        }
+        (EmbeddingOutput::TokenEmbeddings(_), [out_batch, out_seq, dim])
+            if *out_batch == batch && *out_seq == seq =>
+        {
+            pool_token_embeddings(data, batch, seq, *dim, mask, pooling)?
+        }
+        other => anyhow::bail!(
+            "ONNX output {} has incompatible shape {:?} for the declared Sentence Transformers graph",
+            output.name(),
+            other.1
+        ),
+    };
+    if normalize {
+        normalize_nested_rows(&mut rows);
+    }
+    Ok(rows)
+}
+
+fn pool_token_embeddings(
     hidden: &[f32],
     batch: usize,
     seq: usize,
     dim: usize,
     mask: &[i64],
+    pooling: &PoolingConfig,
 ) -> Result<Vec<Vec<f32>>> {
     if hidden.len() != batch * seq * dim {
         anyhow::bail!(
@@ -206,39 +333,89 @@ fn mean_pool_normalize(
         );
     }
 
-    let mut rows = vec![vec![0.0_f32; dim]; batch];
+    if pooling.word_embedding_dimension != dim {
+        anyhow::bail!(
+            "pooling metadata expects hidden size {}, but ONNX returned {dim}",
+            pooling.word_embedding_dimension
+        );
+    }
+    let mode_count = pooling.enabled_count();
+    if mode_count == 0 {
+        anyhow::bail!("pooling metadata enables no supported pooling mode");
+    }
+
+    let mut rows = Vec::with_capacity(batch);
     for row in 0..batch {
-        let mut count = 0.0_f32;
-        for token in 0..seq {
-            let mask_value = mask[row * seq + token] as f32;
+        let mut pooled = Vec::with_capacity(dim * mode_count);
+        let mask_row = &mask[row * seq..(row + 1) * seq];
+        if pooling.pooling_mode_cls_token {
+            let offset = row * seq * dim;
+            pooled.extend_from_slice(&hidden[offset..offset + dim]);
+        }
+        if pooling.pooling_mode_max_tokens {
+            let mut values = vec![f32::NEG_INFINITY; dim];
+            for (token, &mask_value) in mask_row.iter().enumerate() {
+                if mask_value == 0 {
+                    continue;
+                }
+                let offset = (row * seq + token) * dim;
+                for col in 0..dim {
+                    values[col] = values[col].max(hidden[offset + col]);
+                }
+            }
+            for value in &mut values {
+                if !value.is_finite() {
+                    *value = 0.0;
+                }
+            }
+            pooled.extend(values);
+        }
+
+        let mut sum = vec![0.0_f32; dim];
+        let mut token_count = 0.0_f32;
+        let mut weighted_sum = vec![0.0_f32; dim];
+        let mut weight_total = 0.0_f32;
+        for (token, &raw_mask_value) in mask_row.iter().enumerate() {
+            let mask_value = raw_mask_value as f32;
             if mask_value == 0.0 {
                 continue;
             }
-            count += mask_value;
+            token_count += mask_value;
+            let weight = (token + 1) as f32 * mask_value;
+            weight_total += weight;
             let offset = (row * seq + token) * dim;
             for col in 0..dim {
-                rows[row][col] += hidden[offset + col] * mask_value;
+                sum[col] += hidden[offset + col] * mask_value;
+                weighted_sum[col] += hidden[offset + col] * weight;
             }
         }
-        let denom = count.max(1e-9);
-        for value in &mut rows[row] {
-            *value /= denom;
+        if pooling.pooling_mode_mean_tokens {
+            let denom = token_count.max(1e-9);
+            pooled.extend(sum.iter().map(|value| value / denom));
         }
+        if pooling.pooling_mode_mean_sqrt_len_tokens {
+            let denom = token_count.sqrt().max(1e-9);
+            pooled.extend(sum.iter().map(|value| value / denom));
+        }
+        if pooling.pooling_mode_weightedmean_tokens {
+            let denom = weight_total.max(1e-9);
+            pooled.extend(weighted_sum.iter().map(|value| value / denom));
+        }
+        if pooling.pooling_mode_lasttoken {
+            if let Some(token) = mask_row.iter().rposition(|value| *value != 0) {
+                let offset = (row * seq + token) * dim;
+                pooled.extend_from_slice(&hidden[offset..offset + dim]);
+            } else {
+                pooled.resize(pooled.len() + dim, 0.0);
+            }
+        }
+        rows.push(pooled);
     }
-    Ok(normalize_nested_rows(rows))
+    Ok(rows)
 }
 
-fn normalize_rows(data: &[f32], batch: usize, dim: usize) -> Vec<Vec<f32>> {
-    let rows = data
-        .chunks(dim)
-        .take(batch)
-        .map(|row| row.to_vec())
-        .collect();
-    normalize_nested_rows(rows)
-}
-
-fn normalize_nested_rows(mut rows: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
-    for row in &mut rows {
+fn normalize_nested_rows(rows: &mut [Vec<f32>]) {
+    for row in rows {
         let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
         if norm > 0.0 {
             for value in row {
@@ -246,10 +423,9 @@ fn normalize_nested_rows(mut rows: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
             }
         }
     }
-    rows
 }
 
-static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<Embedder>>>> = OnceCell::new();
+static REGISTRY: OnceLock<RwLock<HashMap<String, Arc<Embedder>>>> = OnceLock::new();
 
 fn registry() -> &'static RwLock<HashMap<String, Arc<Embedder>>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
@@ -285,18 +461,57 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
     let api = ApiBuilder::from_env()
         .build()
         .context("failed to init hf-hub api for embedder")?;
-    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+    let unpinned = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+    let modules_path = unpinned
+        .get("modules.json")
+        .with_context(|| format!("fetch Sentence Transformers modules.json for {repo_id}"))?;
+    let (snapshot_root, revision) = snapshot_from_path(&modules_path)?;
+    let repo = PinnedRepo {
+        repo: api.repo(Repo::with_revision(
+            repo_id.to_string(),
+            RepoType::Model,
+            revision.clone(),
+        )),
+        snapshot_root,
+        revision: revision.clone(),
+    };
 
-    let config_path = repo.get("config.json").context("fetch config.json")?;
-    let tokenizer_path = repo.get("tokenizer.json").context("fetch tokenizer.json")?;
-    let onnx_path = resolve_onnx_artifact(&repo, repo_id)?;
+    let modules: Vec<SentenceTransformerModule> = read_json_path(&modules_path)?;
+    let (transformer_path, pooling_path, normalize) = validate_module_graph(&modules, repo_id)?;
+    let config_file = module_file(transformer_path, "config.json");
+    let tokenizer_file = module_file(transformer_path, "tokenizer.json");
+    let sentence_config_file = module_file(transformer_path, "sentence_bert_config.json");
+    let pooling_file = module_file(pooling_path, "config.json");
 
-    let hidden_size = read_hidden_size(&config_path).unwrap_or(0);
+    let config_path = repo.get(&config_file)?;
+    let tokenizer_path = repo
+        .get(&tokenizer_file)
+        .or_else(|_| repo.get("tokenizer.json"))?;
+    let pooling: PoolingConfig = read_json_path(&repo.get(&pooling_file)?)?;
+    let hidden_size = read_required_usize(&config_path, "hidden_size")?;
+    if hidden_size != pooling.word_embedding_dimension {
+        anyhow::bail!(
+            "embedding model {repo_id} declares hidden_size {hidden_size}, but pooling expects {}",
+            pooling.word_embedding_dimension
+        );
+    }
+    let mode_count = pooling.enabled_count();
+    if mode_count == 0 {
+        anyhow::bail!("embedding model {repo_id} enables no supported pooling mode");
+    }
+    let max_length = resolve_max_length(
+        &repo,
+        &sentence_config_file,
+        &module_file(transformer_path, "tokenizer_config.json"),
+        &config_path,
+    )?;
+    let (onnx_path, onnx_artifact) = resolve_onnx_artifact(&repo, repo_id)?;
+
     let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("load tokenizer for {repo_id}: {e}"))?;
     tokenizer
         .with_truncation(Some(TruncationParams {
-            max_length: EMBED_TRUNCATION_MAX,
+            max_length,
             ..Default::default()
         }))
         .map_err(|e| anyhow::anyhow!("configure truncation: {e}"))?;
@@ -307,28 +522,246 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
         .iter()
         .map(|input| input.name().to_string())
         .collect::<Vec<_>>();
-    let output_name = session
-        .outputs()
-        .first()
-        .map(|output| output.name().to_string())
-        .ok_or_else(|| anyhow::anyhow!("ONNX model has no outputs"))?;
+    let embedding_dim = hidden_size
+        .checked_mul(mode_count)
+        .ok_or_else(|| anyhow::anyhow!("embedding dimension overflow for {repo_id}"))?;
+    let output = select_embedding_output(&session, embedding_dim)?;
+    let cache_fingerprint = embedding_fingerprint(
+        &revision,
+        &onnx_artifact,
+        &pooling,
+        normalize,
+        max_length,
+        embedding_dim,
+        &provider_id,
+    );
 
     Ok(Embedder {
         session: Mutex::new(session),
         tokenizer,
         input_names,
-        output_name,
-        hidden_size,
+        output,
+        pooling,
+        normalize,
+        embedding_dim,
+        max_length,
         model_id: repo_id.to_string(),
         provider_id,
-        model_revision: "main".to_string(),
+        cache_fingerprint,
     })
 }
 
-fn resolve_onnx_artifact(repo: &ApiRepo, repo_id: &str) -> Result<PathBuf> {
+fn snapshot_from_path(path: &Path) -> Result<(PathBuf, String)> {
+    let snapshot_root = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Hugging Face cache path has no snapshot parent"))?;
+    let snapshots_dir = snapshot_root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if snapshots_dir != Some("snapshots") {
+        anyhow::bail!(
+            "Hugging Face artifact {} is not stored in an immutable snapshot",
+            path.display()
+        );
+    }
+    let revision = snapshot_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Hugging Face snapshot has no revision"))?;
+    Ok((snapshot_root.to_path_buf(), revision.to_string()))
+}
+
+fn read_json_path<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read model metadata {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("parse model metadata {}", path.display()))
+}
+
+fn module_file(module_path: &str, filename: &str) -> String {
+    if module_path.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{module_path}/{filename}")
+    }
+}
+
+fn validate_module_graph<'a>(
+    modules: &'a [SentenceTransformerModule],
+    repo_id: &str,
+) -> Result<(&'a str, &'a str, bool)> {
+    if modules.len() < 2 || modules.len() > 3 {
+        anyhow::bail!(
+            "unsupported Sentence Transformers graph for {repo_id}: expected Transformer, Pooling, and optional Normalize"
+        );
+    }
+    for (expected, module) in modules.iter().enumerate() {
+        if module.idx != expected {
+            anyhow::bail!("unsupported non-contiguous module graph for {repo_id}");
+        }
+        let path = Path::new(&module.path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                && !module.path.is_empty()
+        {
+            anyhow::bail!(
+                "unsupported Sentence Transformers module path {:?} for {repo_id}",
+                module.path
+            );
+        }
+    }
+    if !is_standard_module(&modules[0].module_type, "Transformer")
+        || !is_standard_module(&modules[1].module_type, "Pooling")
+    {
+        anyhow::bail!(
+            "unsupported Sentence Transformers graph for {repo_id}: first modules must be Transformer and Pooling"
+        );
+    }
+    let normalize = match modules.get(2) {
+        Some(module) if is_standard_module(&module.module_type, "Normalize") => true,
+        Some(module) => anyhow::bail!(
+            "unsupported Sentence Transformers module {} for {repo_id}",
+            module.module_type
+        ),
+        None => false,
+    };
+    Ok((&modules[0].path, &modules[1].path, normalize))
+}
+
+fn is_standard_module(module_type: &str, name: &str) -> bool {
+    module_type.starts_with("sentence_transformers.models.")
+        && module_type.rsplit('.').next() == Some(name)
+}
+
+fn read_required_usize(path: &Path, key: &str) -> Result<usize> {
+    let value: serde_json::Value = read_json_path(path)?;
+    valid_usize(value.get(key))
+        .ok_or_else(|| anyhow::anyhow!("model metadata {} has no valid {key}", path.display()))
+}
+
+fn valid_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0 && *value < 1_000_000)
+}
+
+fn resolve_max_length(
+    repo: &PinnedRepo,
+    sentence_config_file: &str,
+    tokenizer_config_file: &str,
+    model_config_path: &Path,
+) -> Result<usize> {
+    let sentence = repo
+        .get(sentence_config_file)
+        .ok()
+        .map(|path| read_json_path(&path))
+        .transpose()?;
+    let tokenizer = repo
+        .get(tokenizer_config_file)
+        .ok()
+        .map(|path| read_json_path(&path))
+        .transpose()?;
+    let model = read_json_path(model_config_path)?;
+    canonical_max_length(sentence.as_ref(), tokenizer.as_ref(), &model)
+}
+
+fn canonical_max_length(
+    sentence: Option<&serde_json::Value>,
+    tokenizer: Option<&serde_json::Value>,
+    model: &serde_json::Value,
+) -> Result<usize> {
+    sentence
+        .and_then(|value| valid_usize(value.get("max_seq_length")))
+        .or_else(|| tokenizer.and_then(|value| valid_usize(value.get("model_max_length"))))
+        .or_else(|| valid_usize(model.get("max_position_embeddings")))
+        .ok_or_else(|| {
+            anyhow::anyhow!("embedding model metadata has no valid canonical maximum length")
+        })
+}
+
+fn select_embedding_output(session: &Session, embedding_dim: usize) -> Result<EmbeddingOutput> {
+    let rank = |dtype: &ValueType| match dtype {
+        ValueType::Tensor { shape, .. } => Some(shape.len()),
+        _ => None,
+    };
+    for candidate in ["token_embeddings", "last_hidden_state"] {
+        if let Some(output) = session
+            .outputs()
+            .iter()
+            .find(|output| output.name() == candidate && rank(output.dtype()) == Some(3))
+        {
+            return Ok(EmbeddingOutput::TokenEmbeddings(output.name().to_string()));
+        }
+    }
+    if let Some(output) = session
+        .outputs()
+        .iter()
+        .find(|output| output.name() == "sentence_embedding" && rank(output.dtype()) == Some(2))
+    {
+        if let ValueType::Tensor { shape, .. } = output.dtype() {
+            let declared_dim = shape.get(1).copied().unwrap_or(-1);
+            if declared_dim > 0 && declared_dim as usize != embedding_dim {
+                anyhow::bail!(
+                    "ONNX sentence_embedding width {declared_dim} does not match metadata-derived width {embedding_dim}"
+                );
+            }
+        }
+        return Ok(EmbeddingOutput::SentenceEmbedding(
+            output.name().to_string(),
+        ));
+    }
+    let outputs = session
+        .outputs()
+        .iter()
+        .map(|output| format!("{}:{:?}", output.name(), output.dtype()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "ONNX model exposes no supported named sentence or token embedding output ({outputs})"
+    )
+}
+
+fn embedding_fingerprint(
+    revision: &str,
+    artifact: &str,
+    pooling: &PoolingConfig,
+    normalize: bool,
+    max_length: usize,
+    embedding_dim: usize,
+    provider: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        EMBEDDING_PIPELINE_VERSION.to_string(),
+        revision.to_string(),
+        artifact.to_string(),
+        pooling.word_embedding_dimension.to_string(),
+        pooling.pooling_mode_cls_token.to_string(),
+        pooling.pooling_mode_max_tokens.to_string(),
+        pooling.pooling_mode_mean_tokens.to_string(),
+        pooling.pooling_mode_mean_sqrt_len_tokens.to_string(),
+        pooling.pooling_mode_weightedmean_tokens.to_string(),
+        pooling.pooling_mode_lasttoken.to_string(),
+        normalize.to_string(),
+        max_length.to_string(),
+        embedding_dim.to_string(),
+        provider.to_string(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn resolve_onnx_artifact(repo: &PinnedRepo, repo_id: &str) -> Result<(PathBuf, String)> {
     const CANDIDATES: &[&str] = &[
-        "model.onnx",
         "onnx/model.onnx",
+        "model.onnx",
         "onnx/model_quantized.onnx",
         "onnx/model_qint8_avx512.onnx",
         "onnx/model_quantized_uint8.onnx",
@@ -339,7 +772,7 @@ fn resolve_onnx_artifact(repo: &ApiRepo, repo_id: &str) -> Result<PathBuf> {
         match repo.get(candidate) {
             Ok(path) => {
                 ensure_external_onnx_data(repo, candidate);
-                return Ok(path);
+                return Ok((path, (*candidate).to_string()));
             }
             Err(err) => errors.push(format!("{candidate}: {err}")),
         }
@@ -352,18 +785,9 @@ fn resolve_onnx_artifact(repo: &ApiRepo, repo_id: &str) -> Result<PathBuf> {
     )
 }
 
-fn ensure_external_onnx_data(repo: &ApiRepo, onnx_file: &str) {
+fn ensure_external_onnx_data(repo: &PinnedRepo, onnx_file: &str) {
     let companion = format!("{onnx_file}_data");
     let _ = repo.get(&companion);
-}
-
-fn read_hidden_size(config_path: &Path) -> Option<usize> {
-    let config = std::fs::read_to_string(config_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&config).ok()?;
-    value
-        .get("hidden_size")?
-        .as_u64()
-        .map(|value| value as usize)
 }
 
 fn build_session(onnx_path: &Path) -> Result<(Session, String)> {
@@ -397,15 +821,18 @@ fn build_session(onnx_path: &Path) -> Result<(Session, String)> {
 }
 
 fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
-    let mut providers = Vec::new();
     #[cfg(target_os = "windows")]
-    {
-        providers.push(ep::DirectML::default().build());
-    }
-    providers.push(xnnpack_provider());
+    let providers = vec![ep::DirectML::default().build()];
+    #[cfg(target_os = "macos")]
+    let providers = vec![ep::CoreML::default().build()];
+    #[cfg(target_os = "linux")]
+    let providers = vec![xnnpack_provider()];
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let providers = Vec::new();
     providers
 }
 
+#[cfg(target_os = "linux")]
 fn xnnpack_provider() -> ort::ep::ExecutionProviderDispatch {
     let provider = if let Some(threads) = embedding_threads().and_then(NonZeroUsize::new) {
         ep::XNNPACK::default().with_intra_op_num_threads(threads)
@@ -416,11 +843,14 @@ fn xnnpack_provider() -> ort::ep::ExecutionProviderDispatch {
 }
 
 fn planned_provider_id() -> String {
-    let mut providers = Vec::new();
     #[cfg(target_os = "windows")]
-    providers.push("DmlExecutionProvider");
-    providers.push("XnnpackExecutionProvider");
-    providers.push("CPUExecutionProvider");
+    let providers = ["DmlExecutionProvider", "CPUExecutionProvider"];
+    #[cfg(target_os = "macos")]
+    let providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"];
+    #[cfg(target_os = "linux")]
+    let providers = ["XnnpackExecutionProvider", "CPUExecutionProvider"];
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let providers = ["CPUExecutionProvider"];
     providers.join("+")
 }
 
@@ -431,17 +861,6 @@ fn embedding_threads() -> Option<usize> {
         .filter(|threads| *threads > 0)
 }
 
-/// Sorted list of loaded embedder repo ids. Mirrors `tokenizer::loaded_model_ids`
-/// for the prefetch/introspection PyO3 surface.
-pub fn loaded_embedder_ids() -> Vec<String> {
-    let Ok(map) = registry().read() else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = map.keys().cloned().collect();
-    ids.sort();
-    ids
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,13 +868,37 @@ mod tests {
 
     use tokenizers::models::wordlevel::WordLevel;
 
+    fn mean_pooling() -> PoolingConfig {
+        PoolingConfig {
+            word_embedding_dimension: 2,
+            pooling_mode_cls_token: false,
+            pooling_mode_max_tokens: false,
+            pooling_mode_mean_tokens: true,
+            pooling_mode_mean_sqrt_len_tokens: false,
+            pooling_mode_weightedmean_tokens: false,
+            pooling_mode_lasttoken: false,
+        }
+    }
+
     #[test]
     fn mean_pool_normalize_matches_hand_computation() {
         // batch=1, seq=2, dim=2. Second token masked out, so the pooled vector
         // equals the first token's vector, then L2-normalized.
         let hidden = vec![3.0_f32, 4.0, 100.0, 100.0];
         let mask = vec![1_i64, 0];
-        let out = mean_pool_normalize(&hidden, 1, 2, 2, &mask).unwrap();
+        let out = embeddings_from_output(
+            &EmbeddingOutput::TokenEmbeddings("last_hidden_state".to_string()),
+            &mean_pooling(),
+            true,
+            OutputBatch {
+                dims: &[1, 2, 2],
+                data: &hidden,
+                batch: 1,
+                sequence_length: 2,
+                attention_mask: &mask,
+            },
+        )
+        .unwrap();
         let row = &out[0];
         assert!((row[0] - 0.6).abs() < 1e-5, "got {}", row[0]);
         assert!((row[1] - 0.8).abs() < 1e-5, "got {}", row[1]);
@@ -463,17 +906,76 @@ mod tests {
 
     #[test]
     fn embeddings_from_2d_output_normalizes_rows() {
-        let out = embeddings_from_output(&[1, 2], &[3.0, 4.0], 1, 1, &[1]).unwrap();
+        let out = embeddings_from_output(
+            &EmbeddingOutput::SentenceEmbedding("sentence_embedding".to_string()),
+            &mean_pooling(),
+            true,
+            OutputBatch {
+                dims: &[1, 2],
+                data: &[3.0, 4.0],
+                batch: 1,
+                sequence_length: 1,
+                attention_mask: &[1],
+            },
+        )
+        .unwrap();
         assert!((out[0][0] - 0.6).abs() < 1e-5, "got {}", out[0][0]);
         assert!((out[0][1] - 0.8).abs() < 1e-5, "got {}", out[0][1]);
     }
 
     #[test]
-    fn loaded_embedder_ids_is_sorted() {
-        let ids = loaded_embedder_ids();
-        let mut sorted = ids.clone();
-        sorted.sort();
-        assert_eq!(ids, sorted);
+    fn embeddings_from_2d_output_rejects_metadata_width_mismatch() {
+        let error = embeddings_from_output(
+            &EmbeddingOutput::SentenceEmbedding("sentence_embedding".to_string()),
+            &mean_pooling(),
+            false,
+            OutputBatch {
+                dims: &[1, 3],
+                data: &[1.0, 2.0, 3.0],
+                batch: 1,
+                sequence_length: 1,
+                attention_mask: &[1],
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("metadata-derived width"));
+    }
+
+    #[test]
+    fn pooling_concatenates_standard_modes_in_sentence_transformers_order() {
+        let pooling = PoolingConfig {
+            word_embedding_dimension: 2,
+            pooling_mode_cls_token: true,
+            pooling_mode_max_tokens: true,
+            pooling_mode_mean_tokens: true,
+            pooling_mode_mean_sqrt_len_tokens: true,
+            pooling_mode_weightedmean_tokens: true,
+            pooling_mode_lasttoken: true,
+        };
+        let row = pool_token_embeddings(&[1.0, 2.0, 3.0, 4.0], 1, 2, 2, &[1, 1], &pooling)
+            .unwrap()
+            .remove(0);
+
+        let expected = [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            2.0,
+            3.0,
+            4.0 / 2.0_f32.sqrt(),
+            6.0 / 2.0_f32.sqrt(),
+            7.0 / 3.0,
+            10.0 / 3.0,
+            3.0,
+            4.0,
+        ];
+        assert!(
+            row.iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-5),
+            "got {row:?}"
+        );
     }
 
     #[test]
@@ -495,5 +997,65 @@ mod tests {
         assert_eq!(tokenizer.encode("hello", false).unwrap().get_ids().len(), 8);
         let sizing = tokenizer_for_sizing(&tokenizer);
         assert_eq!(sizing.encode("hello", false).unwrap().get_ids().len(), 1);
+    }
+
+    #[test]
+    fn sentence_transformer_max_length_has_precedence() {
+        let sentence = serde_json::json!({"max_seq_length": 256});
+        let tokenizer = serde_json::json!({"model_max_length": 384});
+        let model = serde_json::json!({"max_position_embeddings": 512});
+        assert_eq!(
+            canonical_max_length(Some(&sentence), Some(&tokenizer), &model).unwrap(),
+            256
+        );
+        assert_eq!(
+            canonical_max_length(None, Some(&tokenizer), &model).unwrap(),
+            384
+        );
+        assert!(canonical_max_length(None, None, &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn module_graph_rejects_dense_and_non_contiguous_modules() {
+        let transformer = SentenceTransformerModule {
+            idx: 0,
+            path: String::new(),
+            module_type: "sentence_transformers.models.Transformer".to_string(),
+        };
+        let pooling = SentenceTransformerModule {
+            idx: 1,
+            path: "1_Pooling".to_string(),
+            module_type: "sentence_transformers.models.Pooling".to_string(),
+        };
+        assert!(validate_module_graph(&[transformer.clone(), pooling.clone()], "test").is_ok());
+
+        let dense = SentenceTransformerModule {
+            idx: 2,
+            path: "2_Dense".to_string(),
+            module_type: "sentence_transformers.models.Dense".to_string(),
+        };
+        assert!(
+            validate_module_graph(&[transformer.clone(), pooling.clone(), dense], "test")
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+
+        let mut non_contiguous = pooling;
+        non_contiguous.idx = 3;
+        assert!(validate_module_graph(&[transformer, non_contiguous], "test").is_err());
+    }
+
+    #[test]
+    fn embedding_fingerprint_changes_with_revision_and_provider() {
+        let pooling = mean_pooling();
+        let first =
+            embedding_fingerprint("sha-a", "onnx/model.onnx", &pooling, true, 256, 2, "cpu");
+        let revision =
+            embedding_fingerprint("sha-b", "onnx/model.onnx", &pooling, true, 256, 2, "cpu");
+        let provider =
+            embedding_fingerprint("sha-a", "onnx/model.onnx", &pooling, true, 256, 2, "coreml");
+        assert_ne!(first, revision);
+        assert_ne!(first, provider);
     }
 }

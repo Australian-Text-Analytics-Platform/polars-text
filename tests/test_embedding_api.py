@@ -1,17 +1,55 @@
 from __future__ import annotations
 
+import inspect
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import polars as pl
 import polars_text
-from polars_text import functions
+import pytest
+from polars_text import _expressions
+from polars_text.namespace import TextNamespace
 from polars_text.utils import PLUGIN_PATH
 
 
-def test_embedding_is_exported_from_package() -> None:
-    assert polars_text.embedding is functions.embedding
+def test_expression_operations_are_namespace_only() -> None:
+    removed = {
+        "tokenize",
+        "concordance",
+        "clean_text",
+        "word_count",
+        "char_count",
+        "sentence_count",
+        "embedding",
+        "topic_modeling",
+        "compiled_features",
+    }
+    assert removed.isdisjoint(polars_text.__all__)
+    assert all(not hasattr(polars_text, name) for name in removed)
+    with pytest.raises(ImportError):
+        __import__("polars_text.functions")
+
+
+def test_namespace_signatures_match_the_public_contract() -> None:
+    assert str(inspect.signature(TextNamespace.tokenize)) == (
+        "(self, *, model: 'str', lowercase: 'bool' = True, "
+        "remove_punctuation: 'bool' = True, cache: 'str | os.PathLike[str] | None' = None) "
+        "-> 'pl.Expr'"
+    )
+    assert str(inspect.signature(TextNamespace.concordance)) == (
+        "(self, query: 'str', *, left_tokens: 'int' = 5, right_tokens: 'int' = 5, "
+        "regex: 'bool' = False, case_sensitive: 'bool' = False, "
+        "ignore_punctuation: 'bool' = False) -> 'pl.Expr'"
+    )
+    assert str(inspect.signature(TextNamespace.topic_modeling)) == (
+        "(self, *, embedding_model: 'str | None' = None, "
+        "embedding_cache: 'str | os.PathLike[str] | None' = None, "
+        "segmentation: \"Literal['automatic', 'line', 'sentence']\" = 'automatic', "
+        "max_tokens: 'int' = 256, seed: 'int' = 42, "
+        "min_topic_size: 'int' = 10, tokenizer_model: 'str | None' = None, "
+        "lowercase: 'bool' = True) -> 'pl.Expr'"
+    )
 
 
 def test_plugin_path_points_to_imported_extension() -> None:
@@ -20,121 +58,58 @@ def test_plugin_path_points_to_imported_extension() -> None:
     assert any(str(PLUGIN_PATH).endswith(suffix) for suffix in EXTENSION_SUFFIXES)
 
 
-def test_embedding_registers_plugin_kwargs(monkeypatch: Any, tmp_path: Path) -> None:
+def test_embedding_registers_validated_plugin_kwargs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     calls: list[dict[str, Any]] = []
-
-    def fake_register_plugin_function(**kwargs: Any) -> pl.Expr:
-        calls.append(kwargs)
-        return pl.lit([0.0])
-
+    monkeypatch.setattr(_expressions, "compiled_features", lambda: {"embedding"})
     monkeypatch.setattr(
-        functions, "register_plugin_function", fake_register_plugin_function
+        _expressions,
+        "register_plugin_function",
+        lambda **kwargs: calls.append(kwargs) or pl.lit([0.0]),
     )
 
     cache_path = tmp_path / "embeddings.duckdb"
-
-    expr = functions.embedding(
-        "text",
-        embedder_model="onnx-community/all-MiniLM-L6-v2-ONNX",
+    expr = cast(Any, pl.col("text")).text.embedding(
+        model=" onnx-community/all-MiniLM-L6-v2-ONNX ",
         cache=cache_path,
         batch_size=16,
     )
 
     assert isinstance(expr, pl.Expr)
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["function_name"] == "embedding"
-    assert call["is_elementwise"] is True
-    assert call["kwargs"] == {
+    assert calls[0]["kwargs"] == {
         "embedder_model": "onnx-community/all-MiniLM-L6-v2-ONNX",
         "cache": str(cache_path),
         "batch_size": 16,
     }
+    with pytest.raises(ValueError, match="batch_size"):
+        cast(Any, pl.col("text")).text.embedding(batch_size=0)
 
 
-def test_embedding_namespace_delegates_to_function(
-    monkeypatch: Any, tmp_path: Path
+def test_topic_modeling_registers_only_the_supported_fit_controls(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
-
-    def fake_embedding(expr: pl.Expr, **kwargs: Any) -> pl.Expr:
-        calls.append({"expr": expr, **kwargs})
-        return pl.lit([0.0])
-
-    monkeypatch.setattr(functions, "embedding", fake_embedding)
-
-    cache_path = tmp_path / "embeddings.duckdb"
-    text_namespace = getattr(pl.col("text"), "text")
-    expr = text_namespace.embedding(
-        embedder_model="onnx-community/all-MiniLM-L6-v2-ONNX",
-        cache=cache_path,
-        batch_size=32,
-    )
-
-    assert isinstance(expr, pl.Expr)
-    assert len(calls) == 1
-    assert calls[0]["embedder_model"] == "onnx-community/all-MiniLM-L6-v2-ONNX"
-    assert calls[0]["cache"] == cache_path
-    assert calls[0]["batch_size"] == 32
-
-
-def test_topic_modeling_registers_pipeline_kwargs(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def fake_register_plugin_function(**kwargs: Any) -> pl.Expr:
-        calls.append(kwargs)
-        return pl.lit([0])
-
+    monkeypatch.setattr(_expressions, "compiled_features", lambda: {"topic-modeling"})
     monkeypatch.setattr(
-        functions, "register_plugin_function", fake_register_plugin_function
+        _expressions,
+        "register_plugin_function",
+        lambda **kwargs: calls.append(kwargs) or pl.lit([0]),
     )
 
-    cache_path = tmp_path / "embeddings.duckdb"
-    expr = functions.topic_modeling(
-        "text",
-        cache=cache_path,
-        segmentation_method="paragraph",
-        max_tokens=64,
-        overlap=8,
+    cast(Any, pl.col("text")).text.topic_modeling(
+        segmentation="line", max_tokens=80, seed=7, min_topic_size=2
     )
 
-    assert isinstance(expr, pl.Expr)
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["function_name"] == "topic_modeling"
-    assert call["kwargs"]["cache"] == str(cache_path)
-    assert call["kwargs"]["segmentation_method"] == "paragraph"
-    assert call["kwargs"]["max_tokens"] == 64
-    assert call["kwargs"]["overlap"] == 8
-    assert call["is_elementwise"] is False
-    assert call["returns_scalar"] is True
-
-
-def test_topic_modeling_namespace_delegates_pipeline_kwargs(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def fake_topic_modeling(expr: pl.Expr, **kwargs: Any) -> pl.Expr:
-        calls.append({"expr": expr, **kwargs})
-        return pl.lit([0])
-
-    monkeypatch.setattr(functions, "topic_modeling", fake_topic_modeling)
-
-    cache_path = tmp_path / "embeddings.duckdb"
-    text_namespace = getattr(pl.col("text"), "text")
-    expr = text_namespace.topic_modeling(
-        cache=cache_path,
-        segmentation_method="sentence",
-        max_tokens=96,
-        overlap=12,
-    )
-
-    assert isinstance(expr, pl.Expr)
-    assert len(calls) == 1
-    assert calls[0]["cache"] == cache_path
-    assert calls[0]["segmentation_method"] == "sentence"
-    assert calls[0]["max_tokens"] == 96
-    assert calls[0]["overlap"] == 12
+    assert calls[0]["kwargs"] == {
+        "embedder_model": None,
+        "cache": None,
+        "segmentation_method": "line",
+        "max_tokens": 80,
+        "seed": 7,
+        "min_cluster_size": 2,
+        "vectorizer_model": None,
+        "lowercase": True,
+    }
+    with pytest.raises(ValueError, match="automatic.*line.*sentence"):
+        cast(Any, pl.col("text")).text.topic_modeling(segmentation="paragraph")

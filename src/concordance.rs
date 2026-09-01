@@ -1,5 +1,5 @@
 use crate::offsets::byte_spans_to_char_spans;
-use crate::tokenizer::{tokenize_plain_text, tokenize_plain_text_with_offsets};
+use crate::tokenizer::tokenize_plain_text_with_offsets;
 use anyhow::Result;
 use polars::prelude::*;
 use regex::RegexBuilder;
@@ -13,7 +13,7 @@ pub struct ConcordanceKwargs {
     pub regex: bool,
     pub case_sensitive: bool,
     #[serde(default)]
-    pub remove_punct: bool,
+    pub ignore_punctuation: bool,
 }
 
 pub fn list_struct_output(input_fields: &[Field]) -> PolarsResult<Field> {
@@ -35,8 +35,8 @@ pub fn concordance_struct_type() -> DataType {
     ])
 }
 
-fn empty_struct_series() -> Series {
-    let fields = vec![
+fn empty_struct_series() -> PolarsResult<Series> {
+    let fields = [
         Series::new("left_context".into(), Vec::<String>::new()),
         Series::new("matched_text".into(), Vec::<String>::new()),
         Series::new("right_context".into(), Vec::<String>::new()),
@@ -45,64 +45,150 @@ fn empty_struct_series() -> Series {
         Series::new("l1".into(), Vec::<String>::new()),
         Series::new("r1".into(), Vec::<String>::new()),
     ];
-    StructChunked::from_series(PlSmallStr::EMPTY, 0, fields.iter())
-        .expect("empty struct build should succeed")
-        .into_series()
+    Ok(StructChunked::from_series(PlSmallStr::EMPTY, 0, fields.iter())?.into_series())
 }
 
-fn detokenize(tokens: &[String]) -> String {
-    if tokens.is_empty() {
-        return String::new();
+#[derive(Debug)]
+struct SourceToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn source_tokens(text: &str, ignore_punctuation: bool) -> Result<Vec<SourceToken>> {
+    let char_count = text.chars().count();
+    tokenize_plain_text_with_offsets(text, false, ignore_punctuation)
+        .into_iter()
+        .map(|(token, start, end)| {
+            let start = usize::try_from(start)
+                .map_err(|_| anyhow::anyhow!("tokenizer returned a negative start offset"))?;
+            let end = usize::try_from(end)
+                .map_err(|_| anyhow::anyhow!("tokenizer returned a negative end offset"))?;
+            if start > end || end > char_count {
+                anyhow::bail!(
+                    "tokenizer returned invalid character span {start}..{end} for {char_count} characters"
+                );
+            }
+            Ok(SourceToken {
+                text: token,
+                start,
+                end,
+            })
+        })
+        .collect()
+}
+
+fn offset_fragment_tokens(
+    fragment: &str,
+    start_offset: usize,
+    ignore_punctuation: bool,
+) -> Result<Vec<SourceToken>> {
+    let mut tokens = source_tokens(fragment, ignore_punctuation)?;
+    for token in &mut tokens {
+        token.start += start_offset;
+        token.end += start_offset;
     }
-    tokens.join(" ")
+    Ok(tokens)
 }
 
-fn char_offset_to_byte_offset(text: &str, char_offset: i64) -> usize {
-    if char_offset <= 0 {
-        return 0;
-    }
-
-    text.char_indices()
-        .nth(char_offset as usize)
-        .map_or(text.len(), |(byte_offset, _)| byte_offset)
+struct ContextWindow {
+    context_start: Option<usize>,
+    context_end: Option<usize>,
+    adjacent_left: String,
+    adjacent_right: String,
 }
 
-fn raw_context_windows(
-    left_text: &str,
-    right_text: &str,
-    left_take: usize,
-    right_take: usize,
-) -> (String, String, String, String) {
-    let left_tokens = tokenize_plain_text_with_offsets(left_text, false, true);
-    let right_tokens = tokenize_plain_text_with_offsets(right_text, false, true);
+struct ContextRequest<'a> {
+    text: &'a str,
+    char_to_byte: &'a [usize],
+    tokens: &'a [SourceToken],
+    match_chars: (usize, usize),
+    complete_tokens: (usize, usize),
+    take: (usize, usize),
+    ignore_punctuation: bool,
+}
 
-    let left_start = left_tokens.len().saturating_sub(left_take);
-    let left_slice = if left_take == 0 {
-        &left_tokens[0..0]
+fn raw_context_window(request: ContextRequest<'_>) -> Result<ContextWindow> {
+    let ContextRequest {
+        text,
+        char_to_byte,
+        tokens,
+        match_chars: (start_char, end_char),
+        complete_tokens: (left_complete_end, right_complete_start),
+        take: (left_take, right_take),
+        ignore_punctuation,
+    } = request;
+    let left_fragment = tokens
+        .get(left_complete_end)
+        .filter(|token| token.start < start_char && start_char < token.end)
+        .map_or(Ok(Vec::new()), |token| {
+            let fragment = &text[char_to_byte[token.start]..char_to_byte[start_char]];
+            offset_fragment_tokens(fragment, token.start, ignore_punctuation)
+        })?;
+    let left_fragment_take = left_take.min(left_fragment.len());
+    let left_full_take = left_take.saturating_sub(left_fragment_take);
+    let left_full_start = left_complete_end.saturating_sub(left_full_take);
+    let context_start = if left_take == 0 {
+        None
+    } else if left_full_start < left_complete_end {
+        Some(tokens[left_full_start].start)
     } else {
-        &left_tokens[left_start..]
+        left_fragment
+            .get(left_fragment.len().saturating_sub(left_fragment_take))
+            .map(|token| token.start)
     };
-    let right_end = right_take.min(right_tokens.len());
-    let right_slice = &right_tokens[..right_end];
+    let adjacent_left = if left_fragment_take > 0 {
+        left_fragment
+            .last()
+            .map(|token| token.text.clone())
+            .unwrap_or_default()
+    } else {
+        tokens
+            .get(left_complete_end.saturating_sub(1))
+            .filter(|_| left_full_take > 0)
+            .map(|token| token.text.clone())
+            .unwrap_or_default()
+    };
 
-    let left_context = left_slice
-        .first()
-        .map_or_else(String::new, |(_, start, _)| {
-            left_text[char_offset_to_byte_offset(left_text, *start)..].to_string()
-        });
-    let right_context = right_slice.last().map_or_else(String::new, |(_, _, end)| {
-        right_text[..char_offset_to_byte_offset(right_text, *end)].to_string()
-    });
-    let l1 = left_slice
-        .last()
-        .map(|(token, _, _)| token.clone())
-        .unwrap_or_default();
-    let r1 = right_slice
-        .first()
-        .map(|(token, _, _)| token.clone())
-        .unwrap_or_default();
+    let right_intersecting = right_complete_start
+        .checked_sub(1)
+        .and_then(|index| tokens.get(index))
+        .filter(|token| token.start < end_char && end_char < token.end);
+    let right_fragment = right_intersecting.map_or(Ok(Vec::new()), |token| {
+        let fragment = &text[char_to_byte[end_char]..char_to_byte[token.end]];
+        offset_fragment_tokens(fragment, end_char, ignore_punctuation)
+    })?;
+    let right_fragment_take = right_take.min(right_fragment.len());
+    let right_full_take = right_take.saturating_sub(right_fragment_take);
+    let right_full_end = (right_complete_start + right_full_take).min(tokens.len());
+    let context_end = if right_take == 0 {
+        None
+    } else if right_full_end > right_complete_start {
+        Some(tokens[right_full_end - 1].end)
+    } else {
+        right_fragment
+            .get(right_fragment_take.saturating_sub(1))
+            .map(|token| token.end)
+    };
+    let adjacent_right = if right_fragment_take > 0 {
+        right_fragment
+            .first()
+            .map(|token| token.text.clone())
+            .unwrap_or_default()
+    } else {
+        tokens
+            .get(right_complete_start)
+            .filter(|_| right_full_take > 0)
+            .map(|token| token.text.clone())
+            .unwrap_or_default()
+    };
 
-    (left_context, right_context, l1, r1)
+    Ok(ContextWindow {
+        context_start,
+        context_end,
+        adjacent_left,
+        adjacent_right,
+    })
 }
 
 pub fn concordance_for_text(text: &str, kwargs: &ConcordanceKwargs) -> Result<Vec<Series>> {
@@ -138,48 +224,63 @@ pub fn concordance_for_text(text: &str, kwargs: &ConcordanceKwargs) -> Result<Ve
         .collect();
 
     let char_spans = byte_spans_to_char_spans(text, hits.iter().map(|(s, e, _)| (*s, *e)));
+    let tokens = source_tokens(text, kwargs.ignore_punctuation)?;
+    let char_to_byte = text
+        .char_indices()
+        .map(|(byte_offset, _)| byte_offset)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut left_complete_end = 0;
+    let mut right_complete_start = 0;
 
-    for ((start_byte, end_byte, matched), (start_idx, end_idx)) in
-        hits.iter().zip(char_spans.into_iter())
-    {
+    for ((start_byte, end_byte, matched), (start_idx, end_idx)) in hits.iter().zip(char_spans) {
         let start_byte = *start_byte;
         let end_byte = *end_byte;
+        let start_char = usize::try_from(start_idx)
+            .map_err(|_| anyhow::anyhow!("negative concordance start offset"))?;
+        let end_char = usize::try_from(end_idx)
+            .map_err(|_| anyhow::anyhow!("negative concordance end offset"))?;
 
-        let left_text = &text[..start_byte];
-        let right_text = &text[end_byte..];
+        while tokens
+            .get(left_complete_end)
+            .is_some_and(|token| token.end <= start_char)
+        {
+            left_complete_end += 1;
+        }
+        right_complete_start = right_complete_start.max(left_complete_end);
+        while tokens
+            .get(right_complete_start)
+            .is_some_and(|token| token.start < end_char)
+        {
+            right_complete_start += 1;
+        }
 
         let left_take = kwargs.num_left_tokens.max(0) as usize;
         let right_take = kwargs.num_right_tokens.max(0) as usize;
 
-        let (left_context, right_context, l1, r1) = if kwargs.remove_punct {
-            raw_context_windows(left_text, right_text, left_take, right_take)
-        } else {
-            let left_tokens = tokenize_plain_text(left_text, false, false);
-            let right_tokens = tokenize_plain_text(right_text, false, false);
-            let left_start = left_tokens.len().saturating_sub(left_take);
-            let left_slice = if left_take == 0 {
-                &left_tokens[0..0]
-            } else {
-                &left_tokens[left_start..]
-            };
-            let right_end = right_take.min(right_tokens.len());
-            let right_slice = &right_tokens[..right_end];
-
-            (
-                detokenize(left_slice),
-                detokenize(right_slice),
-                left_slice.last().cloned().unwrap_or_default(),
-                right_slice.first().cloned().unwrap_or_default(),
-            )
-        };
+        let window = raw_context_window(ContextRequest {
+            text,
+            char_to_byte: &char_to_byte,
+            tokens: &tokens,
+            match_chars: (start_char, end_char),
+            complete_tokens: (left_complete_end, right_complete_start),
+            take: (left_take, right_take),
+            ignore_punctuation: kwargs.ignore_punctuation,
+        })?;
+        let left_context = window.context_start.map_or_else(String::new, |start| {
+            text[char_to_byte[start]..start_byte].to_string()
+        });
+        let right_context = window.context_end.map_or_else(String::new, |end| {
+            text[end_byte..char_to_byte[end]].to_string()
+        });
 
         left_contexts.push(left_context);
         matched_texts.push(matched.clone());
         right_contexts.push(right_context);
         start_indices.push(start_idx);
         end_indices.push(end_idx);
-        l1_vals.push(l1);
-        r1_vals.push(r1);
+        l1_vals.push(window.adjacent_left);
+        r1_vals.push(window.adjacent_right);
     }
 
     if matched_texts.is_empty() {
@@ -199,25 +300,10 @@ pub fn concordance_for_text(text: &str, kwargs: &ConcordanceKwargs) -> Result<Ve
     Ok(series)
 }
 
-pub fn struct_series_from_matches(matches: Vec<Series>) -> Series {
+pub fn struct_series_from_matches(matches: Vec<Series>) -> PolarsResult<Series> {
     if matches.is_empty() {
         return empty_struct_series();
     }
     let length = matches.first().map(|series| series.len()).unwrap_or(0);
-    StructChunked::from_series(PlSmallStr::EMPTY, length, matches.iter())
-        .expect("struct build should succeed")
-        .into_series()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_detokenize() {
-        assert_eq!(detokenize(&[]), "");
-
-        let tokens = vec!["hello".to_string(), "world".to_string()];
-        assert_eq!(detokenize(&tokens), "hello world");
-    }
+    Ok(StructChunked::from_series(PlSmallStr::EMPTY, length, matches.iter())?.into_series())
 }

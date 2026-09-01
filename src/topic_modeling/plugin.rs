@@ -5,32 +5,29 @@
 //! separate nested lists; topic metadata is never inferred from dominant-topic
 //! rows.
 
-use polars::chunked_array::builder::{AnonymousOwnedListBuilder, ListBuilderTrait};
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
 use serde::Deserialize;
 
 use super::{run, RunConfig, TopicModelingResult};
+use crate::list_output::list_from_spans;
 
 #[derive(Deserialize)]
 struct TopicModelingKwargs {
     embedder_model: Option<String>,
     cache: Option<String>,
-    segmentation_method: super::chunking::SegmentationMethod,
+    segmentation_method: super::segmentation::SegmentationMethod,
     max_tokens: usize,
-    overlap: usize,
-    reduce_dims: usize,
     seed: u64,
     min_cluster_size: usize,
-    min_samples: Option<usize>,
     vectorizer_model: Option<String>,
     lowercase: bool,
 }
 
-fn distribution_struct_type() -> DataType {
+fn coverage_struct_type() -> DataType {
     DataType::Struct(vec![
         Field::new("topic_id".into(), DataType::Int32),
-        Field::new("proportion".into(), DataType::Float32),
+        Field::new("coverage".into(), DataType::Float32),
     ])
 }
 
@@ -39,8 +36,8 @@ fn document_struct_type() -> DataType {
         Field::new("doc_index".into(), DataType::UInt32),
         Field::new("dominant_topic".into(), DataType::Int32),
         Field::new(
-            "topic_distribution".into(),
-            DataType::List(Box::new(distribution_struct_type())),
+            "topic_coverage".into(),
+            DataType::List(Box::new(coverage_struct_type())),
         ),
     ])
 }
@@ -64,13 +61,6 @@ fn topic_struct_type() -> DataType {
     ])
 }
 
-fn stage_timing_struct_type() -> DataType {
-    DataType::Struct(vec![
-        Field::new("stage".into(), DataType::String),
-        Field::new("elapsed_ms".into(), DataType::Float64),
-    ])
-}
-
 fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
     let dtype = DataType::Struct(vec![
         Field::new(
@@ -81,13 +71,8 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
             "topics".into(),
             DataType::List(Box::new(topic_struct_type())),
         ),
-        Field::new("n_chunks".into(), DataType::UInt32),
-        Field::new("truncated_segment_count".into(), DataType::UInt32),
-        Field::new("clustering_context".into(), DataType::Binary),
-        Field::new(
-            "stage_timings_ms".into(),
-            DataType::List(Box::new(stage_timing_struct_type())),
-        ),
+        Field::new("n_segments".into(), DataType::UInt32),
+        Field::new("projection_context".into(), DataType::Binary),
     ]);
     Ok(Field::new(input_fields[0].name().clone(), dtype))
 }
@@ -96,50 +81,33 @@ fn build_list_from_spans(
     name: &str,
     inner: &Series,
     spans: &[(usize, usize)],
-    inner_type: DataType,
+    _inner_type: DataType,
 ) -> PolarsResult<Series> {
-    let mut builder = AnonymousOwnedListBuilder::new(name.into(), spans.len(), Some(inner_type));
-    for &(start, end) in spans {
-        if start == end {
-            builder.append_empty();
-        } else {
-            builder.append_series(&inner.slice(start as i64, end - start))?;
-        }
-    }
-    Ok(builder.finish().into_series())
+    list_from_spans(name.into(), inner, spans)
 }
 
 fn build_single_list(name: &str, inner: &Series, inner_type: DataType) -> PolarsResult<Series> {
-    let mut builder = AnonymousOwnedListBuilder::new(name.into(), 1, Some(inner_type));
-    if inner.is_empty() {
-        builder.append_empty();
-    } else {
-        builder.append_series(inner)?;
-    }
-    Ok(builder.finish().into_series())
+    build_list_from_spans(name, inner, &[(0, inner.len())], inner_type)
 }
 
 #[polars_expr(output_type_func=topic_modeling_output)]
 pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let documents: Vec<String> = ca
-        .into_iter()
-        .map(|opt| opt.unwrap_or("").to_string())
-        .collect();
+    let documents = ca
+        .iter()
+        .map(|value| value.unwrap_or(""))
+        .collect::<Vec<_>>();
 
     let cfg = RunConfig {
         embedder_repo_id: kwargs.embedder_model,
         embedding_cache_path: kwargs.cache,
-        chunking: super::chunking::ChunkingConfig {
+        segmentation: super::segmentation::SegmentationConfig {
             method: kwargs.segmentation_method,
             max_tokens: kwargs.max_tokens,
-            overlap: kwargs.overlap,
         },
-        reduce_dims: kwargs.reduce_dims,
         seed: kwargs.seed,
         cluster: super::cluster::ClusterConfig {
             min_cluster_size: kwargs.min_cluster_size,
-            min_samples: kwargs.min_samples,
         },
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
@@ -156,32 +124,32 @@ fn topic_modeling_result_to_series(
     name: PlSmallStr,
     result: &TopicModelingResult,
 ) -> PolarsResult<Series> {
-    let mut distribution_topic_ids = Vec::new();
-    let mut distribution_proportions = Vec::new();
-    let mut distribution_spans = Vec::with_capacity(result.documents.len());
+    let mut coverage_topic_ids = Vec::new();
+    let mut coverage_values = Vec::new();
+    let mut coverage_spans = Vec::with_capacity(result.documents.len());
     for document in &result.documents {
-        let start = distribution_topic_ids.len();
-        for &(topic_id, proportion) in &document.topic_distribution {
-            distribution_topic_ids.push(topic_id);
-            distribution_proportions.push(proportion);
+        let start = coverage_topic_ids.len();
+        for &(topic_id, coverage) in &document.topic_coverage {
+            coverage_topic_ids.push(topic_id);
+            coverage_values.push(coverage);
         }
-        distribution_spans.push((start, distribution_topic_ids.len()));
+        coverage_spans.push((start, coverage_topic_ids.len()));
     }
-    let distribution_inner = StructChunked::from_series(
+    let coverage_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
-        distribution_topic_ids.len(),
+        coverage_topic_ids.len(),
         [
-            Series::new("topic_id".into(), distribution_topic_ids),
-            Series::new("proportion".into(), distribution_proportions),
+            Series::new("topic_id".into(), coverage_topic_ids),
+            Series::new("coverage".into(), coverage_values),
         ]
         .iter(),
     )?
     .into_series();
-    let distributions = build_list_from_spans(
-        "topic_distribution",
-        &distribution_inner,
-        &distribution_spans,
-        distribution_struct_type(),
+    let coverage = build_list_from_spans(
+        "topic_coverage",
+        &coverage_inner,
+        &coverage_spans,
+        coverage_struct_type(),
     )?;
     let document_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
@@ -192,8 +160,12 @@ fn topic_modeling_result_to_series(
                 result
                     .documents
                     .iter()
-                    .map(|document| document.doc_index as u32)
-                    .collect::<Vec<_>>(),
+                    .map(|document| {
+                        u32::try_from(document.doc_index).map_err(|_| {
+                            PolarsError::ComputeError("Topic document index exceeds UInt32".into())
+                        })
+                    })
+                    .collect::<PolarsResult<Vec<_>>>()?,
             ),
             Series::new(
                 "dominant_topic".into(),
@@ -203,7 +175,7 @@ fn topic_modeling_result_to_series(
                     .map(|document| document.dominant_topic)
                     .collect::<Vec<_>>(),
             ),
-            distributions,
+            coverage,
         ]
         .iter(),
     )?
@@ -217,7 +189,9 @@ fn topic_modeling_result_to_series(
         let start = words.len();
         for representative_word in &topic.representative_words {
             words.push(representative_word.word.as_str());
-            occurrence_counts.push(representative_word.occurrence_count as u64);
+            occurrence_counts.push(u64::try_from(representative_word.occurrence_count).map_err(
+                |_| PolarsError::ComputeError("Topic word count exceeds UInt64".into()),
+            )?);
         }
         word_spans.push((start, words.len()));
     }
@@ -272,49 +246,16 @@ fn topic_modeling_result_to_series(
     .into_series();
     let topic_list = build_single_list("topics", &topic_inner, topic_struct_type())?;
 
-    let timing_inner = StructChunked::from_series(
-        PlSmallStr::EMPTY,
-        result.stage_timings_ms.len(),
-        [
-            Series::new(
-                "stage".into(),
-                result
-                    .stage_timings_ms
-                    .iter()
-                    .map(|timing| timing.stage.as_str())
-                    .collect::<Vec<_>>(),
-            ),
-            Series::new(
-                "elapsed_ms".into(),
-                result
-                    .stage_timings_ms
-                    .iter()
-                    .map(|timing| timing.elapsed_ms)
-                    .collect::<Vec<_>>(),
-            ),
-        ]
-        .iter(),
-    )?
-    .into_series();
-    let timing_list = build_single_list(
-        "stage_timings_ms",
-        &timing_inner,
-        stage_timing_struct_type(),
-    )?;
-
+    let n_segments = u32::try_from(result.n_segments)
+        .map_err(|_| PolarsError::ComputeError("Topic Segment count exceeds UInt32".into()))?;
     let fields = [
         document_list,
         topic_list,
-        Series::new("n_chunks".into(), [result.n_chunks as u32]),
+        Series::new("n_segments".into(), [n_segments]),
         Series::new(
-            "truncated_segment_count".into(),
-            [result.truncated_segment_count as u32],
+            "projection_context".into(),
+            [result.projection_context.as_deref()],
         ),
-        Series::new(
-            "clustering_context".into(),
-            [result.clustering_context.as_slice()],
-        ),
-        timing_list,
     ];
     Ok(StructChunked::from_series(name, 1, fields.iter())?.into_series())
 }
@@ -343,13 +284,8 @@ mod tests {
                     "topics".into(),
                     DataType::List(Box::new(topic_struct_type())),
                 ),
-                Field::new("n_chunks".into(), DataType::UInt32),
-                Field::new("truncated_segment_count".into(), DataType::UInt32),
-                Field::new("clustering_context".into(), DataType::Binary),
-                Field::new(
-                    "stage_timings_ms".into(),
-                    DataType::List(Box::new(stage_timing_struct_type())),
-                ),
+                Field::new("n_segments".into(), DataType::UInt32),
+                Field::new("projection_context".into(), DataType::Binary),
             ]
         );
     }
@@ -360,7 +296,7 @@ mod tests {
             documents: vec![DocumentResult {
                 doc_index: 0,
                 dominant_topic: 0,
-                topic_distribution: vec![(0, 0.6), (1, 0.4)],
+                topic_coverage: vec![(0, 0.6), (1, 0.4)],
             }],
             topics: vec![
                 TopicInfo {
@@ -380,10 +316,8 @@ mod tests {
                     y: 1.0,
                 },
             ],
-            n_chunks: 2,
-            truncated_segment_count: 0,
-            stage_timings_ms: Vec::new(),
-            clustering_context: vec![1, 2, 3],
+            n_segments: 2,
+            projection_context: Some(vec![1, 2, 3]),
         };
 
         let series = topic_modeling_result_to_series("topic".into(), &result)

@@ -14,11 +14,10 @@
 //! this module — `ensure_lindera_tokenizer` is only called on cache miss.
 
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use lindera::dictionary::load_dictionary;
@@ -26,12 +25,12 @@ use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 use lindera::tokenizer::Tokenizer as LinderaTokenizer;
 
+use crate::cache::with_file_lock;
+
 const LINDERA_VERSION: &str = "3.0.7";
 const LINDERA_RELEASE_BASE_URL: &str = "https://github.com/lindera/lindera/releases/download";
 const LINDERA_DICT_PATH_ENV: &str = "LINDERA_DICT_PATH";
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
-const LOCK_RETRY_COUNT: usize = 300;
-const LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Which prebuilt dict to fetch. Mirrors the model-id constants in
 /// `tokenizer.rs` (`LINDERA_JA_IPADIC_MODEL_ID` etc).
@@ -71,6 +70,10 @@ impl LinderaDict {
             self.archive_name()
         )
     }
+
+    pub fn cache_identity(&self) -> String {
+        format!("{}-{LINDERA_VERSION}", self.artifact_stem())
+    }
 }
 
 /// `${LINDERA_DICT_PATH:-$HOME/.cache/ldaca}`.
@@ -83,40 +86,6 @@ fn cache_root() -> Result<PathBuf> {
 
     let home = env::var_os("HOME").context("HOME is not set; cannot resolve Lindera dict cache")?;
     Ok(PathBuf::from(home).join(".cache").join("ldaca"))
-}
-
-struct DictLock {
-    path: PathBuf,
-}
-
-impl Drop for DictLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn acquire_dict_lock(lock_path: &Path) -> Result<DictLock> {
-    for _ in 0..LOCK_RETRY_COUNT {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(_) => {
-                return Ok(DictLock {
-                    path: lock_path.to_path_buf(),
-                });
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                thread::sleep(LOCK_RETRY_DELAY);
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("Failed to acquire Lindera dict lock {lock_path:?}"));
-            }
-        }
-    }
-    bail!("Timed out waiting for Lindera dict lock {lock_path:?}");
 }
 
 fn fresh_extract_dir(root: &Path, kind: LinderaDict) -> Result<PathBuf> {
@@ -149,32 +118,32 @@ pub fn ensure_dict(kind: LinderaDict) -> Result<PathBuf> {
 
     fs::create_dir_all(&root).with_context(|| format!("Failed to create cache dir {root:?}"))?;
 
-    let lock_path = root.join(format!(".{}.lock", kind.cache_subdir()));
-    let _lock = acquire_dict_lock(&lock_path)?;
-    if dict_dir.join("matrix.mtx").is_file() {
-        return Ok(dict_dir);
-    }
+    with_file_lock(&dict_dir, || {
+        if dict_dir.join("matrix.mtx").is_file() {
+            return Ok(());
+        }
 
-    let extract_dir = fresh_extract_dir(&root, kind)?;
-    let archive_bytes = download_archive(kind)?;
-    extract_zip(&archive_bytes, &extract_dir)
-        .with_context(|| format!("Failed to extract {}", kind.archive_name()))?;
+        let extract_dir = fresh_extract_dir(&root, kind)?;
+        let archive_bytes = download_archive(kind)?;
+        extract_zip(&archive_bytes, &extract_dir)
+            .with_context(|| format!("Failed to extract {}", kind.archive_name()))?;
 
-    if !extract_dir.join("matrix.mtx").is_file() {
-        let _ = fs::remove_dir_all(&extract_dir);
-        bail!(
-            "Lindera dict archive {archive} did not contain matrix.mtx \
-             after extracting — release layout may have changed",
-            archive = kind.archive_name(),
-        );
-    }
+        if !extract_dir.join("matrix.mtx").is_file() {
+            let _ = fs::remove_dir_all(&extract_dir);
+            bail!(
+                "Lindera dict archive {archive} did not contain matrix.mtx \
+                 after extracting — release layout may have changed",
+                archive = kind.archive_name(),
+            );
+        }
 
-    if dict_dir.exists() {
-        fs::remove_dir_all(&dict_dir)
-            .with_context(|| format!("Failed to remove incomplete dict dir {dict_dir:?}"))?;
-    }
-    fs::rename(&extract_dir, &dict_dir)
-        .with_context(|| format!("Failed to move {extract_dir:?} to {dict_dir:?}"))?;
+        if dict_dir.exists() {
+            fs::remove_dir_all(&dict_dir)
+                .with_context(|| format!("Failed to remove incomplete dict dir {dict_dir:?}"))?;
+        }
+        fs::rename(&extract_dir, &dict_dir)
+            .with_context(|| format!("Failed to move {extract_dir:?} to {dict_dir:?}"))
+    })?;
     Ok(dict_dir)
 }
 
@@ -221,9 +190,7 @@ pub fn ensure_lindera_tokenizer(kind: LinderaDict) -> Result<LinderaTokenizer> {
 
 #[cfg(test)]
 mod tests {
-    use super::{acquire_dict_lock, LinderaDict};
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use super::LinderaDict;
 
     #[test]
     fn archive_and_subdir_names_are_distinct_per_kind() {
@@ -261,29 +228,5 @@ mod tests {
             LinderaDict::JaIpadicNeologd.cache_subdir(),
             "lindera-ipadic-neologd-3.0.7"
         );
-    }
-
-    #[test]
-    fn dict_lock_is_released_on_drop() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "ldaca-lindera-lock-test-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("temp dir");
-        let lock_path = dir.join("dict.lock");
-
-        {
-            let _lock = acquire_dict_lock(&lock_path).expect("first lock");
-            assert!(lock_path.exists());
-        }
-
-        assert!(!lock_path.exists());
-        let _lock = acquire_dict_lock(&lock_path).expect("second lock");
-        assert!(fs::metadata(&lock_path).is_ok());
-        let _ = fs::remove_dir_all(&dir);
     }
 }

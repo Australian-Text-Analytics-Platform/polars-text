@@ -12,7 +12,7 @@ import os
 from typing import Any, cast
 
 import polars as pl
-import polars_text
+import polars_text  # noqa: F401
 import pytest
 
 _LINDERA_JIEBA_TESTS_ENV = "POLARS_TEXT_RUN_LINDERA_JIEBA_TESTS"
@@ -71,7 +71,7 @@ def test_hf_offsets_reconstruct_english_lowercased() -> None:
         # WordPiece subwords carry a "##" prefix in the token string but the
         # offsets index the original (un-prefixed) substring.
         tok = row["token"]
-        tok_stripped = tok[2:] if tok.startswith("##") else tok
+        tok_stripped = tok.removeprefix("##")
         assert tok_stripped == extracted, (
             f"HF offset mismatch: token={tok!r}, stripped={tok_stripped!r}, "
             f"extracted={extracted!r}, row={row}"

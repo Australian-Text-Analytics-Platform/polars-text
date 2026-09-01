@@ -1,8 +1,8 @@
-//! HDBSCAN clustering of reduced chunk embeddings into topics.
+//! HDBSCAN clustering of reduced Topic Segment embeddings into topics.
 //!
-//! Why this exists: after PaCMAP reduction, chunks that talk about the same
+//! Why this exists: after PaCMAP reduction, Topic Segments that discuss the same
 //! thing sit close together; HDBSCAN turns those density peaks into topics and,
-//! crucially, leaves genuinely off-topic chunks as noise (label `-1`) instead of
+//! crucially, leaves genuinely off-topic segments as noise (label `-1`) instead of
 //! forcing every point into a cluster. That noise handling is why BERTopic uses
 //! HDBSCAN rather than k-means, and it carries straight over here.
 //!
@@ -14,32 +14,27 @@
 //! is monotonic with cosine distance and we can use the Euclidean metric the
 //! crate provides directly.
 //!
-//! Called by: `topic_modeling::run` after `reduce`, on the reduced chunk points.
+//! Called by: `topic_modeling::run` after `reduce`, on the reduced segment points.
 
 use anyhow::Result;
 use hdbscan::{DistanceMetric, Hdbscan, HdbscanHyperParams};
 
-/// Outlier/noise label emitted by HDBSCAN for chunks that belong to no topic.
+/// Outlier/noise label emitted by HDBSCAN for segments that belong to no topic.
 /// Mirrors BERTopic's `-1` outlier topic so the rest of the pipeline (rollup,
 /// payload, frontend) can treat it the same way.
 pub const OUTLIER_LABEL: i32 = -1;
 
-/// Clustering knobs. `min_cluster_size` is the smallest group of chunks that
-/// counts as a natural topic. Wordflow fixes this private fit setting at 10 and
-/// exposes merge-only Result projection separately. `min_samples`
-/// controls how conservative the noise classification is; `None` lets HDBSCAN
-/// default it to `min_cluster_size`.
+/// Clustering knobs. `min_cluster_size` is also HDBSCAN's default
+/// `min_samples`, matching BERTopic's coupled density policy.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
     pub min_cluster_size: usize,
-    pub min_samples: Option<usize>,
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             min_cluster_size: 10,
-            min_samples: None,
         }
     }
 }
@@ -58,26 +53,21 @@ pub struct ClusterResult {
 /// Flow: build HDBSCAN hyper-parameters from `cfg` (clamping `min_cluster_size`
 /// to the valid `>= 2` range and never exceeding the point count), run the
 /// clusterer, and count distinct non-outlier labels. The crate's labels are
-/// already contiguous from zero, which `rollup`/`coords` rely on for indexing.
+/// already contiguous from zero, which projection and rollup rely on for indexing.
 pub fn cluster(points: &[Vec<f32>], cfg: &ClusterConfig) -> Result<ClusterResult> {
     let n = points.len();
     if n < 2 {
-        // One or zero points cannot form a density cluster; treat all as a
-        // single trivial topic so callers still get a usable labeling.
         return Ok(ClusterResult {
-            labels: vec![0; n],
-            n_topics: if n == 0 { 0 } else { 1 },
+            labels: vec![OUTLIER_LABEL; n],
+            n_topics: 0,
         });
     }
 
     let min_cluster_size = cfg.min_cluster_size.clamp(2, n);
-    let mut builder = HdbscanHyperParams::builder()
+    let params = HdbscanHyperParams::builder()
         .min_cluster_size(min_cluster_size)
-        .dist_metric(DistanceMetric::Euclidean);
-    if let Some(ms) = cfg.min_samples {
-        builder = builder.min_samples(ms.clamp(1, n));
-    }
-    let params = builder.build();
+        .dist_metric(DistanceMetric::Euclidean)
+        .build();
 
     let clusterer = Hdbscan::new(points, params);
     let labels = clusterer
@@ -113,7 +103,6 @@ mod tests {
 
         let cfg = ClusterConfig {
             min_cluster_size: 5,
-            min_samples: None,
         };
         let res = cluster(&points, &cfg).unwrap();
         assert_eq!(res.n_topics, 2, "labels: {:?}", res.labels);
@@ -126,10 +115,10 @@ mod tests {
     }
 
     #[test]
-    fn single_point_is_one_trivial_topic() {
+    fn single_point_is_an_outlier_without_a_fabricated_topic() {
         let res = cluster(&[vec![1.0, 2.0]], &ClusterConfig::default()).unwrap();
-        assert_eq!(res.n_topics, 1);
-        assert_eq!(res.labels, vec![0]);
+        assert_eq!(res.n_topics, 0);
+        assert_eq!(res.labels, vec![OUTLIER_LABEL]);
     }
 
     #[test]

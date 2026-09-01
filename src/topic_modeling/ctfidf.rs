@@ -2,7 +2,7 @@
 //!
 //! Why this exists: a topic is just a set of Topic Segments until it has human-readable
 //! keywords. BERTopic's class-based TF-IDF (c-TF-IDF) treats each topic as one
-//! "document" (the concatenation of its chunks) and scores a term by how
+//! "document" (the concatenation of its Topic Segments) and scores a term by how
 //! frequent it is *within* the topic versus *across* the whole corpus, so terms
 //! that are common everywhere (and thus uninformative) are down-weighted without
 //! needing a hand-tuned stopword list. User stopwords are a presentation concern
@@ -20,8 +20,8 @@
 //! part we unit-test. The tokenization helper depends on downloaded model files
 //! and is exercised by the manual harness, not CI.
 //!
-//! Called by: `topic_modeling::run` after clustering, once Topic Segment texts are
-//! grouped by topic.
+//! Called by: `topic_modeling::run` after clustering. Counts are accumulated
+//! directly from non-overlapping Topic Segment source views.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,28 +119,28 @@ pub fn representative_words(
 /// `model_id` selects the segmentation backend (`lindera:jieba` for Chinese,
 /// `native:plain_words_en` for English, a HF id for WordPiece, etc.); `None`
 /// uses the registry default. Returns one map per input topic, aligned by index.
-pub fn count_topic_terms(
-    topic_texts: &[String],
+pub fn count_topic_terms<'a>(
+    topic_count: usize,
+    assigned_segments: impl IntoIterator<Item = (i32, &'a str)>,
     model_id: Option<&str>,
     lowercase: bool,
 ) -> Result<Vec<HashMap<String, usize>>> {
     let backend: Arc<TokenizerBackend> = ensure_tokenizer_for_model(model_id)?;
-    topic_texts
-        .iter()
-        .map(|text| {
-            Ok(count_tokens(
-                backend.tokenize_text(text, false, lowercase, true)?,
-            ))
-        })
-        .collect()
-}
-
-fn count_tokens(tokens: impl IntoIterator<Item = String>) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for token in tokens {
-        *counts.entry(token).or_insert(0) += 1;
+    let mut per_topic = vec![HashMap::new(); topic_count];
+    for (label, text) in assigned_segments {
+        if label < 0 {
+            continue;
+        }
+        let topic = usize::try_from(label)
+            .map_err(|_| anyhow::anyhow!("Topic label {label} is invalid"))?;
+        let counts = per_topic
+            .get_mut(topic)
+            .ok_or_else(|| anyhow::anyhow!("Topic label {label} is outside the topic count"))?;
+        for token in backend.tokenize_text(text, false, lowercase, true)? {
+            *counts.entry(token).or_insert(0) += 1;
+        }
     }
-    counts
+    Ok(per_topic)
 }
 
 #[cfg(test)]
@@ -201,17 +201,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta"]
         );
-    }
-
-    #[test]
-    fn counts_repeated_overlap_tokens_as_occurrences() {
-        let counts = count_tokens(
-            ["boundary", "next", "boundary"]
-                .into_iter()
-                .map(str::to_string),
-        );
-        assert_eq!(counts["boundary"], 2);
-        assert_eq!(counts["next"], 1);
     }
 
     #[test]

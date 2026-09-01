@@ -17,7 +17,7 @@ import os
 from typing import Any, cast
 
 import polars as pl
-import polars_text
+import polars_text  # noqa: F401
 import pytest
 
 _LINDERA_TESTS_ENV = "POLARS_TEXT_RUN_LINDERA_TESTS"

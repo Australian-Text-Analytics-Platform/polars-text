@@ -80,7 +80,7 @@ mod tests {
                 )
             })
             .collect();
-        let got = byte_spans_to_char_spans(text, byte_spans.into_iter());
+        let got = byte_spans_to_char_spans(text, byte_spans);
         assert_eq!(got, expected);
     }
 
@@ -108,7 +108,7 @@ mod tests {
                 )
             })
             .collect();
-        let got = byte_spans_to_char_spans(text, byte_spans.clone().into_iter());
+        let got = byte_spans_to_char_spans(text, byte_spans.clone());
         assert_eq!(got, expected);
         // Sanity: each Hiragana / Hanzi span should be exactly 1 char.
         for (cs, ce) in &got {
@@ -140,7 +140,7 @@ mod tests {
                 )
             })
             .collect();
-        let got = byte_spans_to_char_spans(text, byte_spans.into_iter());
+        let got = byte_spans_to_char_spans(text, byte_spans);
         assert_eq!(got, expected);
     }
 
@@ -150,7 +150,7 @@ mod tests {
         let text = "café";
         let total_bytes = text.len();
         let spans = vec![(0, total_bytes)];
-        let got = byte_spans_to_char_spans(text, spans.into_iter());
+        let got = byte_spans_to_char_spans(text, spans);
         assert_eq!(got, vec![(0, 4)]);
     }
 
@@ -160,7 +160,7 @@ mod tests {
         // is the property that the single-sweep cursor preserves.
         let text = "abcdef";
         let spans = vec![(0, 2), (2, 4), (4, 6)];
-        let got = byte_spans_to_char_spans(text, spans.into_iter());
+        let got = byte_spans_to_char_spans(text, spans);
         assert_eq!(got, vec![(0, 2), (2, 4), (4, 6)]);
     }
 }

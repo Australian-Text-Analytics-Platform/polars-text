@@ -1,18 +1,20 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
 use lindera::tokenizer::Tokenizer as LinderaTokenizer;
-use once_cell::sync::OnceCell;
 use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
 use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer};
 
+use crate::cache::hash_text;
 use crate::offsets::byte_spans_to_char_spans;
 
-const DEFAULT_TOKENIZER_REVISION: &str = "main";
+const DEFAULT_TOKENIZER_REF: &str = "main";
+const TOKENIZER_IMPLEMENTATION_REVISION: &str = "tokenizer-pipeline-v2";
 const NATIVE_MODEL_PREFIX: &str = "native:";
 const HUGGINGFACE_MODEL_PREFIX: &str = "huggingface:";
 const LINDERA_MODEL_PREFIX: &str = "lindera:";
@@ -151,7 +153,7 @@ impl TokenizerBackend {
                 let char_spans =
                     byte_spans_to_char_spans(processed_ref, offsets.iter().map(|(s, e)| (*s, *e)));
                 toks.iter()
-                    .zip(char_spans.into_iter())
+                    .zip(char_spans)
                     .map(|(tok, (start, end))| TokenRecord {
                         token: tok.clone(),
                         start,
@@ -208,7 +210,7 @@ impl TokenizerBackend {
     }
 }
 
-static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<TokenizerBackend>>>> = OnceCell::new();
+static REGISTRY: OnceLock<RwLock<HashMap<String, Arc<TokenizerBackend>>>> = OnceLock::new();
 
 fn registry() -> &'static RwLock<HashMap<String, Arc<TokenizerBackend>>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
@@ -295,7 +297,7 @@ fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
     let repo = Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,
-        DEFAULT_TOKENIZER_REVISION.to_string(),
+        DEFAULT_TOKENIZER_REF.to_string(),
     );
     let api = api.repo(repo);
     let tokenizer_path = api
@@ -305,15 +307,42 @@ fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer {model_id}: {e}"))
 }
 
-pub fn loaded_model_ids() -> Vec<String> {
-    let Ok(map) = registry().read() else {
-        return Vec::new();
+pub fn tokenizer_cache_fingerprint(model_id: &str) -> Result<String> {
+    let artifact_identity = if model_id == PLAIN_WORDS_EN_MODEL_ID {
+        "bert-pre-tokenizer".to_string()
+    } else if let Some(repository) = model_id.strip_prefix(HUGGINGFACE_MODEL_PREFIX) {
+        let api = ApiBuilder::from_env()
+            .build()
+            .context("Failed to initialize hf-hub client")?;
+        let path = api
+            .repo(Repo::with_revision(
+                repository.to_string(),
+                RepoType::Model,
+                DEFAULT_TOKENIZER_REF.to_string(),
+            ))
+            .get("tokenizer.json")
+            .with_context(|| format!("Failed to fetch tokenizer.json for {repository}"))?;
+        let revision = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("tokenizer snapshot has no immutable revision"))?;
+        let checksum = hash_text(
+            std::str::from_utf8(&std::fs::read(&path)?)
+                .context("tokenizer.json is not valid UTF-8")?,
+        );
+        format!("{revision}:{checksum}")
+    } else if let Some(kind) = lindera_dict_for_model_id(model_id) {
+        kind.cache_identity()
+    } else {
+        anyhow::bail!("Unknown tokenizer model id {model_id:?}");
     };
-    let mut ids: Vec<String> = map.keys().cloned().collect();
-    ids.sort();
-    ids
+    Ok(hash_text(&format!(
+        "{TOKENIZER_IMPLEMENTATION_REVISION}\0{model_id}\0{artifact_identity}"
+    )))
 }
 
+#[cfg(test)]
 pub fn tokenize_plain_text(text: &str, lowercase: bool, remove_punctuation: bool) -> Vec<String> {
     TokenizerBackend::PlainWordsEn
         .tokenize_text(text, false, lowercase, remove_punctuation)
@@ -333,10 +362,10 @@ pub fn tokenize_plain_text_with_offsets(
 #[cfg(test)]
 mod tests {
     use super::{
-        lindera_dict_for_model_id, load_backend, loaded_model_ids, tokenize_plain_text,
-        TokenizerBackend, JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID,
-        LINDERA_JA_IPADIC_NEOLOGD_MODEL_ID, LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID,
-        LINDERA_ZH_CC_CEDICT_MODEL_ID, PLAIN_WORDS_EN_MODEL_ID,
+        lindera_dict_for_model_id, load_backend, tokenize_plain_text, TokenizerBackend,
+        JIEBA_MODEL_ID, LINDERA_JA_IPADIC_MODEL_ID, LINDERA_JA_IPADIC_NEOLOGD_MODEL_ID,
+        LINDERA_JA_UNIDIC_MODEL_ID, LINDERA_KO_DIC_MODEL_ID, LINDERA_ZH_CC_CEDICT_MODEL_ID,
+        PLAIN_WORDS_EN_MODEL_ID,
     };
     use crate::lindera_dict::LinderaDict;
 
@@ -348,14 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn test_loaded_model_ids_returns_sorted_vec() {
-        let ids = loaded_model_ids();
-        let mut sorted = ids.clone();
-        sorted.sort();
-        assert_eq!(ids, sorted);
-    }
-
-    #[test]
     fn test_jieba_model_id_constant() {
         assert_eq!(JIEBA_MODEL_ID, "lindera:jieba");
     }
@@ -363,6 +384,17 @@ mod tests {
     #[test]
     fn test_plain_words_en_model_id_constant() {
         assert_eq!(PLAIN_WORDS_EN_MODEL_ID, "native:plain_words_en");
+    }
+
+    #[test]
+    fn cache_fingerprint_includes_immutable_model_artifact_identity() {
+        let native = super::tokenizer_cache_fingerprint(PLAIN_WORDS_EN_MODEL_ID).unwrap();
+        let jieba = super::tokenizer_cache_fingerprint(JIEBA_MODEL_ID).unwrap();
+        assert_ne!(native, jieba);
+        assert_eq!(
+            native,
+            super::tokenizer_cache_fingerprint(PLAIN_WORDS_EN_MODEL_ID).unwrap()
+        );
     }
 
     #[test]

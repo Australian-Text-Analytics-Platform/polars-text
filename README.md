@@ -1,8 +1,8 @@
 # polars-text
 
-Polars expression plugins for fast, practical text analysis. Use them as
-expressions or via the `pl.col("text").text.*` namespace, plus a few
-Series-based utilities for token frequency stats.
+Polars 1.44.1 expression plugins for fast, practical text analysis. The
+`pl.col("text").text.*` namespace is the sole expression façade; whole-Series
+token-frequency and topic-projection utilities remain top-level functions.
 
 ## Quick start
 
@@ -25,24 +25,24 @@ out = df.with_columns([
     pl.col("text").text.tokenize(
         model="native:plain_words_en",
         lowercase=True,
-        remove_punct=True,
+        remove_punctuation=True,
     ).alias("tokens"),
 ])
 ```
 
 ## Expressions and namespace
 
-Tokenization is available through the `text` namespace on expressions.
+All expression operations are available through the `text` namespace.
 
 ### Tokenization
 
-- `pl.col("text").text.tokenize(model="native:plain_words_en", lowercase=True, remove_punct=True, cache=None)`
-- `pl.col("text").text.embedding(embedder_model=None, cache=None, batch_size=None)`
-- `clean_text(expr)`
-- `word_count(expr)`
-- `char_count(expr)`
-- `sentence_count(expr)`
-- `concordance(expr, search_word, num_left_tokens=5, num_right_tokens=5, regex=False, case_sensitive=False, remove_punct=False)`
+- `pl.col("text").text.tokenize(model="native:plain_words_en", lowercase=True, remove_punctuation=True, cache=None)`
+- `pl.col("text").text.embedding(model=None, cache=None, batch_size=None)`
+- `pl.col("text").text.clean_text()`
+- `pl.col("text").text.word_count()`
+- `pl.col("text").text.char_count()`
+- `pl.col("text").text.sentence_count()`
+- `pl.col("text").text.concordance(query, left_tokens=5, right_tokens=5, regex=False, case_sensitive=False, ignore_punctuation=False)`
 
 ### Namespace usage
 
@@ -62,7 +62,11 @@ model ID. Pass `cache=Path("tokens.duckdb")` to persist tokenization results in
 a DuckDB cache and reuse them by content hash; leave `cache=None` to compute
 directly through the Rust plugin.
 
-Pass `remove_punct=True` to `concordance` to exclude punctuation and
+A configured cache path is dedicated, disposable `polars-text` storage. Schema
+or model-pipeline changes replace the complete DuckDB file; do not put
+unrelated user tables in it.
+
+Pass `ignore_punctuation=True` to `concordance` to exclude punctuation and
 symbol-only tokens from context counts and L1/R1. The returned contexts retain
 the original punctuation and whitespace between lexical tokens and the match;
 literal and regular-expression matching are unchanged.
@@ -74,19 +78,21 @@ input returns `List(Float32)` per row; list input returns nested
 `List(List(Float32))` per row.
 
 ```python
-df = pl.DataFrame({"text": ["A short document."], "chunks": [["first", "second"]]})
+df = pl.DataFrame({"text": ["A short document."], "segments": [["first", "second"]]})
 
 out = df.select([
     pl.col("text").text.embedding(cache="embeddings.duckdb").alias("embedding"),
-    pl.col("chunks").text.embedding(cache="embeddings.duckdb").alias("chunk_embeddings"),
+    pl.col("segments").text.embedding(cache="embeddings.duckdb").alias("segment_embeddings"),
 ])
 ```
 
 The Rust plugin downloads and loads Hugging Face ONNX sentence-transformer
 repositories automatically through `hf-hub`. Repositories without ONNX files are
 not supported. Passing `cache=Path("embeddings.duckdb")` persists vectors in a
-separate DuckDB cache keyed by model, revision, execution-provider label, and
-text hash.
+separate DuckDB cache keyed by the immutable model snapshot, ONNX artifact,
+pooling and normalization graph, canonical maximum length, execution provider,
+pipeline version, and text hash. The default model is
+`sentence-transformers/all-MiniLM-L6-v2`, whose declared maximum is 256 tokens.
 
 ## Concordance
 
@@ -98,7 +104,7 @@ df = pl.DataFrame({"text": ["Hello world, hello again."]})
 
 concordance = (
     pl.col("text")
-    .text.concordance("hello", num_left_tokens=1, num_right_tokens=1)
+    .text.concordance("hello", left_tokens=1, right_tokens=1)
     .list.explode()
     .struct.unnest()
 )
@@ -114,19 +120,23 @@ metadata:
 
 ```text
 {
-  documents: [{doc_index, dominant_topic, topic_distribution}],
+  documents: [{doc_index, dominant_topic, topic_coverage}],
   topics: [{id, representative_words, x, y}],
-  n_chunks,
-  truncated_segment_count,
-  stage_timings_ms
+  n_segments,
+  projection_context
 }
 ```
 
-Automatic, Paragraph, and Sentence modes differ only when constructing Topic
+Automatic, Line, and Sentence modes differ only when constructing Topic
 Segments. All modes then share embedding, clustering, c-TF-IDF, and document
 rollup. Clustering treats every segment as one observation. Rollup weights each
-segment by the Unicode-character length of its retained text; Automatic overlap
-counts repeated text again.
+non-overlapping source span by its owned Unicode-character length.
+
+The token budget includes model-added special tokens. Oversized semantic units
+are split without overlap or discarded tail text.
+Corpora with too little density evidence return no Topics and a null projection
+context. Use `project_topics` and `project_topic_basis` with a non-null context
+for supported post-fit projections down to one Topic.
 
 ## Token frequencies and stats
 
@@ -168,11 +178,13 @@ Some features download tokenizer assets on first use and run on CPU:
 
 The initial call may take longer while models download and cache.
 
+`TOKENIZER_MODELS` is the immutable catalogue of
+`TokenizerModel(model_id, label, languages)` records.
+
 Embedding features download ONNX artifacts on first use. Some ONNX repositories
 store tensor data in sidecar files such as `onnx/model.onnx_data`; those files
-are fetched automatically when present. ONNX Runtime uses DirectML on Windows
-when available, XNNPACK acceleration on supported CPU platforms, and CPU
-fallback.
+are fetched automatically when present. ONNX Runtime uses CoreML on macOS,
+DirectML on Windows, XNNPACK on Linux, and CPU fallback on every platform.
 
 ## Development
 

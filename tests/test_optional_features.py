@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any, cast
 
 import pytest
-
-from polars_text import functions
+from polars_text import _expressions
 from polars_text._internal import compiled_features
 
 
@@ -19,11 +19,16 @@ def test_compiled_features_returns_frozenset() -> None:
     [
         (
             "tokenization",
-            lambda: functions.tokenize("text", model="native:plain_words_en"),
+            lambda: _expressions.tokenize(
+                cast(Any, "text"), model="native:plain_words_en"
+            ),
         ),
-        ("tokenization", lambda: functions.concordance("text", "needle")),
-        ("embedding", lambda: functions.embedding("text")),
-        ("topic-modeling", lambda: functions.topic_modeling("text")),
+        (
+            "tokenization",
+            lambda: _expressions.concordance(cast(Any, "text"), "needle"),
+        ),
+        ("embedding", lambda: _expressions.embedding(cast(Any, "text"))),
+        ("topic-modeling", lambda: _expressions.topic_modeling(cast(Any, "text"))),
     ],
 )
 def test_feature_gated_plugin_wrappers_raise_before_registration(
@@ -33,9 +38,9 @@ def test_feature_gated_plugin_wrappers_raise_before_registration(
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    monkeypatch.setattr(functions, "compiled_features", lambda: frozenset())
+    monkeypatch.setattr(_expressions, "compiled_features", lambda: frozenset())
     monkeypatch.setattr(
-        functions,
+        _expressions,
         "register_plugin_function",
         lambda **kwargs: calls.append(kwargs),
     )

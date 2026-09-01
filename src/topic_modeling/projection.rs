@@ -1,9 +1,9 @@
-//! Immutable, additive Topic projection context.
+//! Immutable Topic projection context.
 //!
-//! HDBSCAN's real Topics are retained as the maximum-resolution leaves. A
-//! deterministic weighted Ward tree records only how those leaves merge. Cuts
-//! aggregate sufficient statistics, so Result queries never need source text,
-//! embeddings, PaCMAP, or HDBSCAN.
+//! HDBSCAN's natural Topics are retained as the maximum-resolution leaves.
+//! A deterministic cosine average-linkage tree records how those leaves merge.
+//! Cuts aggregate sufficient statistics, so Result queries never need source
+//! text, segment embeddings, or HDBSCAN.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
@@ -13,18 +13,17 @@ use serde::{Deserialize, Serialize};
 
 use super::cluster::OUTLIER_LABEL;
 use super::ctfidf;
+use super::reduce::{self, ReduceConfig};
 use super::rollup;
 use super::{DocumentResult, TopicInfo, TopicModelingResult};
 
-const CONTEXT_VERSION: u8 = 1;
+const CONTEXT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Leaf {
     id: usize,
     segment_count: usize,
-    centroid_5d: Vec<f64>,
-    coordinate_sum: [f64; 2],
-    coordinate_count: usize,
+    embedding_sum: Vec<f64>,
     term_counts: Vec<(u32, usize)>,
 }
 
@@ -32,7 +31,7 @@ struct Leaf {
 struct SegmentFact {
     document_index: usize,
     leaf_id: i32,
-    retained_character_weight: usize,
+    owned_character_weight: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +42,7 @@ struct Merge {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopicClusteringContext {
+pub struct TopicProjectionContext {
     version: u8,
     document_count: usize,
     natural_cluster_count: usize,
@@ -51,15 +50,25 @@ pub struct TopicClusteringContext {
     leaves: Vec<Leaf>,
     merges: Vec<Merge>,
     segments: Vec<SegmentFact>,
-    n_chunks: usize,
-    truncated_segment_count: usize,
+    n_segments: usize,
+    seed: u64,
+}
+
+pub struct ProjectionInput<'a> {
+    pub document_count: usize,
+    pub labels: &'a [i32],
+    pub embedding_points: &'a [&'a [f32]],
+    pub document_indices: &'a [usize],
+    pub owned_character_weights: &'a [usize],
+    pub per_leaf_term_counts: &'a [HashMap<String, usize>],
+    pub seed: u64,
 }
 
 /// Compact, N-independent input for Result-time Topic bubble counts.
 ///
 /// Each activation is `[corpus_index, topic_id, minimum_n, row_count]`, where
 /// `minimum_n` is one plus the number of strictly higher positive real-Topic
-/// shares in the row. Equal shares therefore activate at the same cutoff.
+/// coverage values in the row. Equal values activate at the same cutoff.
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicProjectionBasis {
     pub topics: Vec<TopicInfo>,
@@ -68,40 +77,57 @@ pub struct TopicProjectionBasis {
 }
 
 #[derive(Debug, Clone)]
-struct WardNode {
-    node_id: usize,
+struct ActiveNode {
     minimum_leaf_id: usize,
-    weight: usize,
-    centroid: Vec<f64>,
+    leaf_count: usize,
 }
 
-pub fn prepare_context(
-    document_count: usize,
-    labels: &[i32],
-    reduced_5d: &[Vec<f32>],
-    reduced_2d: &[Vec<f32>],
-    document_indices: &[usize],
-    retained_character_weights: &[usize],
-    per_leaf_term_counts: &[HashMap<String, usize>],
-    n_chunks: usize,
-    truncated_segment_count: usize,
-) -> Result<TopicClusteringContext> {
+pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionContext> {
+    let ProjectionInput {
+        document_count,
+        labels,
+        embedding_points,
+        document_indices,
+        owned_character_weights,
+        per_leaf_term_counts,
+        seed,
+    } = input;
     let segment_count = labels.len();
-    if reduced_5d.len() != segment_count
-        || reduced_2d.len() != segment_count
+    if embedding_points.len() != segment_count
         || document_indices.len() != segment_count
-        || retained_character_weights.len() != segment_count
+        || owned_character_weights.len() != segment_count
     {
         bail!("Topic projection inputs must align by Topic Segment");
     }
+    if document_indices
+        .iter()
+        .any(|&index| index >= document_count)
+    {
+        bail!("Topic projection document index is outside the corpus");
+    }
+
     let natural_cluster_count = labels
         .iter()
         .filter(|&&label| label >= 0)
-        .map(|&label| label as usize)
+        .map(|&label| usize::try_from(label))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
         .max()
         .map_or(0, |maximum| maximum + 1);
+    if natural_cluster_count == 0 {
+        bail!("Topic projection requires at least one real Topic");
+    }
     if per_leaf_term_counts.len() != natural_cluster_count {
         bail!("Topic projection term counts must align with real Topic leaves");
+    }
+
+    let embedding_width = embedding_points.first().map_or(0, |point| point.len());
+    if embedding_width == 0
+        || embedding_points.iter().any(|point| {
+            point.len() != embedding_width || point.iter().any(|value| !value.is_finite())
+        })
+    {
+        bail!("Topic projection embeddings must be finite, non-empty, and rectangular");
     }
 
     let vocabulary = per_leaf_term_counts
@@ -113,41 +139,40 @@ pub fn prepare_context(
     let vocabulary_indices = vocabulary
         .iter()
         .enumerate()
-        .map(|(index, term)| (term.as_str(), index as u32))
-        .collect::<HashMap<_, _>>();
+        .map(|(index, term)| {
+            Ok((
+                term.as_str(),
+                u32::try_from(index).context("Topic projection vocabulary is too large")?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
-    let dimensions = reduced_5d.first().map_or(0, Vec::len);
-    let mut centroid_sums = vec![vec![0.0f64; dimensions]; natural_cluster_count];
-    let mut coordinate_sums = vec![[0.0f64; 2]; natural_cluster_count];
-    let mut counts = vec![0usize; natural_cluster_count];
-    for ((point_5d, point_2d), &label) in reduced_5d.iter().zip(reduced_2d).zip(labels) {
+    let mut embedding_sums = vec![vec![0.0f64; embedding_width]; natural_cluster_count];
+    let mut segment_counts = vec![0usize; natural_cluster_count];
+    for (&label, point) in labels.iter().zip(embedding_points) {
         if label == OUTLIER_LABEL {
             continue;
         }
-        let leaf = label as usize;
-        if leaf >= natural_cluster_count || point_5d.len() != dimensions || point_2d.len() < 2 {
-            bail!("Topic projection received an invalid real Topic label or coordinate");
+        let leaf = usize::try_from(label).context("Topic projection label is invalid")?;
+        let count = segment_counts
+            .get_mut(leaf)
+            .context("Topic projection label is outside the natural Topic count")?;
+        *count += 1;
+        for (sum, &value) in embedding_sums[leaf].iter_mut().zip(*point) {
+            *sum += f64::from(value);
         }
-        counts[leaf] += 1;
-        for (sum, &value) in centroid_sums[leaf].iter_mut().zip(point_5d) {
-            *sum += value as f64;
-        }
-        coordinate_sums[leaf][0] += point_2d[0] as f64;
-        coordinate_sums[leaf][1] += point_2d[1] as f64;
     }
 
     let leaves = (0..natural_cluster_count)
         .map(|id| {
-            if counts[id] == 0 {
+            if segment_counts[id] == 0 {
                 bail!("Topic projection real Topic leaf has no Topic Segments");
             }
-            let count = counts[id] as f64;
+            validate_nonzero_vector(&embedding_sums[id], "natural Topic embedding")?;
             Ok(Leaf {
                 id,
-                segment_count: counts[id],
-                centroid_5d: centroid_sums[id].iter().map(|sum| sum / count).collect(),
-                coordinate_sum: coordinate_sums[id],
-                coordinate_count: counts[id],
+                segment_count: segment_counts[id],
+                embedding_sum: embedding_sums[id].clone(),
                 term_counts: per_leaf_term_counts[id]
                     .iter()
                     .map(|(term, &occurrences)| {
@@ -166,18 +191,18 @@ pub fn prepare_context(
     let segments = labels
         .iter()
         .zip(document_indices)
-        .zip(retained_character_weights)
+        .zip(owned_character_weights)
         .map(
-            |((&leaf_id, &document_index), &retained_character_weight)| SegmentFact {
+            |((&leaf_id, &document_index), &owned_character_weight)| SegmentFact {
                 document_index,
                 leaf_id,
-                retained_character_weight,
+                owned_character_weight,
             },
         )
         .collect();
-    let merges = build_ward_tree(&leaves)?;
+    let merges = build_average_linkage_tree(&leaves)?;
 
-    Ok(TopicClusteringContext {
+    Ok(TopicProjectionContext {
         version: CONTEXT_VERSION,
         document_count,
         natural_cluster_count,
@@ -185,178 +210,265 @@ pub fn prepare_context(
         leaves,
         merges,
         segments,
-        n_chunks,
-        truncated_segment_count,
+        n_segments: segment_count,
+        seed,
     })
 }
 
-fn ward_cost(left: &WardNode, right: &WardNode) -> f64 {
-    let squared_distance = left
-        .centroid
-        .iter()
-        .zip(&right.centroid)
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f64>();
-    (left.weight as f64 * right.weight as f64 / (left.weight + right.weight) as f64)
-        * squared_distance
+fn validate_nonzero_vector(vector: &[f64], name: &str) -> Result<()> {
+    let squared_norm = vector.iter().map(|value| value * value).sum::<f64>();
+    if !squared_norm.is_finite() || squared_norm <= f64::EPSILON {
+        bail!("Topic projection {name} has zero or invalid norm");
+    }
+    Ok(())
 }
 
-fn build_ward_tree(leaves: &[Leaf]) -> Result<Vec<Merge>> {
+fn cosine_distance(left: &[f64], right: &[f64]) -> Result<f64> {
+    if left.len() != right.len() || left.is_empty() {
+        bail!("Topic projection embedding dimensions differ");
+    }
+    validate_nonzero_vector(left, "left embedding")?;
+    validate_nonzero_vector(right, "right embedding")?;
+    let dot = left.iter().zip(right).map(|(a, b)| a * b).sum::<f64>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f64>().sqrt();
+    Ok(1.0 - (dot / (left_norm * right_norm)).clamp(-1.0, 1.0))
+}
+
+fn pair_key(left: usize, right: usize) -> (usize, usize) {
+    if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+/// Build a deterministic average-linkage hierarchy over natural Topic
+/// centroids using cosine distance. Every natural Topic has equal weight;
+/// segment population affects coverage, not semantic merge priority.
+fn build_average_linkage_tree(leaves: &[Leaf]) -> Result<Vec<Merge>> {
     let mut active = leaves
         .iter()
-        .map(|leaf| WardNode {
-            node_id: leaf.id,
-            minimum_leaf_id: leaf.id,
-            weight: leaf.segment_count,
-            centroid: leaf.centroid_5d.clone(),
+        .map(|leaf| {
+            (
+                leaf.id,
+                ActiveNode {
+                    minimum_leaf_id: leaf.id,
+                    leaf_count: 1,
+                },
+            )
         })
-        .collect::<Vec<_>>();
+        .collect::<BTreeMap<_, _>>();
+    let mut distances = HashMap::<(usize, usize), f64>::new();
+    for left in 0..leaves.len() {
+        for right in left + 1..leaves.len() {
+            distances.insert(
+                (left, right),
+                cosine_distance(&leaves[left].embedding_sum, &leaves[right].embedding_sum)?,
+            );
+        }
+    }
+
     let mut merges = Vec::with_capacity(leaves.len().saturating_sub(1));
     while active.len() > 1 {
+        let active_ids = active.keys().copied().collect::<Vec<_>>();
         let mut best: Option<(f64, usize, usize, usize, usize)> = None;
-        for left_index in 0..active.len() - 1 {
-            for right_index in left_index + 1..active.len() {
-                let left = &active[left_index];
-                let right = &active[right_index];
-                let ids = if left.minimum_leaf_id <= right.minimum_leaf_id {
+        for (position, &left_id) in active_ids.iter().enumerate() {
+            for &right_id in &active_ids[position + 1..] {
+                let left = &active[&left_id];
+                let right = &active[&right_id];
+                let minimum_ids = if left.minimum_leaf_id <= right.minimum_leaf_id {
                     (left.minimum_leaf_id, right.minimum_leaf_id)
                 } else {
                     (right.minimum_leaf_id, left.minimum_leaf_id)
                 };
-                let candidate = (
-                    ward_cost(left, right),
-                    ids.0,
-                    ids.1,
-                    left_index,
-                    right_index,
-                );
+                let distance = *distances
+                    .get(&pair_key(left_id, right_id))
+                    .context("Topic projection linkage distance is missing")?;
+                let candidate = (distance, minimum_ids.0, minimum_ids.1, left_id, right_id);
                 if best.as_ref().is_none_or(|current| {
                     candidate.0.total_cmp(&current.0).is_lt()
                         || (candidate.0.total_cmp(&current.0).is_eq()
-                            && (candidate.1, candidate.2) < (current.1, current.2))
+                            && (candidate.1, candidate.2, candidate.3, candidate.4)
+                                < (current.1, current.2, current.3, current.4))
                 }) {
                     best = Some(candidate);
                 }
             }
         }
-        let (_, _, _, left_index, right_index) = best.context("Ward tree has no merge pair")?;
-        let right = active.remove(right_index);
-        let left = active.remove(left_index);
-        if left.centroid.len() != right.centroid.len() {
-            bail!("Ward tree leaf centroid dimensions differ");
+
+        let (_, _, _, left_id, right_id) =
+            best.context("Topic projection linkage tree has no merge pair")?;
+        let left = active
+            .remove(&left_id)
+            .context("Topic projection left merge node is missing")?;
+        let right = active
+            .remove(&right_id)
+            .context("Topic projection right merge node is missing")?;
+        let new_id = leaves.len() + merges.len();
+        let leaf_count = left
+            .leaf_count
+            .checked_add(right.leaf_count)
+            .context("Topic projection leaf count overflow")?;
+
+        for &other_id in active.keys() {
+            let left_distance = *distances
+                .get(&pair_key(left_id, other_id))
+                .context("Topic projection left linkage distance is missing")?;
+            let right_distance = *distances
+                .get(&pair_key(right_id, other_id))
+                .context("Topic projection right linkage distance is missing")?;
+            let distance = (left_distance * left.leaf_count as f64
+                + right_distance * right.leaf_count as f64)
+                / leaf_count as f64;
+            distances.insert(pair_key(new_id, other_id), distance);
         }
-        let weight = left.weight + right.weight;
-        let centroid = left
-            .centroid
-            .iter()
-            .zip(&right.centroid)
-            .map(|(a, b)| (a * left.weight as f64 + b * right.weight as f64) / weight as f64)
-            .collect();
-        let node_id = leaves.len() + merges.len();
+
         let minimum_leaf_id = left.minimum_leaf_id.min(right.minimum_leaf_id);
         merges.push(Merge {
-            left: left.node_id,
-            right: right.node_id,
+            left: left_id,
+            right: right_id,
             minimum_leaf_id,
         });
-        active.push(WardNode {
-            node_id,
-            minimum_leaf_id,
-            weight,
-            centroid,
-        });
+        active.insert(
+            new_id,
+            ActiveNode {
+                minimum_leaf_id,
+                leaf_count,
+            },
+        );
     }
     Ok(merges)
 }
 
-fn leaf_projection_ids(context: &TopicClusteringContext, cluster_count: usize) -> Result<Vec<i32>> {
+fn leaf_projection_ids(context: &TopicProjectionContext, topic_count: usize) -> Result<Vec<i32>> {
     let natural = context.natural_cluster_count;
-    if cluster_count > natural
-        || (natural > 1 && cluster_count < 2)
-        || (natural <= 1 && cluster_count != natural)
-    {
-        bail!("cluster_count {cluster_count} is outside the supported range");
+    if topic_count == 0 || topic_count > natural {
+        bail!("topic_count {topic_count} is outside the supported range 1..={natural}");
     }
+
     let mut members = (0..natural).map(|leaf| vec![leaf]).collect::<Vec<_>>();
+    let mut active = (0..natural).collect::<BTreeSet<_>>();
     for (merge_index, merge) in context
         .merges
         .iter()
-        .take(natural.saturating_sub(cluster_count))
+        .take(natural.saturating_sub(topic_count))
         .enumerate()
     {
-        let left = std::mem::take(
+        if !active.remove(&merge.left) || !active.remove(&merge.right) {
+            bail!("Topic projection merge references an inactive node");
+        }
+        let mut combined = members
+            .get(merge.left)
+            .context("Topic projection merge references an unknown left node")?
+            .clone();
+        combined.extend(
             members
-                .get_mut(merge.left)
-                .context("Topic projection merge references an unknown left node")?,
-        );
-        let right = std::mem::take(
-            members
-                .get_mut(merge.right)
+                .get(merge.right)
                 .context("Topic projection merge references an unknown right node")?,
         );
-        let mut combined = left;
-        combined.extend(right);
-        let expected_id = natural + merge_index;
-        if members.len() != expected_id {
+        let node_id = natural + merge_index;
+        if members.len() != node_id {
             bail!("Topic projection merge ordering is invalid");
         }
         members.push(combined);
+        active.insert(node_id);
     }
-    let active_start = natural.saturating_sub(cluster_count);
-    let active_nodes = if cluster_count == natural {
-        (0..natural).collect::<Vec<_>>()
-    } else {
-        // A node is active if it has members and is not consumed by a later applied merge.
-        let consumed = context
-            .merges
-            .iter()
-            .take(active_start)
-            .flat_map(|merge| [merge.left, merge.right])
-            .collect::<BTreeSet<_>>();
-        members
-            .iter()
-            .enumerate()
-            .filter(|(node, member)| !member.is_empty() && !consumed.contains(node))
-            .map(|(node, _)| node)
-            .collect::<Vec<_>>()
-    };
-    if active_nodes.len() != cluster_count {
-        bail!("Topic projection cut did not produce the requested real Topic count");
+
+    if active.len() != topic_count {
+        bail!("Topic projection cut did not produce the requested Topic count");
     }
-    let mut ordered = active_nodes
+    let mut ordered = active
         .into_iter()
         .map(|node| {
             let minimum = *members[node]
                 .iter()
                 .min()
-                .context("Topic projection cluster has no leaves")?;
+                .context("Topic projection node has no leaves")?;
             Ok((minimum, node))
         })
         .collect::<Result<Vec<_>>>()?;
     ordered.sort_unstable();
+
     let mut projected = vec![OUTLIER_LABEL; natural];
     for (projected_id, (_, node)) in ordered.into_iter().enumerate() {
+        let projected_id =
+            i32::try_from(projected_id).context("Topic projection count exceeds i32")?;
         for &leaf in &members[node] {
-            projected[leaf] = projected_id as i32;
+            projected[leaf] = projected_id;
         }
     }
     Ok(projected)
 }
 
+fn normalize_embedding(embedding: &[f64]) -> Result<Vec<f32>> {
+    validate_nonzero_vector(embedding, "projected Topic embedding")?;
+    let norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    Ok(embedding
+        .iter()
+        .map(|value| (value / norm) as f32)
+        .collect())
+}
+
+fn topic_coordinates(embedding_sums: &[Vec<f64>], seed: u64) -> Result<Vec<[f32; 2]>> {
+    match embedding_sums.len() {
+        0 => Ok(Vec::new()),
+        1 => Ok(vec![[0.0, 0.0]]),
+        2 => {
+            let distance = cosine_distance(&embedding_sums[0], &embedding_sums[1])? as f32;
+            Ok(vec![[-distance / 2.0, 0.0], [distance / 2.0, 0.0]])
+        }
+        _ => {
+            let normalized = embedding_sums
+                .iter()
+                .map(|embedding| normalize_embedding(embedding))
+                .collect::<Result<Vec<_>>>()?;
+            let reduced = reduce::reduce(
+                &normalized,
+                &ReduceConfig {
+                    output_dims: 2,
+                    seed,
+                },
+            )?;
+            reduced
+                .into_iter()
+                .map(|point| {
+                    if point.len() != 2 || point.iter().any(|value| !value.is_finite()) {
+                        bail!("Topic coordinate reduction returned invalid output");
+                    }
+                    Ok([point[0], point[1]])
+                })
+                .collect()
+        }
+    }
+}
+
 pub fn project(
-    context: &TopicClusteringContext,
-    cluster_count: usize,
+    context: &TopicProjectionContext,
+    topic_count: usize,
 ) -> Result<TopicModelingResult> {
     validate_context(context)?;
-    let projection_ids = leaf_projection_ids(context, cluster_count)?;
-    let mut term_counts = vec![HashMap::<String, usize>::new(); cluster_count];
-    let mut coordinate_sums = vec![[0.0f64; 2]; cluster_count];
-    let mut coordinate_counts = vec![0usize; cluster_count];
+    let projection_ids = leaf_projection_ids(context, topic_count)?;
+    let mut term_counts = vec![HashMap::<String, usize>::new(); topic_count];
+    let embedding_width = context
+        .leaves
+        .first()
+        .map(|leaf| leaf.embedding_sum.len())
+        .context("Topic projection context has no leaves")?;
+    let mut embedding_sums = vec![vec![0.0f64; embedding_width]; topic_count];
     for leaf in &context.leaves {
-        let projected_id = projection_ids[leaf.id] as usize;
-        coordinate_sums[projected_id][0] += leaf.coordinate_sum[0];
-        coordinate_sums[projected_id][1] += leaf.coordinate_sum[1];
-        coordinate_counts[projected_id] += leaf.coordinate_count;
+        let projected_id = usize::try_from(projection_ids[leaf.id])
+            .context("Topic projection produced an invalid Topic id")?;
+        for (sum, value) in embedding_sums[projected_id]
+            .iter_mut()
+            .zip(&leaf.embedding_sum)
+        {
+            *sum += value;
+        }
         for &(term_index, occurrences) in &leaf.term_counts {
             let term = context
                 .vocabulary
@@ -365,23 +477,20 @@ pub fn project(
             *term_counts[projected_id].entry(term.clone()).or_insert(0) += occurrences;
         }
     }
+
     let representative_words = ctfidf::representative_words(&term_counts);
-    let topics = (0..cluster_count)
-        .map(|id| TopicInfo {
-            id: id as i32,
-            representative_words: representative_words[id].clone(),
-            x: if coordinate_counts[id] == 0 {
-                0.0
-            } else {
-                (coordinate_sums[id][0] / coordinate_counts[id] as f64) as f32
-            },
-            y: if coordinate_counts[id] == 0 {
-                0.0
-            } else {
-                (coordinate_sums[id][1] / coordinate_counts[id] as f64) as f32
-            },
+    let coordinates = topic_coordinates(&embedding_sums, context.seed)?;
+    let topics = (0..topic_count)
+        .map(|id| {
+            Ok(TopicInfo {
+                id: i32::try_from(id).context("Topic count exceeds i32")?,
+                representative_words: representative_words[id].clone(),
+                x: coordinates[id][0],
+                y: coordinates[id][1],
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
+
     let document_indices = context
         .segments
         .iter()
@@ -392,16 +501,21 @@ pub fn project(
         .iter()
         .map(|fact| {
             if fact.leaf_id == OUTLIER_LABEL {
-                OUTLIER_LABEL
+                Ok(OUTLIER_LABEL)
             } else {
-                projection_ids[fact.leaf_id as usize]
+                let leaf = usize::try_from(fact.leaf_id)
+                    .context("Topic projection segment leaf id is invalid")?;
+                projection_ids
+                    .get(leaf)
+                    .copied()
+                    .context("Topic projection segment leaf id is outside the context")
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let weights = context
         .segments
         .iter()
-        .map(|fact| fact.retained_character_weight)
+        .map(|fact| fact.owned_character_weight)
         .collect::<Vec<_>>();
     let documents = rollup::rollup(context.document_count, &document_indices, &labels, &weights)
         .into_iter()
@@ -409,31 +523,30 @@ pub fn project(
         .map(|(doc_index, topics)| DocumentResult {
             doc_index,
             dominant_topic: topics.dominant_topic,
-            topic_distribution: topics
-                .topic_distribution
+            topic_coverage: topics
+                .topic_coverage
                 .into_iter()
-                .map(|entry| (entry.topic_id, entry.proportion))
+                .map(|entry| (entry.topic_id, entry.coverage))
                 .collect(),
         })
         .collect();
     Ok(TopicModelingResult {
         topics,
         documents,
-        n_chunks: context.n_chunks,
-        truncated_segment_count: context.truncated_segment_count,
-        stage_timings_ms: Vec::new(),
-        clustering_context: Vec::new(),
+        n_segments: context.n_segments,
+        projection_context: None,
     })
 }
 
-fn validate_context(context: &TopicClusteringContext) -> Result<()> {
+fn validate_context(context: &TopicProjectionContext) -> Result<()> {
     if context.version != CONTEXT_VERSION {
         bail!(
-            "unsupported Topic clustering context version {}",
+            "unsupported Topic projection context version {}",
             context.version
         );
     }
-    if context.leaves.len() != context.natural_cluster_count
+    if context.natural_cluster_count == 0
+        || context.leaves.len() != context.natural_cluster_count
         || context.merges.len() != context.natural_cluster_count.saturating_sub(1)
         || context
             .leaves
@@ -441,41 +554,41 @@ fn validate_context(context: &TopicClusteringContext) -> Result<()> {
             .enumerate()
             .any(|(id, leaf)| leaf.id != id)
     {
-        bail!("Topic clustering context structure is invalid");
+        bail!("Topic projection context structure is invalid");
+    }
+    for leaf in &context.leaves {
+        validate_nonzero_vector(&leaf.embedding_sum, "stored leaf embedding")?;
     }
     Ok(())
 }
 
-pub fn serialize_context(context: &TopicClusteringContext) -> Result<Vec<u8>> {
+pub fn serialize_context(context: &TopicProjectionContext) -> Result<Vec<u8>> {
     validate_context(context)?;
     let message_pack =
-        rmp_serde::to_vec_named(context).context("encode Topic clustering context")?;
+        rmp_serde::to_vec_named(context).context("encode Topic projection context")?;
     zstd::stream::encode_all(Cursor::new(message_pack), 9)
-        .context("compress Topic clustering context")
+        .context("compress Topic projection context")
 }
 
-pub fn deserialize_context(bytes: &[u8]) -> Result<TopicClusteringContext> {
+pub fn deserialize_context(bytes: &[u8]) -> Result<TopicProjectionContext> {
     let message_pack = zstd::stream::decode_all(Cursor::new(bytes))
-        .context("decompress Topic clustering context")?;
-    let context: TopicClusteringContext =
-        rmp_serde::from_slice(&message_pack).context("decode Topic clustering context")?;
+        .context("decompress Topic projection context")?;
+    let context: TopicProjectionContext =
+        rmp_serde::from_slice(&message_pack).context("decode Topic projection context")?;
     validate_context(&context)?;
     Ok(context)
 }
 
-pub fn project_serialized_context(
-    bytes: &[u8],
-    cluster_count: usize,
-) -> Result<TopicModelingResult> {
-    project(&deserialize_context(bytes)?, cluster_count)
+pub fn project_serialized_context(bytes: &[u8], topic_count: usize) -> Result<TopicModelingResult> {
+    project(&deserialize_context(bytes)?, topic_count)
 }
 
 pub fn project_basis(
-    context: &TopicClusteringContext,
-    cluster_count: usize,
+    context: &TopicProjectionContext,
+    topic_count: usize,
     corpus_sizes: &[usize],
 ) -> Result<TopicProjectionBasis> {
-    let projected = project(context, cluster_count)?;
+    let projected = project(context, topic_count)?;
     let document_count = corpus_sizes.iter().try_fold(0usize, |total, size| {
         total
             .checked_add(*size)
@@ -496,24 +609,26 @@ pub fn project_basis(
         if document.doc_index != expected_index {
             bail!("Topic projection document indices are invalid");
         }
-        has_outlier |= document.dominant_topic == OUTLIER_LABEL;
-        if document
-            .topic_distribution
-            .iter()
-            .any(|&(topic_id, proportion)| {
-                topic_id < OUTLIER_LABEL
-                    || topic_id >= cluster_count as i32
-                    || !proportion.is_finite()
-                    || proportion < 0.0
-            })
-        {
-            bail!("Topic projection distribution contains an invalid entry");
+        let maximum_topic_id =
+            i32::try_from(topic_count).context("Topic projection count exceeds i32")?;
+        if document.topic_coverage.iter().any(|&(topic_id, coverage)| {
+            topic_id < OUTLIER_LABEL
+                || topic_id >= maximum_topic_id
+                || !coverage.is_finite()
+                || coverage < 0.0
+        }) {
+            bail!("Topic projection coverage contains an invalid entry");
         }
-        let mut ranked = document
-            .topic_distribution
+        has_outlier |= document
+            .topic_coverage
             .iter()
-            .filter_map(|&(topic_id, proportion)| {
-                (topic_id >= 0 && proportion > 0.0).then_some((topic_id, proportion))
+            .any(|&(topic_id, coverage)| topic_id == OUTLIER_LABEL && coverage > 0.0);
+
+        let mut ranked = document
+            .topic_coverage
+            .iter()
+            .filter_map(|&(topic_id, coverage)| {
+                (topic_id >= 0 && coverage > 0.0).then_some((topic_id, coverage))
             })
             .collect::<Vec<_>>();
         ranked.sort_by(|left, right| {
@@ -525,9 +640,9 @@ pub fn project_basis(
 
         let mut rank_start = 0;
         while rank_start < ranked.len() {
-            let proportion = ranked[rank_start].1;
+            let coverage = ranked[rank_start].1;
             let mut rank_end = rank_start + 1;
-            while rank_end < ranked.len() && ranked[rank_end].1 == proportion {
+            while rank_end < ranked.len() && ranked[rank_end].1 == coverage {
                 rank_end += 1;
             }
             let minimum_n = rank_start + 1;
@@ -558,74 +673,67 @@ pub fn project_basis(
 
 pub fn project_serialized_context_basis(
     bytes: &[u8],
-    cluster_count: usize,
+    topic_count: usize,
     corpus_sizes: &[usize],
 ) -> Result<TopicProjectionBasis> {
-    project_basis(&deserialize_context(bytes)?, cluster_count, corpus_sizes)
-}
-
-pub fn natural_cluster_count(context: &TopicClusteringContext) -> usize {
-    context.natural_cluster_count
+    project_basis(&deserialize_context(bytes)?, topic_count, corpus_sizes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture() -> TopicClusteringContext {
+    fn fixture() -> TopicProjectionContext {
         let labels = vec![0, 0, 1, 1, 2, 2, OUTLIER_LABEL];
-        let points_5d = vec![
-            vec![0.0],
-            vec![0.2],
-            vec![10.0],
-            vec![10.2],
-            vec![30.0],
-            vec![30.2],
-            vec![99.0],
+        let embeddings = [
+            vec![1.0, 0.0],
+            vec![0.9, 0.1],
+            vec![0.95, 0.05],
+            vec![0.85, 0.15],
+            vec![-1.0, 0.0],
+            vec![-0.9, -0.1],
+            vec![0.0, 1.0],
         ];
-        let points_2d = points_5d
-            .iter()
-            .map(|point| vec![point[0], point[0]])
-            .collect::<Vec<_>>();
+        let embedding_points = embeddings.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let counts = vec![
             HashMap::from([("alpha".to_string(), 4)]),
             HashMap::from([("beta".to_string(), 3)]),
             HashMap::from([("gamma".to_string(), 2)]),
         ];
-        prepare_context(
-            2,
-            &labels,
-            &points_5d,
-            &points_2d,
-            &[0, 0, 0, 0, 1, 1, 1],
-            &[1, 1, 1, 1, 2, 2, 4],
-            &counts,
-            7,
-            0,
-        )
+        prepare_context(ProjectionInput {
+            document_count: 2,
+            labels: &labels,
+            embedding_points: &embedding_points,
+            document_indices: &[0, 0, 0, 0, 1, 1, 1],
+            owned_character_weights: &[1, 1, 1, 1, 2, 2, 4],
+            per_leaf_term_counts: &counts,
+            seed: 7,
+        })
         .unwrap()
+    }
+
+    #[test]
+    fn cosine_average_linkage_merges_nearest_topics_first() {
+        let context = fixture();
+        let projected = leaf_projection_ids(&context, 2).unwrap();
+        assert_eq!(projected, vec![0, 0, 1]);
     }
 
     #[test]
     fn deterministic_cuts_are_exact_and_canonical() {
         let context = fixture();
-        let natural = project(&context, 3).unwrap();
-        assert_eq!(
-            natural
-                .topics
-                .iter()
-                .map(|topic| topic.id)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        let merged = project(&context, 2).unwrap();
-        assert_eq!(merged.topics.len(), 2);
-        assert_eq!(merged.documents[0].dominant_topic, 0);
-        assert_eq!(merged.documents[1].dominant_topic, 1);
+        let first = project(&context, 2).unwrap();
+        let second = project(&context, 2).unwrap();
+        assert_eq!(first.topics.len(), 2);
+        assert_eq!(first.documents[0].dominant_topic, 0);
+        assert_eq!(first.documents[1].dominant_topic, OUTLIER_LABEL);
+        for (left, right) in first.topics.iter().zip(&second.topics) {
+            assert_eq!((left.id, left.x, left.y), (right.id, right.x, right.y));
+        }
     }
 
     #[test]
-    fn serialization_round_trip_and_corruption() {
+    fn serialization_round_trip_rejects_corruption_and_old_versions() {
         let context = fixture();
         let bytes = serialize_context(&context).unwrap();
         assert_eq!(
@@ -633,14 +741,21 @@ mod tests {
             2
         );
         assert!(project_serialized_context(b"not zstd", 2).is_err());
+
+        let mut old = context;
+        old.version = 1;
+        let encoded = rmp_serde::to_vec_named(&old).unwrap();
+        let compressed = zstd::stream::encode_all(Cursor::new(encoded), 1).unwrap();
+        let error = deserialize_context(&compressed).unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
     }
 
     #[test]
-    fn projection_keeps_outlier_weight_in_distribution() {
+    fn projection_keeps_outlier_weight_in_coverage() {
         let projected = project(&fixture(), 2).unwrap();
         let document = &projected.documents[1];
         let outlier = document
-            .topic_distribution
+            .topic_coverage
             .iter()
             .find(|(id, _)| *id == OUTLIER_LABEL)
             .unwrap();
@@ -648,33 +763,22 @@ mod tests {
     }
 
     #[test]
-    fn compact_basis_aggregates_ties_without_serializing_documents() {
+    fn compact_basis_aggregates_ties_and_marks_any_outlier_coverage() {
         let context = fixture();
         let basis = project_basis(&context, 3, &[1, 1]).unwrap();
-        let full_json = serde_json::to_vec(&project(&context, 3).unwrap()).unwrap();
-        let basis_json = serde_json::to_vec(&basis).unwrap();
-
         assert_eq!(basis.topics.len(), 3);
         assert_eq!(
             basis.activations,
             vec![[0, 0, 1, 1], [0, 1, 1, 1], [1, 2, 1, 1]]
         );
-        assert!(!basis.has_outlier);
-        assert!(basis_json.len() < full_json.len());
+        assert!(basis.has_outlier);
+        assert!(project_basis(&context, 3, &[1]).is_err());
     }
 
     #[test]
-    fn compact_basis_marks_all_outlier_documents_and_validates_corpora() {
-        let mut context = fixture();
-        context.document_count = 3;
-        context.segments.push(SegmentFact {
-            document_index: 2,
-            leaf_id: OUTLIER_LABEL,
-            retained_character_weight: 1,
-        });
-
-        let basis = project_basis(&context, 3, &[1, 1, 1]).unwrap();
-        assert!(basis.has_outlier);
-        assert!(project_basis(&context, 3, &[2]).is_err());
+    fn one_topic_projection_uses_origin() {
+        let projected = project(&fixture(), 1).unwrap();
+        assert_eq!(projected.topics.len(), 1);
+        assert_eq!((projected.topics[0].x, projected.topics[0].y), (0.0, 0.0));
     }
 }

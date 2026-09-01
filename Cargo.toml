@@ -1,6 +1,6 @@
 [package]
 name = "polars_text"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 
 [lib]
@@ -9,14 +9,15 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["full"]
-full = ["tokenization", "embedding", "topic-modeling"]
-cache = ["dep:duckdb", "dep:fs2", "dep:serde_json", "dep:sha2"]
+full = ["topic-modeling"]
+cache = ["dep:duckdb", "dep:fs2", "dep:serde_json", "dep:sha2", "dep:tempfile"]
 tokenization = [
     "dep:hf-hub",
     "dep:lindera",
     "dep:tokenizers",
     "dep:ureq",
     "dep:zip",
+    "dep:polars-arrow",
     "cache",
 ]
 embedding = [
@@ -24,6 +25,7 @@ embedding = [
     "dep:ndarray",
     "dep:ort",
     "dep:tokenizers",
+    "dep:polars-arrow",
     "cache",
 ]
 topic-modeling = [
@@ -31,7 +33,6 @@ topic-modeling = [
     "tokenization",
     "dep:hdbscan",
     "dep:pacmap",
-    "dep:unicode-segmentation",
     "dep:rmp-serde",
     "dep:zstd",
 ]
@@ -55,17 +56,17 @@ zip = { version = "7", default-features = false, features = [
 lindera = { version = "3", default-features = false, features = [
     "mmap",
 ], optional = true }
-once_cell = "1"
-# Keep all polars crates on the exact source tree used by Python polars 1.40.0.
+# Keep all polars crates on the exact source tree used by Python polars 1.44.1.
 # Building this crate standalone in CI must not rely on an outer workspace patch,
 # otherwise Cargo mixes crates.io polars 0.53.0 with git-tagged pyo3-polars and
 # the resolver breaks on transitive dependencies like chrono.
-polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", default-features = false, features = [
+polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.44.1", default-features = false, features = [
     "fmt",
     "dtype-struct",
 ] }
-pyo3 = "0.28"
-pyo3-polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.40.0", features = [
+polars-arrow = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.44.1", default-features = false, optional = true }
+pyo3 = "0.29"
+pyo3-polars = { git = "https://github.com/pola-rs/polars.git", tag = "py-1.44.1", features = [
     "derive",
 ] }
 regex = "1"
@@ -77,23 +78,15 @@ zstd = { version = "0.13", optional = true }
 tokenizers = { version = "0.23", default-features = false, features = [
     "onig",
 ], optional = true }
-unicode-segmentation = { version = "1.13.3", optional = true }
+unicode-segmentation = "1.13.3"
 
 # --- Topic-modeling pipeline (Rust BERTopic replacement) ---
-# ort: ONNX Runtime embeddings for Hugging Face ONNX sentence-transformer repos.
-# src/topic_modeling/embedding.rs owns automatic hf-hub downloads and runtime
-# inference. Candle was intentionally removed because acceleration needs ORT EPs.
-ort = { version = "2.0.0-rc.12", default-features = false, features = [
-    "std",
-    "ndarray",
-    "download-binaries",
-    "tls-native",
-    "api-24",
-    "directml",
-    "xnnpack",
-], optional = true }
+# src/topic_modeling/embedding.rs owns automatic hf-hub downloads and ORT
+# inference. Execution-provider features are target-specific below because ORT's
+# prebuilt distributions reject feature sets that are unavailable on a target.
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
 # pacmap: PaCMAP dimensionality reduction (ndarray 0.16). Used by
 # src/topic_modeling/reduce.rs. The static MKL backend keeps Windows wheels
 # self-contained; otherwise petal-decomposition links unresolved LAPACK symbols.
@@ -102,6 +95,48 @@ ndarray = { version = "0.16", optional = true }
 # hdbscan: density-based clustering of reduced chunk embeddings into topics.
 # Used by src/topic_modeling/cluster.rs.
 hdbscan = { version = "0.12", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-native",
+    "api-24",
+    "coreml",
+], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-native",
+    "api-24",
+    "directml",
+], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-native",
+    "api-24",
+    "xnnpack",
+], optional = true }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-native",
+    "api-24",
+], optional = true }
+
+[dev-dependencies]
+ahash = "0.8"
 
 [profile.dev]
 debug = 0

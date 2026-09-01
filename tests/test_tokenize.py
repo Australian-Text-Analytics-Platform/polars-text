@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 import polars as pl
-import polars_text
+import polars_text  # noqa: F401
 
 
 def test_tokenize_namespace() -> None:

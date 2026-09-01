@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-
 use pyo3::prelude::*;
 use pyo3::types::PyFrozenSet;
 use pyo3_polars::PolarsAllocator;
+#[cfg(feature = "tokenization")]
+use pyo3_polars::PySeries;
 
 #[cfg(feature = "cache")]
 mod cache;
@@ -11,6 +11,8 @@ mod concordance;
 pub mod expressions;
 #[cfg(feature = "tokenization")]
 mod lindera_dict;
+#[cfg(any(feature = "embedding", feature = "tokenization"))]
+mod list_output;
 #[cfg(feature = "tokenization")]
 mod offsets;
 #[cfg(feature = "tokenization")]
@@ -24,16 +26,15 @@ pub mod topic_modeling;
 static ALLOC: PolarsAllocator = PolarsAllocator::new();
 
 #[pymodule]
-fn _internal(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
-    _m.add_function(wrap_pyfunction!(compiled_features, _m)?)?;
-    _m.add_function(wrap_pyfunction!(token_frequencies_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(prefetch_tokenizer_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(loaded_tokenizers_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(debug_token_cache_snapshot_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(prefetch_embedder_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(loaded_embedders_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(project_topic_modeling_context_py, _m)?)?;
-    _m.add_function(wrap_pyfunction!(project_topic_modeling_basis_py, _m)?)?;
+fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(compiled_features, module)?)?;
+    #[cfg(feature = "tokenization")]
+    module.add_function(wrap_pyfunction!(token_frequencies_py, module)?)?;
+    #[cfg(feature = "topic-modeling")]
+    {
+        module.add_function(wrap_pyfunction!(project_topic_modeling_context_py, module)?)?;
+        module.add_function(wrap_pyfunction!(project_topic_modeling_basis_py, module)?)?;
+    }
     Ok(())
 }
 
@@ -62,156 +63,24 @@ fn compiled_features(py: Python<'_>) -> PyResult<Bound<'_, PyFrozenSet>> {
     PyFrozenSet::new(py, compiled_feature_names())
 }
 
-#[cfg(any(not(feature = "tokenization"), not(feature = "embedding")))]
-fn feature_disabled(operation: &str, feature: &str) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!(
-        "{operation} requires the '{feature}' feature; rebuild polars-text with that feature or use the default full build"
-    ))
-}
-
+#[cfg(feature = "tokenization")]
 #[pyfunction(name = "token_frequencies")]
-#[pyo3(signature = (texts, model))]
-fn token_frequencies_py(py: Python<'_>, texts: Vec<String>, model: String) -> PyResult<Py<PyAny>> {
-    token_frequencies_py_impl(py, texts, model)
-}
-
-#[cfg(feature = "tokenization")]
-fn token_frequencies_py_impl(
-    py: Python<'_>,
-    texts: Vec<String>,
-    model: String,
-) -> PyResult<Py<PyAny>> {
-    token_frequencies::token_frequencies_py(py, texts, Some(model.as_str()))
-}
-
-#[cfg(not(feature = "tokenization"))]
-fn token_frequencies_py_impl(
-    _py: Python<'_>,
-    _texts: Vec<String>,
-    _model: String,
-) -> PyResult<Py<PyAny>> {
-    Err(feature_disabled("token_frequencies", "tokenization"))
-}
-
-#[pyfunction(name = "prefetch_tokenizer")]
-#[pyo3(signature = (model_id))]
-fn prefetch_tokenizer_py(model_id: &str) -> PyResult<()> {
-    prefetch_tokenizer_py_impl(model_id)
-}
-
-#[cfg(feature = "tokenization")]
-fn prefetch_tokenizer_py_impl(model_id: &str) -> PyResult<()> {
-    tokenizer::ensure_tokenizer_for_model(Some(model_id))
-        .map(|_| ())
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
-}
-
-#[cfg(not(feature = "tokenization"))]
-fn prefetch_tokenizer_py_impl(_model_id: &str) -> PyResult<()> {
-    Err(feature_disabled("prefetch_tokenizer", "tokenization"))
-}
-
-#[pyfunction(name = "loaded_tokenizers")]
-fn loaded_tokenizers_py() -> Vec<String> {
-    loaded_tokenizers_py_impl()
-}
-
-#[cfg(feature = "tokenization")]
-fn loaded_tokenizers_py_impl() -> Vec<String> {
-    tokenizer::loaded_model_ids()
-}
-
-#[cfg(not(feature = "tokenization"))]
-fn loaded_tokenizers_py_impl() -> Vec<String> {
-    Vec::new()
-}
-
-#[pyfunction(name = "debug_token_cache_snapshot")]
-#[pyo3(signature = (path))]
-fn debug_token_cache_snapshot_py(
-    path: PathBuf,
-) -> PyResult<(Vec<String>, Vec<expressions::TokenCacheDebugRow>)> {
-    debug_token_cache_snapshot_py_impl(path)
-}
-
-#[cfg(feature = "tokenization")]
-fn debug_token_cache_snapshot_py_impl(
-    path: PathBuf,
-) -> PyResult<(Vec<String>, Vec<expressions::TokenCacheDebugRow>)> {
-    expressions::debug_token_cache_snapshot(&path)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
-}
-
-#[cfg(not(feature = "tokenization"))]
-fn debug_token_cache_snapshot_py_impl(
-    _path: PathBuf,
-) -> PyResult<(Vec<String>, Vec<expressions::TokenCacheDebugRow>)> {
-    Err(feature_disabled(
-        "debug_token_cache_snapshot",
-        "tokenization",
-    ))
-}
-
-/// Download/load the ONNX Runtime embedder for `repo_id` (default model if `None`) so
-/// a later `run_topic_modeling` call doesn't pay the load cost. Mirrors
-/// `prefetch_tokenizer`.
-#[pyfunction(name = "prefetch_embedder")]
-#[pyo3(signature = (repo_id=None))]
-fn prefetch_embedder_py(repo_id: Option<String>) -> PyResult<()> {
-    prefetch_embedder_py_impl(repo_id)
-}
-
-#[cfg(feature = "embedding")]
-fn prefetch_embedder_py_impl(repo_id: Option<String>) -> PyResult<()> {
-    topic_modeling::embedding::ensure_embedder(repo_id.as_deref())
-        .map(|_| ())
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
-}
-
-#[cfg(not(feature = "embedding"))]
-fn prefetch_embedder_py_impl(_repo_id: Option<String>) -> PyResult<()> {
-    Err(feature_disabled("prefetch_embedder", "embedding"))
-}
-
-/// Repo ids of embedders currently resident in the in-process registry.
-#[pyfunction(name = "loaded_embedders")]
-fn loaded_embedders_py() -> Vec<String> {
-    loaded_embedders_py_impl()
-}
-
-#[cfg(feature = "embedding")]
-fn loaded_embedders_py_impl() -> Vec<String> {
-    topic_modeling::embedding::loaded_embedder_ids()
-}
-
-#[pyfunction(name = "project_topic_modeling_context")]
-#[pyo3(signature = (context, cluster_count))]
-fn project_topic_modeling_context_py(context: Vec<u8>, cluster_count: usize) -> PyResult<String> {
-    project_topic_modeling_context_py_impl(&context, cluster_count)
+#[pyo3(signature = (series, model))]
+fn token_frequencies_py(py: Python<'_>, series: PySeries, model: String) -> PyResult<Py<PyAny>> {
+    token_frequencies::token_frequencies_py(py, series, Some(model.as_str()))
 }
 
 #[cfg(feature = "topic-modeling")]
-fn project_topic_modeling_context_py_impl(
-    context: &[u8],
-    cluster_count: usize,
-) -> PyResult<String> {
-    let result = topic_modeling::projection::project_serialized_context(context, cluster_count)
+#[pyfunction(name = "project_topic_modeling_context")]
+#[pyo3(signature = (context, cluster_count))]
+fn project_topic_modeling_context_py(context: Vec<u8>, cluster_count: usize) -> PyResult<String> {
+    let result = topic_modeling::projection::project_serialized_context(&context, cluster_count)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
     serde_json::to_string(&result)
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
 }
 
-#[cfg(not(feature = "topic-modeling"))]
-fn project_topic_modeling_context_py_impl(
-    _context: &[u8],
-    _cluster_count: usize,
-) -> PyResult<String> {
-    Err(feature_disabled(
-        "project_topic_modeling_context",
-        "topic-modeling",
-    ))
-}
-
+#[cfg(feature = "topic-modeling")]
 #[pyfunction(name = "project_topic_modeling_basis")]
 #[pyo3(signature = (context, cluster_count, corpus_sizes))]
 fn project_topic_modeling_basis_py(
@@ -219,40 +88,14 @@ fn project_topic_modeling_basis_py(
     cluster_count: usize,
     corpus_sizes: Vec<usize>,
 ) -> PyResult<String> {
-    project_topic_modeling_basis_py_impl(&context, cluster_count, &corpus_sizes)
-}
-
-#[cfg(feature = "topic-modeling")]
-fn project_topic_modeling_basis_py_impl(
-    context: &[u8],
-    cluster_count: usize,
-    corpus_sizes: &[usize],
-) -> PyResult<String> {
     let basis = topic_modeling::projection::project_serialized_context_basis(
-        context,
+        &context,
         cluster_count,
-        corpus_sizes,
+        &corpus_sizes,
     )
     .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
     serde_json::to_string(&basis)
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
-}
-
-#[cfg(not(feature = "topic-modeling"))]
-fn project_topic_modeling_basis_py_impl(
-    _context: &[u8],
-    _cluster_count: usize,
-    _corpus_sizes: &[usize],
-) -> PyResult<String> {
-    Err(feature_disabled(
-        "project_topic_modeling_basis",
-        "topic-modeling",
-    ))
-}
-
-#[cfg(not(feature = "embedding"))]
-fn loaded_embedders_py_impl() -> Vec<String> {
-    Vec::new()
 }
 
 #[cfg(test)]

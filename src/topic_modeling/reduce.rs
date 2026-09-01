@@ -1,4 +1,4 @@
-//! PaCMAP dimensionality reduction for topic-modeling chunk embeddings.
+//! PaCMAP dimensionality reduction for topic-modeling segment embeddings.
 //!
 //! Why this exists: density-based clustering (HDBSCAN) degrades in the raw
 //! 384-dim embedding space (the curse of dimensionality flattens density
@@ -7,14 +7,13 @@
 //! PCA-to-50-dims escape hatch; PaCMAP's internal PCA *initialization* is part
 //! of the algorithm, not a fallback for it.
 //!
-//! PaCMAP (JMLR 2021) preserves both local and global structure and is a
-//! faithful Rust port, making it the closest available stand-in for UMAP. Output
-//! is seeded for reproducibility.
+//! PaCMAP (JMLR 2021) is the selected Rust-native reducer, not an assumed UMAP
+//! equivalent. The repository's one-time quality audit compares this choice
+//! with UMAP and PCA. Output is seeded for reproducibility.
 //!
-//! Called by: `topic_modeling::run` between embedding and clustering. The
-//! orchestrator only calls this when there are enough chunks for neighbor-based
-//! reduction; tiny corpora are handled upstream as a single trivial topic rather
-//! than reduced here.
+//! Called by: `topic_modeling::run` between embedding and clustering and by the
+//! projector for merged-Topic coordinates. Corpora below three points are
+//! handled explicitly by their caller.
 
 use anyhow::Result;
 use ndarray::Array2;
@@ -38,42 +37,63 @@ impl Default for ReduceConfig {
     }
 }
 
-/// Minimum number of points PaCMAP can reduce. Its default neighbor count is 10,
-/// and it needs strictly more points than neighbors plus headroom for mid-near
-/// and far pairs; below this the orchestrator must not call `reduce`.
-pub const MIN_POINTS_FOR_REDUCTION: usize = 12;
-
 /// Reduce `points` (each a same-length embedding row) to `cfg.output_dims`.
 ///
 /// Flow: pack the rows into an `ndarray` matrix, run PaCMAP with PCA
 /// initialization and a fixed seed, then unpack the reduced matrix back into row
-/// vectors for the clusterer. Errors if called with too few points — the
-/// orchestrator guards against that, but the check keeps the failure explicit.
-pub fn reduce(points: &[Vec<f32>], cfg: &ReduceConfig) -> Result<Vec<Vec<f32>>> {
+/// vectors for the clusterer. Neighbour counts are reduced for small inputs so
+/// PaCMAP never requests more unique far points than exist.
+pub fn reduce<T: AsRef<Vec<f32>>>(points: &[T], cfg: &ReduceConfig) -> Result<Vec<Vec<f32>>> {
     let n = points.len();
-    if n < MIN_POINTS_FOR_REDUCTION {
-        anyhow::bail!("reduce called with {n} points; need at least {MIN_POINTS_FOR_REDUCTION}");
+    if n < 3 {
+        anyhow::bail!("PaCMAP reduction requires at least 3 points; received {n}");
     }
-    let dim = points[0].len();
+    let dim = points[0].as_ref().len();
     if dim == 0 {
         anyhow::bail!("reduce called with zero-dimensional points");
     }
-    if points.iter().any(|p| p.len() != dim) {
+    if points.iter().any(|p| p.as_ref().len() != dim) {
         anyhow::bail!("reduce called with ragged embedding rows");
     }
+    if points
+        .iter()
+        .flat_map(|point| point.as_ref())
+        .any(|value| !value.is_finite())
+    {
+        anyhow::bail!("reduce called with non-finite embedding values");
+    }
+    if cfg.output_dims < 2 {
+        anyhow::bail!("PaCMAP output dimensions must be at least 2");
+    }
+    let max_output_dims = dim.min(n).min(if dim > 100 { 100 } else { dim });
+    if cfg.output_dims > max_output_dims {
+        anyhow::bail!(
+            "PaCMAP output dimensions {} exceed the usable rank {max_output_dims} for {n}x{dim} input",
+            cfg.output_dims
+        );
+    }
 
-    let flat: Vec<f32> = points.iter().flatten().copied().collect();
+    let flat: Vec<f32> = points
+        .iter()
+        .flat_map(|point| point.as_ref())
+        .copied()
+        .collect();
     let matrix = Array2::from_shape_vec((n, dim), flat)
         .map_err(|e| anyhow::anyhow!("failed to build embedding matrix: {e}"))?;
 
+    let (n_neighbors, far_pair_ratio) = if n == 3 {
+        (1, 1.0)
+    } else {
+        (10.min((n - 1) / 3).max(1), 2.0)
+    };
     let config = Configuration {
         embedding_dimensions: cfg.output_dims,
         // PCA init is PaCMAP's standard, deterministic starting point — this is
         // the algorithm's own initialization, not the rejected PCA fallback.
         initialization: Initialization::Pca,
         mid_near_ratio: 0.5,
-        far_pair_ratio: 2.0,
-        override_neighbors: None,
+        far_pair_ratio,
+        override_neighbors: Some(n_neighbors),
         seed: Some(cfg.seed),
         pair_configuration: PairConfiguration::Generate,
         learning_rate: 1.0,
@@ -85,13 +105,19 @@ pub fn reduce(points: &[Vec<f32>], cfg: &ReduceConfig) -> Result<Vec<Vec<f32>>> 
     let (embedding, _snapshots) = fit_transform(matrix.view(), config)
         .map_err(|e| anyhow::anyhow!("PaCMAP fit_transform failed: {e}"))?;
 
-    let out_dim = embedding.ncols();
+    if embedding.nrows() != n || embedding.ncols() != cfg.output_dims {
+        anyhow::bail!(
+            "PaCMAP returned shape {}x{}; expected {n}x{}",
+            embedding.nrows(),
+            embedding.ncols(),
+            cfg.output_dims
+        );
+    }
     let reduced = embedding
         .rows()
         .into_iter()
         .map(|row| row.to_vec())
         .collect::<Vec<_>>();
-    debug_assert!(reduced.iter().all(|r| r.len() == out_dim));
     Ok(reduced)
 }
 
@@ -101,16 +127,16 @@ mod tests {
 
     #[test]
     fn reduce_rejects_too_few_points() {
-        let pts = vec![vec![0.0f32, 1.0]; 3];
+        let pts = vec![vec![0.0f32, 1.0]; 2];
         let err = reduce(&pts, &ReduceConfig::default()).unwrap_err();
-        assert!(err.to_string().contains("at least"), "{err}");
+        assert!(err.to_string().contains("at least 3"), "{err}");
     }
 
     #[test]
     fn reduce_outputs_requested_dimensionality() {
         // Two well-separated Gaussians-ish blobs in 8-dim, enough points for
         // PaCMAP. We only assert shape + determinism here, never exact values.
-        let mut pts = Vec::new();
+        let mut pts: Vec<Vec<f32>> = Vec::new();
         for i in 0..40 {
             let base = if i % 2 == 0 { 0.0 } else { 5.0 };
             pts.push((0..8).map(|j| base + (i * j % 3) as f32 * 0.01).collect());
@@ -132,5 +158,41 @@ mod tests {
                 assert!((x - y).abs() < 1e-2, "{x} vs {y}");
             }
         }
+    }
+
+    #[test]
+    fn reduce_rejects_single_output_dimension() {
+        let pts = vec![vec![0.0f32, 1.0]; 12];
+        let err = reduce(
+            &pts,
+            &ReduceConfig {
+                output_dims: 1,
+                seed: 42,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at least 2"), "{err}");
+    }
+
+    #[test]
+    fn reduce_rejects_output_wider_than_input_rank() {
+        let pts = vec![vec![0.0f32, 1.0]; 12];
+        let err = reduce(
+            &pts,
+            &ReduceConfig {
+                output_dims: 3,
+                seed: 42,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("usable rank 2"), "{err}");
+    }
+
+    #[test]
+    fn reduce_rejects_non_finite_values() {
+        let mut pts = vec![vec![0.0f32, 1.0]; 12];
+        pts[0][0] = f32::NAN;
+        let err = reduce(&pts, &ReduceConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("non-finite"), "{err}");
     }
 }

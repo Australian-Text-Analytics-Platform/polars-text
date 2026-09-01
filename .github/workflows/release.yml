@@ -58,7 +58,7 @@ jobs:
             - name: Build wheel
               uses: PyO3/maturin-action@v1
               with:
-                  maturin-version: v1.14.1
+                  maturin-version: v1.15.0
                   target: ${{ matrix.target }}
                   manylinux: ${{ matrix.manylinux || '' }}
                   before-script-linux: ${{ matrix.before-script-linux || '' }}
@@ -109,7 +109,7 @@ jobs:
               uses: PyO3/maturin-action@v1
               with:
                   command: sdist
-                  maturin-version: v1.14.1
+                  maturin-version: v1.15.0
                   rust-toolchain: stable
                   args: --out dist
 

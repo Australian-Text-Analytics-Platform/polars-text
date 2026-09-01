@@ -1,34 +1,18 @@
-//! Rust topic-modeling pipeline — an offline, long-text replacement for the
-//! Python BERTopic path.
+//! Native topic-modeling pipeline.
 //!
-//! Pipeline (one uniform path for short and long text alike):
-//!   1. `chunking`  — split each document into token-budgeted Topic Segments
-//!      (a short document is simply one segment).
-//!   2. `embedding` — ONNX Runtime sentence embeddings per segment.
-//!   3. `reduce`    — PaCMAP dimensionality reduction for clusterability.
-//!   4. `cluster`   — HDBSCAN groups segments into topics (with `-1` outliers).
-//!   5. `ctfidf`    — c-TF-IDF keyword labels per topic.
-//!   6. `rollup`    — aggregate segment topics into a per-document distribution
-//!      plus a dominant topic.
-//!   7. `coords`    — 2D topic-centroid coordinates for the bubble chart.
+//! One uniform path handles short and long text:
+//! 1. `segmentation` creates non-overlapping, token-budgeted source spans.
+//! 2. `embedding` produces sentence embeddings for those spans.
+//! 3. `reduce` maps embeddings to an adaptive clustering space with PaCMAP.
+//! 4. `cluster` assigns HDBSCAN Topics and explicit `-1` outliers.
+//! 5. `ctfidf` labels each real Topic from its assigned source spans.
+//! 6. `rollup` reports per-document source-character coverage.
 //!
-//! `run` chains these stages; `run_topic_modeling` (in `lib.rs`) is the PyO3
-//! entry the backend worker calls. There is no length branching — the only
-//! special case is a *numeric guard* for corpora too small for PaCMAP to fit,
-//! which collapse to a single trivial topic (NOT a PCA fallback, NOT a
-//! short-text path).
-//!
-//! Determinism note: the per-stage deterministic logic is unit-tested; `run`
-//! itself depends on downloaded model weights and PaCMAP's seeded-but-not-
-//! bit-exact reduction, so it is validated by the manual harness (Phase 2),
-//! not CI.
+//! Corpora without enough density evidence return an explicit no-topic result;
+//! the pipeline never fabricates a cluster to keep the result non-empty.
 
 #[cfg(feature = "topic-modeling")]
-pub mod chunking;
-#[cfg(feature = "topic-modeling")]
 pub mod cluster;
-#[cfg(feature = "topic-modeling")]
-pub mod coords;
 #[cfg(feature = "topic-modeling")]
 pub mod ctfidf;
 #[cfg(feature = "embedding")]
@@ -43,19 +27,19 @@ pub mod projection;
 pub mod reduce;
 #[cfg(feature = "topic-modeling")]
 pub mod rollup;
+#[cfg(feature = "topic-modeling")]
+pub mod segmentation;
 
 #[cfg(feature = "topic-modeling")]
-use std::{path::Path, time::Instant};
+use std::path::Path;
 
 #[cfg(feature = "topic-modeling")]
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(feature = "topic-modeling")]
 use serde::Serialize;
 
 #[cfg(feature = "topic-modeling")]
 use crate::tokenizer::PLAIN_WORDS_EN_MODEL_ID;
-#[cfg(feature = "topic-modeling")]
-use chunking::ChunkingConfig;
 #[cfg(feature = "topic-modeling")]
 use cluster::ClusterConfig;
 #[cfg(feature = "topic-modeling")]
@@ -63,37 +47,23 @@ use ctfidf::RepresentativeWord;
 #[cfg(feature = "topic-modeling")]
 use embedding_cache::{get_or_insert_embeddings, CacheScope};
 #[cfg(feature = "topic-modeling")]
-use reduce::{ReduceConfig, MIN_POINTS_FOR_REDUCTION};
-
-/// Number of dimensions for the visualization-only reduction feeding the bubble
-/// chart. Always 2 (x, y).
+use reduce::ReduceConfig;
 #[cfg(feature = "topic-modeling")]
-const COORD_DIMS: usize = 2;
+use segmentation::SegmentationConfig;
 
-/// ORT inference batch size for topic-modeling chunks. This mirrors the public
-/// `.text.embedding(batch_size=None)` default so topic modeling is bounded even
-/// when a corpus yields thousands of chunks.
+/// ORT inference batch size for Topic Segments.
 #[cfg(feature = "topic-modeling")]
 const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
 
-/// All knobs for one topic-modeling run. The backend maps its public options
-/// (`random_seed`, sampling, CJK vectorizer choice) onto these fields and fixes
-/// the natural HDBSCAN leaf size internally.
+/// Supported controls for one topic-modeling run.
 #[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    /// HF repo id of the ONNX embedder; `None` uses the default ONNX model.
     pub embedder_repo_id: Option<String>,
-    /// Optional path to the per-user DuckDB embedding cache (`embeddings.duckdb`).
     pub embedding_cache_path: Option<String>,
-    pub chunking: ChunkingConfig,
-    /// PaCMAP clustering-space dimensionality (≈5–15).
-    pub reduce_dims: usize,
-    /// Seed shared by both PaCMAP passes for reproducibility.
+    pub segmentation: SegmentationConfig,
     pub seed: u64,
     pub cluster: ClusterConfig,
-    /// Tokenizer model id used to segment topic text for c-TF-IDF (e.g.
-    /// `lindera:jieba` for Chinese). `None` falls back to English plain words.
     pub vectorizer_model_id: Option<String>,
     pub lowercase: bool,
 }
@@ -104,8 +74,7 @@ impl Default for RunConfig {
         Self {
             embedder_repo_id: None,
             embedding_cache_path: None,
-            chunking: ChunkingConfig::default(),
-            reduce_dims: ReduceConfig::default().output_dims,
+            segmentation: SegmentationConfig::default(),
             seed: ReduceConfig::default().seed,
             cluster: ClusterConfig::default(),
             vectorizer_model_id: None,
@@ -114,7 +83,7 @@ impl Default for RunConfig {
     }
 }
 
-/// One topic for the bubble chart and topic table.
+/// One Topic for the bubble chart and Topic table.
 #[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicInfo {
@@ -124,48 +93,26 @@ pub struct TopicInfo {
     pub y: f32,
 }
 
-/// One document's topic outcome: the full distribution and its dominant topic.
+/// One document's source-character Topic coverage and dominant Topic.
 #[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentResult {
     pub doc_index: usize,
     pub dominant_topic: i32,
-    /// `(topic_id, proportion)` pairs summing to 1 over the retained character
-    /// length of the document's Topic Segments.
-    pub topic_distribution: Vec<(i32, f32)>,
+    /// `(topic_id, coverage)` pairs summing to one over owned Topic Segment
+    /// characters. HDBSCAN outlier `-1` remains explicit.
+    pub topic_coverage: Vec<(i32, f32)>,
 }
 
-/// One measured native topic-modeling stage, in milliseconds.
-#[cfg(feature = "topic-modeling")]
-#[derive(Debug, Clone, Serialize)]
-pub struct StageTiming {
-    pub stage: String,
-    pub elapsed_ms: f64,
-}
-
-/// Full pipeline output handed back to Python.
+/// Full pipeline output handed back to Polars.
 #[cfg(feature = "topic-modeling")]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicModelingResult {
     pub topics: Vec<TopicInfo>,
     pub documents: Vec<DocumentResult>,
-    pub n_chunks: usize,
-    pub truncated_segment_count: usize,
-    pub stage_timings_ms: Vec<StageTiming>,
+    pub n_segments: usize,
     #[serde(skip)]
-    pub clustering_context: Vec<u8>,
-}
-
-#[cfg(feature = "topic-modeling")]
-fn record_stage_timing(
-    stage_timings_ms: &mut Vec<StageTiming>,
-    stage: &'static str,
-    started_at: Instant,
-) {
-    stage_timings_ms.push(StageTiming {
-        stage: stage.to_string(),
-        elapsed_ms: started_at.elapsed().as_secs_f64() * 1000.0,
-    });
+    pub projection_context: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "topic-modeling")]
@@ -189,46 +136,61 @@ fn encode_topic_embedding_batches(
 }
 
 /// Run the full pipeline on `documents`.
-///
-/// Flow:
-///  1. Load the embedder and chunk every document with its sizing tokenizer.
-///  2. If there are enough chunks for PaCMAP, embed → reduce(5D) → HDBSCAN, and
-///     separately reduce(2D) for coordinates. Too few chunks collapse to one
-///     trivial topic (numeric guard); zero chunks yield no topics.
-///  3. Concatenate each topic's chunk text, then c-TF-IDF for keywords.
-///  4. Roll segment labels up to length-weighted per-document distributions,
-///     then assemble the topic/document payload.
 #[cfg(feature = "topic-modeling")]
-pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult> {
-    let total_started_at = Instant::now();
-    let mut stage_timings_ms = Vec::new();
-
-    let stage_started_at = Instant::now();
+pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     let embedder = embedding::ensure_embedder(cfg.embedder_repo_id.as_deref())?;
-    record_stage_timing(&mut stage_timings_ms, "embedder_load", stage_started_at);
+    if cfg.segmentation.max_tokens > embedder.max_length() {
+        anyhow::bail!(
+            "segmentation max_tokens {} exceeds model {} maximum length {}",
+            cfg.segmentation.max_tokens,
+            embedder.model_id(),
+            embedder.max_length()
+        );
+    }
 
-    let stage_started_at = Instant::now();
-    let chunking_result =
-        chunking::chunk_documents(documents, embedder.sizing_tokenizer(), &cfg.chunking)?;
-    let chunks = chunking_result.chunks;
-    let truncated_segment_count = chunking_result.truncated_count;
-    record_stage_timing(&mut stage_timings_ms, "chunking", stage_started_at);
-    let n_chunks = chunks.len();
+    let segments = segmentation::segment_documents(
+        documents,
+        &embedder.sizing_tokenizer(),
+        &cfg.segmentation,
+    )?
+    .segments;
+    let segment_doc_indices = segments
+        .iter()
+        .map(|segment| segment.doc_index)
+        .collect::<Vec<_>>();
+    let segment_weights = segments
+        .iter()
+        .map(|segment| segment.owned_character_count)
+        .collect::<Vec<_>>();
 
-    // Materialize embeddings for every non-empty chunk set before the tiny-
-    // corpus guard so the DuckDB embedding cache observes all text pieces. The
-    // guard below skips only PaCMAP/HDBSCAN when there are too few points.
-    let embeddings: Vec<Vec<f32>> = if n_chunks == 0 {
-        Vec::new()
-    } else {
-        let stage_started_at = Instant::now();
-        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let embeddings = if let Some(cache_path) = cfg.embedding_cache_path.as_deref() {
+    // PaCMAP needs at least three points and HDBSCAN needs at least one full
+    // minimum cluster. Anything smaller has no defensible density-based Topic.
+    let minimum_evidence = cfg.cluster.min_cluster_size.max(3);
+    if segments.len() < minimum_evidence {
+        return Ok(no_topic_result(
+            documents.len(),
+            &segment_doc_indices,
+            &segment_weights,
+        ));
+    }
+
+    // Cache and ONNX APIs own strings, so source spans are materialized exactly
+    // once at that boundary and reused for c-TF-IDF.
+    let texts = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .text(documents[segment.doc_index])
+                .map(str::to_owned)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let embeddings: Vec<std::sync::Arc<Vec<f32>>> =
+        if let Some(cache_path) = cfg.embedding_cache_path.as_deref() {
             get_or_insert_embeddings(
                 Path::new(cache_path),
                 CacheScope {
                     model_id: embedder.model_id(),
-                    revision: embedder.model_revision(),
+                    fingerprint: embedder.cache_fingerprint(),
                     provider_id: embedder.provider_id(),
                 },
                 &texts,
@@ -236,115 +198,103 @@ pub fn run(documents: &[String], cfg: &RunConfig) -> Result<TopicModelingResult>
             )?
         } else {
             encode_topic_embedding_batches(&texts, |batch| embedder.encode(batch))?
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect()
         };
-        record_stage_timing(&mut stage_timings_ms, "embedding", stage_started_at);
-        embeddings
-    };
 
-    // Stages 3-4 produce: a topic label per chunk, the topic count, and a 2D
-    // coordinate per topic. The guard branches differ only in how labels/coords
-    // are obtained — everything downstream is identical (no length branching).
-    let (labels, n_topics, reduced_5d, reduced_2d): (
-        Vec<i32>,
-        usize,
-        Vec<Vec<f32>>,
-        Vec<Vec<f32>>,
-    ) = if n_chunks == 0 {
-        (Vec::new(), 0, Vec::new(), Vec::new())
-    } else if n_chunks < MIN_POINTS_FOR_REDUCTION {
-        // Too few chunks for PaCMAP to fit a neighbor graph: one topic.
-        (
-            vec![0; n_chunks],
-            1,
-            vec![vec![0.0; cfg.reduce_dims]; n_chunks],
-            vec![vec![0.0; COORD_DIMS]; n_chunks],
-        )
-    } else {
-        let stage_started_at = Instant::now();
-        let reduced = reduce::reduce(
-            &embeddings,
-            &ReduceConfig {
-                output_dims: cfg.reduce_dims,
-                seed: cfg.seed,
-            },
-        )?;
-        record_stage_timing(&mut stage_timings_ms, "reduce_clustering", stage_started_at);
-
-        // HDBSCAN establishes the natural maximum-resolution leaves. The
-        // projection context built below can merge those real topics later.
-        let stage_started_at = Instant::now();
-        let clustered = cluster::cluster(&reduced, &cfg.cluster)?;
-        let labels = clustered.labels;
-        let n_topics = clustered.n_topics;
-        record_stage_timing(&mut stage_timings_ms, "hdbscan", stage_started_at);
-
-        let stage_started_at = Instant::now();
-        let two_d = reduce::reduce(
-            &embeddings,
-            &ReduceConfig {
-                output_dims: COORD_DIMS,
-                seed: cfg.seed,
-            },
-        )?;
-        record_stage_timing(
-            &mut stage_timings_ms,
-            "reduce_coordinates",
-            stage_started_at,
-        );
-
-        let stage_started_at = Instant::now();
-        let _coords = coords::topic_coords_2d(&two_d, &labels, n_topics);
-        record_stage_timing(&mut stage_timings_ms, "topic_coordinates", stage_started_at);
-        (labels, n_topics, reduced, two_d)
-    };
-
-    // c-TF-IDF: one "document" per topic = its chunks concatenated.
-    let mut topic_texts = vec![String::new(); n_topics];
-    for (chunk, &label) in chunks.iter().zip(&labels) {
-        if label >= 0 && (label as usize) < n_topics {
-            let t = label as usize;
-            topic_texts[t].push_str(&chunk.text);
-            topic_texts[t].push(' ');
-        }
+    let embedding_width = embeddings
+        .first()
+        .map(|embedding| embedding.len())
+        .context("topic embedder returned no vectors")?;
+    let reduce_dims = 5usize.min(embedding_width).min(segments.len());
+    if reduce_dims < 2 {
+        anyhow::bail!("topic embeddings do not have enough usable dimensions");
     }
+    let reduced = reduce::reduce(
+        &embeddings,
+        &ReduceConfig {
+            output_dims: reduce_dims,
+            seed: cfg.seed,
+        },
+    )?;
+    let clustered = cluster::cluster(&reduced, &cfg.cluster)?;
+    if clustered.n_topics == 0 {
+        return Ok(no_topic_result(
+            documents.len(),
+            &segment_doc_indices,
+            &segment_weights,
+        ));
+    }
+
     let vectorizer = cfg
         .vectorizer_model_id
         .as_deref()
         .unwrap_or(PLAIN_WORDS_EN_MODEL_ID);
-    let stage_started_at = Instant::now();
-    let term_counts = ctfidf::count_topic_terms(&topic_texts, Some(vectorizer), cfg.lowercase)?;
-    record_stage_timing(
-        &mut stage_timings_ms,
-        "ctfidf_count_terms",
-        stage_started_at,
-    );
-
-    let chunk_doc_index: Vec<usize> = chunks.iter().map(|c| c.doc_index).collect();
-    let chunk_weights: Vec<usize> = chunks.iter().map(|c| c.text.chars().count()).collect();
-    let stage_started_at = Instant::now();
-    let context = projection::prepare_context(
-        documents.len(),
-        &labels,
-        &reduced_5d,
-        &reduced_2d,
-        &chunk_doc_index,
-        &chunk_weights,
-        &term_counts,
-        n_chunks,
-        truncated_segment_count,
+    let term_counts = ctfidf::count_topic_terms(
+        clustered.n_topics,
+        clustered
+            .labels
+            .iter()
+            .copied()
+            .zip(texts.iter().map(String::as_str)),
+        Some(vectorizer),
+        cfg.lowercase,
     )?;
-    let mut result = projection::project(&context, n_topics)?;
-    record_stage_timing(&mut stage_timings_ms, "ctfidf_scores", stage_started_at);
-    record_stage_timing(&mut stage_timings_ms, "total", total_started_at);
-    result.stage_timings_ms = stage_timings_ms;
-    result.clustering_context = projection::serialize_context(&context)?;
+    let embedding_points = embeddings
+        .iter()
+        .map(|embedding| embedding.as_slice())
+        .collect::<Vec<_>>();
+    let context = projection::prepare_context(projection::ProjectionInput {
+        document_count: documents.len(),
+        labels: &clustered.labels,
+        embedding_points: &embedding_points,
+        document_indices: &segment_doc_indices,
+        owned_character_weights: &segment_weights,
+        per_leaf_term_counts: &term_counts,
+        seed: cfg.seed,
+    })?;
+    let mut result = projection::project(&context, clustered.n_topics)?;
+    result.projection_context = Some(projection::serialize_context(&context)?);
     Ok(result)
+}
+
+#[cfg(feature = "topic-modeling")]
+fn no_topic_result(
+    document_count: usize,
+    segment_doc_indices: &[usize],
+    segment_weights: &[usize],
+) -> TopicModelingResult {
+    let labels = vec![cluster::OUTLIER_LABEL; segment_doc_indices.len()];
+    let documents = rollup::rollup(
+        document_count,
+        segment_doc_indices,
+        &labels,
+        segment_weights,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(doc_index, topics)| DocumentResult {
+        doc_index,
+        dominant_topic: topics.dominant_topic,
+        topic_coverage: topics
+            .topic_coverage
+            .into_iter()
+            .map(|entry| (entry.topic_id, entry.coverage))
+            .collect(),
+    })
+    .collect();
+    TopicModelingResult {
+        topics: Vec::new(),
+        documents,
+        n_segments: segment_doc_indices.len(),
+        projection_context: None,
+    }
 }
 
 #[cfg(all(test, feature = "topic-modeling"))]
 mod tests {
     use super::*;
-    use anyhow::Context;
 
     #[test]
     fn topic_embedding_batches_are_bounded_and_ordered() -> Result<()> {
@@ -372,5 +322,18 @@ mod tests {
         assert_eq!(vectors.first(), Some(&vec![0.0]));
         assert_eq!(vectors.last(), Some(&vec![69.0]));
         Ok(())
+    }
+
+    #[test]
+    fn insufficient_evidence_is_explicitly_all_outlier() {
+        let result = no_topic_result(2, &[0], &[4]);
+        assert!(result.topics.is_empty());
+        assert!(result.projection_context.is_none());
+        assert_eq!(result.documents[0].dominant_topic, cluster::OUTLIER_LABEL);
+        assert_eq!(
+            result.documents[0].topic_coverage,
+            vec![(cluster::OUTLIER_LABEL, 1.0)]
+        );
+        assert!(result.documents[1].topic_coverage.is_empty());
     }
 }

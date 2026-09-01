@@ -1,34 +1,31 @@
 #[cfg(feature = "tokenization")]
-use std::collections::{HashMap, HashSet};
-#[cfg(feature = "tokenization")]
-use std::path::Path;
-
-#[cfg(feature = "tokenization")]
 use anyhow::{Context, Result as AnyhowResult};
 #[cfg(feature = "tokenization")]
-use duckdb::{params, Connection, Error as DuckDbError};
-#[cfg(any(feature = "embedding", feature = "tokenization"))]
-use polars::chunked_array::builder::{AnonymousOwnedListBuilder, ListBuilderTrait};
+use duckdb::{params, Connection};
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
+#[cfg(feature = "tokenization")]
+use std::collections::HashMap;
+#[cfg(feature = "tokenization")]
+use std::path::Path;
+#[cfg(any(feature = "embedding", feature = "tokenization"))]
+use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(feature = "tokenization")]
-use crate::cache::{get_or_insert_text_values, hash_text, TextCacheTable};
+use crate::cache::{get_or_insert_text_values, hash_text, stage_requested_hashes, TextCacheTable};
 #[cfg(feature = "tokenization")]
 use crate::concordance::{
-    concordance_for_text, concordance_struct_type, list_struct_output, struct_series_from_matches,
-    ConcordanceKwargs,
+    concordance_for_text, list_struct_output, struct_series_from_matches, ConcordanceKwargs,
 };
+#[cfg(any(feature = "embedding", feature = "tokenization"))]
+use crate::list_output::list_from_spans;
 #[cfg(feature = "tokenization")]
-use crate::tokenizer::{ensure_tokenizer_for_model, TokenizerBackend};
+use crate::tokenizer::{ensure_tokenizer_for_model, tokenizer_cache_fingerprint, TokenizerBackend};
 #[cfg(feature = "embedding")]
 use crate::topic_modeling::embedding::{ensure_embedder, Embedder};
 #[cfg(feature = "embedding")]
 use crate::topic_modeling::embedding_cache::{get_or_insert_embeddings, CacheScope};
-
-fn string_output(input_fields: &[Field]) -> PolarsResult<Field> {
-    Ok(Field::new(input_fields[0].name().clone(), DataType::String))
-}
 
 fn int_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), DataType::Int64))
@@ -50,135 +47,28 @@ fn embedding_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), dtype))
 }
 
-fn clean_text_value(text: &str) -> String {
-    let lowered = text.to_lowercase();
-    let mut cleaned = String::with_capacity(lowered.len());
-    for ch in lowered.chars() {
-        if ch.is_ascii_punctuation() {
-            cleaned.push(' ');
-        } else if ch.is_ascii_digit() {
-            cleaned.push(' ');
-        } else {
-            cleaned.push(ch);
-        }
-    }
-    let mut normalized = String::new();
-    let mut last_space = false;
-    for ch in cleaned.chars() {
-        if ch.is_whitespace() {
-            if !last_space {
-                normalized.push(' ');
-                last_space = true;
-            }
-        } else {
-            normalized.push(ch);
-            last_space = false;
-        }
-    }
-    normalized.trim().to_string()
-}
-
-fn map_string_values(
-    inputs: &[Series],
-    mut map: impl FnMut(&str) -> String,
-) -> PolarsResult<Series> {
-    let ca = inputs[0].str()?;
-    let out: Vec<String> = ca
-        .into_iter()
-        .map(|opt_text| opt_text.map(&mut map).unwrap_or_default())
-        .collect();
-    Ok(Series::new(ca.name().clone(), out))
-}
-
 fn count_string_values(
     inputs: &[Series],
     mut count: impl FnMut(&str) -> i64,
 ) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
     let out: Vec<i64> = ca
-        .into_iter()
+        .iter()
         .map(|opt_text| opt_text.map(&mut count).unwrap_or(0))
         .collect();
     Ok(Series::new(ca.name().clone(), out))
 }
 
-#[polars_expr(output_type_func=string_output)]
-pub fn clean_text(inputs: &[Series]) -> PolarsResult<Series> {
-    map_string_values(inputs, clean_text_value)
-}
-
-/// Heuristic test for "writing-system characters that are their own word
-/// boundary" — covers Han ideographs (used by Chinese and parts of
-/// Japanese/Korean), Hiragana, Katakana, and Hangul syllables. Punctuation
-/// and spaces are intentionally excluded because they aren't words.
-fn is_cjk_word_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x4E00..=0x9FFF      // CJK Unified Ideographs
-            | 0x3400..=0x4DBF // CJK Extension A
-            | 0x20000..=0x2A6DF // CJK Extension B
-            | 0x3040..=0x309F // Hiragana
-            | 0x30A0..=0x30FF // Katakana
-            | 0xAC00..=0xD7AF // Hangul Syllables
-    )
-}
-
 #[polars_expr(output_type_func=int_output)]
 pub fn word_count(inputs: &[Series]) -> PolarsResult<Series> {
-    // Phase 3.4: ``split_whitespace`` returns 1 for pure-CJK text because
-    // CJK orthography has no inter-word whitespace. Detect that case and
-    // count each CJK character as one word — a coarse heuristic that gives
-    // a meaningful non-zero count on Chinese / Japanese corpora without a
-    // tokenizer round-trip. For real word-level counts post-Tokenise, use
-    // ``pl.col(derived_tokens_col).list.len()``. English / whitespace-
-    // tokenised flows are byte-identical: any text with internal whitespace
-    // still goes through ``split_whitespace``.
-    count_string_values(inputs, |text| {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            0
-        } else if trimmed.chars().any(|c| c.is_whitespace()) {
-            trimmed.split_whitespace().count() as i64
-        } else if trimmed.chars().all(is_cjk_word_char) {
-            trimmed.chars().count() as i64
-        } else {
-            // Mixed CJK + non-CJK with no whitespace (e.g. CJK followed by
-            // Latin punctuation): treat the whole run as one word, matching
-            // the existing semantics.
-            1
-        }
-    })
-}
-
-#[polars_expr(output_type_func=int_output)]
-pub fn char_count(inputs: &[Series]) -> PolarsResult<Series> {
-    count_string_values(inputs, |text| text.chars().count() as i64)
-}
-
-/// Sentence terminators covered by ``sentence_count``. ASCII ``. ! ?``
-/// plus the full-width variants used in Chinese and Japanese writing, plus
-/// a few common non-Latin terminators we've seen in real corpora. Add
-/// future scripts here rather than at the call site so the contract stays
-/// in one place.
-fn is_sentence_terminator(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | '!' | '?'           // ASCII
-            | '。' | '！' | '？'    // CJK full-width (Chinese, Japanese)
-            | '۔'                  // Arabic full stop
-            | '؟'                  // Arabic question mark
-            | '।' | '॥' // Devanagari danda / double danda
-    )
+    count_string_values(inputs, |text| text.unicode_words().count() as i64)
 }
 
 #[polars_expr(output_type_func=int_output)]
 pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
-    // Phase 3.3: terminator set is Unicode-aware. EN flows are byte-identical
-    // because the ASCII terminators are still in the set; CJK now splits on
-    // ``。！？`` correctly instead of returning 1 for an entire paragraph.
     count_string_values(inputs, |text| {
-        text.split(is_sentence_terminator)
-            .filter(|segment| !segment.trim().is_empty())
+        text.unicode_sentences()
+            .filter(|sentence| !sentence.trim().is_empty())
             .count() as i64
     })
 }
@@ -187,37 +77,26 @@ pub fn sentence_count(inputs: &[Series]) -> PolarsResult<Series> {
 #[polars_expr(output_type_func=list_struct_output)]
 pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
+    let mut spans = Vec::with_capacity(ca.len());
+    let mut flat = struct_series_from_matches(Vec::new())?;
 
-    let mut builder = AnonymousOwnedListBuilder::new(
-        PlSmallStr::EMPTY,
-        ca.len(),
-        Some(concordance_struct_type()),
-    );
-
-    for opt_text in ca.into_iter() {
+    for opt_text in ca.iter() {
+        let start = flat.len();
         let text = match opt_text {
             Some(value) => value,
             None => {
-                builder.append_empty();
+                spans.push((start, start));
                 continue;
             }
         };
 
         let matches = concordance_for_text(text, &kwargs)
             .map_err(|e| PolarsError::ComputeError(format!("Concordance failed: {e}").into()))?;
-        if matches.is_empty() {
-            builder.append_empty();
-        } else {
-            let struct_series = struct_series_from_matches(matches);
-            builder.append_series(&struct_series).map_err(|e| {
-                PolarsError::ComputeError(format!("Concordance failed: {e}").into())
-            })?;
-        }
+        let struct_series = struct_series_from_matches(matches)?;
+        flat.append(&struct_series)?;
+        spans.push((start, flat.len()));
     }
-
-    let mut list = builder.finish();
-    list.rename(ca.name().clone());
-    Ok(list.into_series())
+    list_from_spans(ca.name().clone(), &flat, &spans)
 }
 
 #[cfg(feature = "tokenization")]
@@ -235,12 +114,13 @@ struct TokenizeKwargs {
 const TOKEN_CACHE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS token_cache (
     model VARCHAR NOT NULL,
+    fingerprint VARCHAR NOT NULL,
     params_hash VARCHAR NOT NULL,
     content_hash VARCHAR NOT NULL,
     tokens VARCHAR[] NOT NULL,
     start_offsets BIGINT[] NOT NULL,
     end_offsets BIGINT[] NOT NULL,
-    PRIMARY KEY (model, params_hash, content_hash)
+    PRIMARY KEY (model, fingerprint, params_hash, content_hash)
 )
 "#;
 
@@ -252,7 +132,6 @@ struct TokenCacheParams {
 }
 
 #[cfg(feature = "tokenization")]
-#[derive(Clone)]
 struct TokenCacheEntry {
     tokens: Vec<String>,
     starts: Vec<i64>,
@@ -301,66 +180,8 @@ impl TokenCacheEntry {
 #[cfg(feature = "tokenization")]
 struct TokenCacheTable<'a> {
     model_id: &'a str,
+    fingerprint: &'a str,
     params_hash: &'a str,
-}
-
-pub(crate) type TokenCacheDebugRow = (String, String, String, Vec<String>, Vec<i64>, Vec<i64>);
-
-#[cfg(feature = "tokenization")]
-pub(crate) fn debug_token_cache_snapshot(
-    path: &Path,
-) -> AnyhowResult<(Vec<String>, Vec<TokenCacheDebugRow>)> {
-    let conn = Connection::open(path).with_context(|| format!("open cache {}", path.display()))?;
-
-    let mut schema_stmt = conn
-        .prepare("DESCRIBE token_cache")
-        .context("prepare token cache schema snapshot")?;
-    let schema_rows = schema_stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("query token cache schema snapshot")?;
-    let mut columns = Vec::new();
-    for column in schema_rows {
-        columns.push(column.context("read token cache schema row")?);
-    }
-
-    let mut row_stmt = conn
-        .prepare(
-            r#"
-            SELECT model, params_hash, content_hash,
-                   to_json(tokens), to_json(start_offsets), to_json(end_offsets)
-            FROM token_cache
-            ORDER BY content_hash
-            "#,
-        )
-        .context("prepare token cache row snapshot")?;
-    let row_items = row_stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })
-        .context("query token cache row snapshot")?;
-
-    let mut rows = Vec::new();
-    for row in row_items {
-        let (model, params_hash, content_hash, tokens_json, starts_json, ends_json) =
-            row.context("read token cache snapshot row")?;
-        rows.push((
-            model,
-            params_hash,
-            content_hash,
-            serde_json::from_str(&tokens_json).context("decode token cache snapshot tokens")?,
-            serde_json::from_str(&starts_json).context("decode token cache snapshot starts")?,
-            serde_json::from_str(&ends_json).context("decode token cache snapshot ends")?,
-        ));
-    }
-
-    Ok((columns, rows))
 }
 
 #[cfg(feature = "tokenization")]
@@ -375,43 +196,32 @@ impl TextCacheTable for TokenCacheTable<'_> {
         &self,
         conn: &Connection,
         hashes: &[String],
-    ) -> AnyhowResult<HashMap<String, Self::Value>> {
+    ) -> AnyhowResult<HashMap<String, Arc<Self::Value>>> {
+        stage_requested_hashes(conn, hashes)?;
         let mut out = HashMap::new();
         let mut stmt = conn
             .prepare(
                 r#"
-                                SELECT to_json(tokens), to_json(start_offsets), to_json(end_offsets)
-                FROM token_cache
-                WHERE model = ?
-                  AND params_hash = ?
-                  AND content_hash = ?
+                SELECT cache.content_hash, to_json(cache.tokens),
+                       to_json(cache.start_offsets), to_json(cache.end_offsets)
+                FROM token_cache AS cache
+                INNER JOIN requested_hashes AS requested USING (content_hash)
+                WHERE cache.model = ? AND cache.fingerprint = ? AND cache.params_hash = ?
                 "#,
             )
             .context("prepare token cache lookup")?;
-
-        for hash in hashes.iter().collect::<HashSet<_>>() {
-            let row_result =
-                stmt.query_row(params![self.model_id, self.params_hash, hash], |row| {
-                    let tokens_json: String = row.get(0)?;
-                    let starts_json: String = row.get(1)?;
-                    let ends_json: String = row.get(2)?;
-                    Ok((tokens_json, starts_json, ends_json))
-                });
-            match row_result {
-                Ok((tokens_json, starts_json, ends_json)) => {
-                    let entry = TokenCacheEntry {
-                        tokens: serde_json::from_str(&tokens_json)
-                            .context("decode token cache tokens")?,
-                        starts: serde_json::from_str(&starts_json)
-                            .context("decode token cache starts")?,
-                        ends: serde_json::from_str(&ends_json)
-                            .context("decode token cache ends")?,
-                    };
-                    out.insert(hash.clone(), entry);
-                }
-                Err(DuckDbError::QueryReturnedNoRows) => {}
-                Err(err) => return Err(err).context("read token cache row"),
-            }
+        let mut rows = stmt.query(params![self.model_id, self.fingerprint, self.params_hash])?;
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            let tokens_json: String = row.get(1)?;
+            let starts_json: String = row.get(2)?;
+            let ends_json: String = row.get(3)?;
+            let entry = TokenCacheEntry {
+                tokens: serde_json::from_str(&tokens_json).context("decode token cache tokens")?,
+                starts: serde_json::from_str(&starts_json).context("decode token cache starts")?,
+                ends: serde_json::from_str(&ends_json).context("decode token cache ends")?,
+            };
+            out.insert(hash, Arc::new(entry));
         }
 
         Ok(out)
@@ -420,39 +230,47 @@ impl TextCacheTable for TokenCacheTable<'_> {
     fn persist_new(
         &self,
         conn: &Connection,
-        entries: &[(String, Self::Value)],
+        entries: &[(String, Arc<Self::Value>)],
     ) -> AnyhowResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut stmt = conn
-            .prepare(
-                r#"
-                INSERT OR IGNORE INTO token_cache
-                (model, params_hash, content_hash, tokens, start_offsets, end_offsets)
-                VALUES (?, ?, ?, ?::VARCHAR[], ?::BIGINT[], ?::BIGINT[])
-                "#,
-            )
-            .context("prepare token cache insert")?;
-
-        for (hash, entry) in entries {
-            let tokens_json =
-                serde_json::to_string(&entry.tokens).context("encode token cache tokens")?;
-            let starts_json =
-                serde_json::to_string(&entry.starts).context("encode token cache starts")?;
-            let ends_json =
-                serde_json::to_string(&entry.ends).context("encode token cache ends")?;
-            stmt.execute(params![
-                self.model_id,
-                self.params_hash,
-                hash,
-                tokens_json,
-                starts_json,
-                ends_json,
-            ])
-            .context("insert token cache row")?;
+        conn.execute_batch(
+            "BEGIN; DROP TABLE IF EXISTS staged_token_cache;
+             CREATE TEMP TABLE staged_token_cache (
+               model VARCHAR, fingerprint VARCHAR, params_hash VARCHAR, content_hash VARCHAR,
+               tokens VARCHAR[], start_offsets BIGINT[], end_offsets BIGINT[]
+             );",
+        )?;
+        let result = (|| -> AnyhowResult<()> {
+            let mut appender = conn.appender("staged_token_cache")?;
+            for (hash, entry) in entries {
+                let tokens_json = serde_json::to_string(&entry.tokens)?;
+                let starts_json = serde_json::to_string(&entry.starts)?;
+                let ends_json = serde_json::to_string(&entry.ends)?;
+                appender.append_row(params![
+                    self.model_id,
+                    self.fingerprint,
+                    self.params_hash,
+                    hash,
+                    tokens_json,
+                    starts_json,
+                    ends_json,
+                ])?;
+            }
+            appender.flush()?;
+            drop(appender);
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO token_cache
+                 SELECT model, fingerprint, params_hash, content_hash, tokens, start_offsets, end_offsets
+                 FROM staged_token_cache; COMMIT;",
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
         }
-        Ok(())
+        result
     }
 }
 
@@ -510,7 +328,7 @@ fn flat_struct_series_from_tokens(
     end_col: Vec<i64>,
 ) -> PolarsResult<Series> {
     let n = tok_col.len();
-    let fields = vec![
+    let fields = [
         Series::new("token".into(), tok_col),
         Series::new("start".into(), start_col),
         Series::new("end".into(), end_col),
@@ -530,25 +348,12 @@ fn build_token_list_series(
     let inner = flat_struct_series_from_tokens(tok_col, start_col, end_col)
         .map_err(|e| PolarsError::ComputeError(format!("Struct build failed: {e}").into()))?;
 
-    let mut builder = AnonymousOwnedListBuilder::new(
-        PlSmallStr::EMPTY,
-        row_count,
-        Some(token_offset_struct_type()),
-    );
-    for (start, end) in row_spans {
-        if end == start {
-            builder.append_empty();
-        } else {
-            let slice = inner.slice(start as i64, end - start);
-            builder.append_series(&slice).map_err(|err| {
-                PolarsError::ComputeError(format!("List builder failed: {err}").into())
-            })?;
-        }
+    if row_spans.len() != row_count {
+        return Err(PolarsError::ComputeError(
+            "token list row count does not match span count".into(),
+        ));
     }
-
-    let mut list = builder.finish();
-    list.rename(name);
-    Ok(list.into_series())
+    list_from_spans(name, &inner, &row_spans)
 }
 
 #[cfg(feature = "embedding")]
@@ -587,11 +392,11 @@ fn encode_embedding_batches(
     texts: &[String],
     batch_size: usize,
     cache_path: Option<&str>,
-) -> PolarsResult<Vec<Vec<f32>>> {
+) -> PolarsResult<Vec<Arc<Vec<f32>>>> {
     if let Some(cache_path) = cache_path {
         let scope = CacheScope {
             model_id: embedder.model_id(),
-            revision: embedder.model_revision(),
+            fingerprint: embedder.cache_fingerprint(),
             provider_id: embedder.provider_id(),
         };
         return get_or_insert_embeddings(
@@ -607,6 +412,7 @@ fn encode_embedding_batches(
     }
 
     encode_uncached_embedding_batches(embedder, texts, batch_size)
+        .map(|vectors| vectors.into_iter().map(Arc::new).collect())
 }
 
 #[cfg(feature = "embedding")]
@@ -631,23 +437,7 @@ fn build_embedding_vector_list(
     row_spans: Vec<(usize, usize)>,
     flat: Vec<f32>,
 ) -> PolarsResult<Series> {
-    let inner = Series::new(PlSmallStr::EMPTY, flat);
-    let mut builder =
-        AnonymousOwnedListBuilder::new(PlSmallStr::EMPTY, row_spans.len(), Some(DataType::Float32));
-    for (start, end) in row_spans {
-        if end == start {
-            builder.append_empty();
-        } else {
-            let slice = inner.slice(start as i64, end - start);
-            builder.append_series(&slice).map_err(|err| {
-                PolarsError::ComputeError(format!("Embedding list build failed: {err}").into())
-            })?;
-        }
-    }
-
-    let mut list = builder.finish();
-    list.rename(name);
-    Ok(list.into_series())
+    list_from_spans(name, &Series::new(PlSmallStr::EMPTY, flat), &row_spans)
 }
 
 #[cfg(feature = "embedding")]
@@ -661,7 +451,7 @@ fn embed_string_series(
 
     let mut texts: Vec<String> = Vec::new();
     let mut row_text_indices: Vec<Option<usize>> = Vec::with_capacity(ca.len());
-    for opt_text in ca.into_iter() {
+    for opt_text in ca.iter() {
         match opt_text {
             Some(text) => {
                 row_text_indices.push(Some(texts.len()));
@@ -698,11 +488,11 @@ fn embed_list_string_series(
     let mut item_text_indices: Vec<Option<usize>> = Vec::new();
     let mut row_item_spans: Vec<(usize, usize)> = Vec::with_capacity(ca.len());
 
-    for opt_inner in ca.into_iter() {
+    for opt_inner in ca.amortized_iter() {
         let row_start = item_text_indices.len();
         if let Some(inner) = opt_inner {
-            let inner_ca = inner.str()?;
-            for opt_text in inner_ca.into_iter() {
+            let inner_ca = inner.as_ref().str()?;
+            for opt_text in inner_ca.iter() {
                 match opt_text {
                     Some(text) => {
                         item_text_indices.push(Some(texts.len()));
@@ -727,27 +517,7 @@ fn embed_list_string_series(
     }
 
     let vector_list = build_embedding_vector_list(PlSmallStr::EMPTY, item_vector_spans, flat)?;
-    let mut builder = AnonymousOwnedListBuilder::new(
-        PlSmallStr::EMPTY,
-        row_item_spans.len(),
-        Some(DataType::List(Box::new(DataType::Float32))),
-    );
-    for (start, end) in row_item_spans {
-        if end == start {
-            builder.append_empty();
-        } else {
-            let slice = vector_list.slice(start as i64, end - start);
-            builder.append_series(&slice).map_err(|err| {
-                PolarsError::ComputeError(
-                    format!("Nested embedding list build failed: {err}").into(),
-                )
-            })?;
-        }
-    }
-
-    let mut list = builder.finish();
-    list.rename(ca.name().clone());
-    Ok(list.into_series())
+    list_from_spans(ca.name().clone(), &vector_list, &row_item_spans)
 }
 
 #[cfg(feature = "tokenization")]
@@ -760,7 +530,7 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
     if let Some(cache_path) = kwargs.cache.as_deref() {
         let mut texts = Vec::new();
         let mut row_text_indices = Vec::with_capacity(ca.len());
-        for opt_text in ca.into_iter() {
+        for opt_text in ca.iter() {
             match opt_text {
                 Some(text) => {
                     row_text_indices.push(Some(texts.len()));
@@ -772,8 +542,12 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
 
         let params_hash = token_params_hash(kwargs.lowercase, kwargs.remove_punct)
             .map_err(|e| PolarsError::ComputeError(format!("Token cache failed: {e:#}").into()))?;
+        let model_id = kwargs.model_id.as_deref().unwrap_or_default();
+        let fingerprint = tokenizer_cache_fingerprint(model_id)
+            .map_err(|e| PolarsError::ComputeError(format!("Token cache failed: {e:#}").into()))?;
         let table = TokenCacheTable {
-            model_id: kwargs.model_id.as_deref().unwrap_or_default(),
+            model_id,
+            fingerprint: &fingerprint,
             params_hash: &params_hash,
         };
         let entries = get_or_insert_text_values(Path::new(cache_path), &table, &texts, |misses| {
@@ -815,7 +589,7 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
     let mut end_col: Vec<i64> = Vec::with_capacity(estimated_tokens);
     let mut row_spans: Vec<(usize, usize)> = Vec::with_capacity(ca.len());
 
-    for opt_text in ca.into_iter() {
+    for opt_text in ca.iter() {
         let span_start = tok_col.len();
         match opt_text {
             Some(text) => {
@@ -847,18 +621,4 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
         start_col,
         end_col,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_clean_text_value_normalizes() {
-        let cleaned = clean_text_value("Hello, World! 123");
-        assert_eq!(cleaned, "hello world");
-
-        let cleaned = clean_text_value("  Hi--there\t42 ");
-        assert_eq!(cleaned, "hi there");
-    }
 }
