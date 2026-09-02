@@ -117,13 +117,14 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# ort 2.0.0-rc.13 does not publish an XNNPACK binary for this target, so use
+# ONNX Runtime's built-in CPU provider rather than producing an unlinked wheel.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "std",
     "ndarray",
     "download-binaries",
     "tls-native",
     "api-24",
-    "xnnpack",
 ], optional = true }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))'.dependencies]

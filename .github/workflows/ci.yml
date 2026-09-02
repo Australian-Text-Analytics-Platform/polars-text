@@ -67,7 +67,7 @@ jobs:
           target: ${{ matrix.target }}
           container: off
           rust-toolchain: stable
-          sccache: true
+          sccache: ${{ runner.os != 'Windows' }}
           args: --release --locked --out dist --interpreter 3.14 --timings
 
       - name: Upload Cargo timing report
@@ -94,7 +94,7 @@ jobs:
         run: pytest -q
 
       - name: Show sccache stats
-        if: always()
+        if: always() && runner.os != 'Windows'
         continue-on-error: true
         shell: bash
         run: sccache --show-stats

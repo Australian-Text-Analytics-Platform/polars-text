@@ -184,7 +184,8 @@ The initial call may take longer while models download and cache.
 Embedding features download ONNX artifacts on first use. Some ONNX repositories
 store tensor data in sidecar files such as `onnx/model.onnx_data`; those files
 are fetched automatically when present. ONNX Runtime uses CoreML on macOS,
-DirectML on Windows, XNNPACK on Linux, and CPU fallback on every platform.
+DirectML on Windows, the CPU provider on Linux, and CPU fallback on every
+platform.
 
 ## Development
 

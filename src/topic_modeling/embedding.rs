@@ -16,8 +16,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
-#[cfg(target_os = "linux")]
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -826,20 +824,10 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
     #[cfg(target_os = "macos")]
     let providers = vec![ep::CoreML::default().build()];
     #[cfg(target_os = "linux")]
-    let providers = vec![xnnpack_provider()];
+    let providers = Vec::new();
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let providers = Vec::new();
     providers
-}
-
-#[cfg(target_os = "linux")]
-fn xnnpack_provider() -> ort::ep::ExecutionProviderDispatch {
-    let provider = if let Some(threads) = embedding_threads().and_then(NonZeroUsize::new) {
-        ep::XNNPACK::default().with_intra_op_num_threads(threads)
-    } else {
-        ep::XNNPACK::default()
-    };
-    provider.build()
 }
 
 fn planned_provider_id() -> String {
@@ -848,7 +836,7 @@ fn planned_provider_id() -> String {
     #[cfg(target_os = "macos")]
     let providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"];
     #[cfg(target_os = "linux")]
-    let providers = ["XnnpackExecutionProvider", "CPUExecutionProvider"];
+    let providers = ["CPUExecutionProvider"];
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let providers = ["CPUExecutionProvider"];
     providers.join("+")
