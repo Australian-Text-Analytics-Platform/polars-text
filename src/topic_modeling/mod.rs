@@ -41,13 +41,9 @@ use serde::Serialize;
 #[cfg(feature = "topic-modeling")]
 use crate::tokenizer::PLAIN_WORDS_EN_MODEL_ID;
 #[cfg(feature = "topic-modeling")]
-use cluster::ClusterConfig;
-#[cfg(feature = "topic-modeling")]
 use ctfidf::RepresentativeWord;
 #[cfg(feature = "topic-modeling")]
 use embedding_cache::{get_or_insert_embeddings, CacheScope};
-#[cfg(feature = "topic-modeling")]
-use reduce::ReduceConfig;
 #[cfg(feature = "topic-modeling")]
 use segmentation::SegmentationConfig;
 
@@ -63,24 +59,9 @@ pub struct RunConfig {
     pub embedding_cache_path: Option<String>,
     pub segmentation: SegmentationConfig,
     pub seed: u64,
-    pub cluster: ClusterConfig,
+    pub min_cluster_size: usize,
     pub vectorizer_model_id: Option<String>,
     pub lowercase: bool,
-}
-
-#[cfg(feature = "topic-modeling")]
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self {
-            embedder_repo_id: None,
-            embedding_cache_path: None,
-            segmentation: SegmentationConfig::default(),
-            seed: ReduceConfig::default().seed,
-            cluster: ClusterConfig::default(),
-            vectorizer_model_id: None,
-            lowercase: true,
-        }
-    }
 }
 
 /// One Topic for the bubble chart and Topic table.
@@ -152,8 +133,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         documents,
         &embedder.sizing_tokenizer(),
         &cfg.segmentation,
-    )?
-    .segments;
+    )?;
     let segment_doc_indices = segments
         .iter()
         .map(|segment| segment.doc_index)
@@ -165,7 +145,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
 
     // PaCMAP needs at least three points and HDBSCAN needs at least one full
     // minimum cluster. Anything smaller has no defensible density-based Topic.
-    let minimum_evidence = cfg.cluster.min_cluster_size.max(3);
+    let minimum_evidence = cfg.min_cluster_size.max(3);
     if segments.len() < minimum_evidence {
         return Ok(no_topic_result(
             documents.len(),
@@ -211,14 +191,8 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     if reduce_dims < 2 {
         anyhow::bail!("topic embeddings do not have enough usable dimensions");
     }
-    let reduced = reduce::reduce(
-        &embeddings,
-        &ReduceConfig {
-            output_dims: reduce_dims,
-            seed: cfg.seed,
-        },
-    )?;
-    let clustered = cluster::cluster(&reduced, &cfg.cluster)?;
+    let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
+    let clustered = cluster::cluster(&reduced, cfg.min_cluster_size)?;
     if clustered.n_topics == 0 {
         return Ok(no_topic_result(
             documents.len(),
@@ -238,7 +212,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
             .iter()
             .copied()
             .zip(texts.iter().map(String::as_str)),
-        Some(vectorizer),
+        vectorizer,
         cfg.lowercase,
     )?;
     let embedding_points = embeddings

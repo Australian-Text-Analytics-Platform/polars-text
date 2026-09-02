@@ -77,17 +77,8 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), dtype))
 }
 
-fn build_list_from_spans(
-    name: &str,
-    inner: &Series,
-    spans: &[(usize, usize)],
-    _inner_type: DataType,
-) -> PolarsResult<Series> {
-    list_from_spans(name.into(), inner, spans)
-}
-
-fn build_single_list(name: &str, inner: &Series, inner_type: DataType) -> PolarsResult<Series> {
-    build_list_from_spans(name, inner, &[(0, inner.len())], inner_type)
+fn build_single_list(name: &str, inner: &Series) -> PolarsResult<Series> {
+    list_from_spans(name.into(), inner, &[(0, inner.len())])
 }
 
 #[polars_expr(output_type_func=topic_modeling_output)]
@@ -106,9 +97,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
             max_tokens: kwargs.max_tokens,
         },
         seed: kwargs.seed,
-        cluster: super::cluster::ClusterConfig {
-            min_cluster_size: kwargs.min_cluster_size,
-        },
+        min_cluster_size: kwargs.min_cluster_size,
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
     };
@@ -145,12 +134,7 @@ fn topic_modeling_result_to_series(
         .iter(),
     )?
     .into_series();
-    let coverage = build_list_from_spans(
-        "topic_coverage",
-        &coverage_inner,
-        &coverage_spans,
-        coverage_struct_type(),
-    )?;
+    let coverage = list_from_spans("topic_coverage".into(), &coverage_inner, &coverage_spans)?;
     let document_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
         result.documents.len(),
@@ -180,7 +164,7 @@ fn topic_modeling_result_to_series(
         .iter(),
     )?
     .into_series();
-    let document_list = build_single_list("documents", &document_inner, document_struct_type())?;
+    let document_list = build_single_list("documents", &document_inner)?;
 
     let mut words = Vec::new();
     let mut occurrence_counts = Vec::new();
@@ -205,12 +189,8 @@ fn topic_modeling_result_to_series(
         .iter(),
     )?
     .into_series();
-    let representative_words = build_list_from_spans(
-        "representative_words",
-        &word_inner,
-        &word_spans,
-        representative_word_struct_type(),
-    )?;
+    let representative_words =
+        list_from_spans("representative_words".into(), &word_inner, &word_spans)?;
     let topic_inner = StructChunked::from_series(
         PlSmallStr::EMPTY,
         result.topics.len(),
@@ -244,7 +224,7 @@ fn topic_modeling_result_to_series(
         .iter(),
     )?
     .into_series();
-    let topic_list = build_single_list("topics", &topic_inner, topic_struct_type())?;
+    let topic_list = build_single_list("topics", &topic_inner)?;
 
     let n_segments = u32::try_from(result.n_segments)
         .map_err(|_| PolarsError::ComputeError("Topic Segment count exceeds UInt32".into()))?;

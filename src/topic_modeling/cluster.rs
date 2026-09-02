@@ -24,21 +24,6 @@ use hdbscan::{DistanceMetric, Hdbscan, HdbscanHyperParams};
 /// payload, frontend) can treat it the same way.
 pub const OUTLIER_LABEL: i32 = -1;
 
-/// Clustering knobs. `min_cluster_size` is also HDBSCAN's default
-/// `min_samples`, matching BERTopic's coupled density policy.
-#[derive(Debug, Clone)]
-pub struct ClusterConfig {
-    pub min_cluster_size: usize,
-}
-
-impl Default for ClusterConfig {
-    fn default() -> Self {
-        Self {
-            min_cluster_size: 10,
-        }
-    }
-}
-
 /// Result of clustering: one label per input point. Labels are contiguous
 /// `0..n_topics` for real topics, or `OUTLIER_LABEL` for noise. `n_topics` is
 /// the count of distinct non-outlier labels, precomputed for the orchestrator.
@@ -50,11 +35,11 @@ pub struct ClusterResult {
 
 /// Cluster `points` into topics.
 ///
-/// Flow: build HDBSCAN hyper-parameters from `cfg` (clamping `min_cluster_size`
+/// Flow: build HDBSCAN hyper-parameters (clamping `min_cluster_size`
 /// to the valid `>= 2` range and never exceeding the point count), run the
 /// clusterer, and count distinct non-outlier labels. The crate's labels are
 /// already contiguous from zero, which projection and rollup rely on for indexing.
-pub fn cluster(points: &[Vec<f32>], cfg: &ClusterConfig) -> Result<ClusterResult> {
+pub fn cluster(points: &[Vec<f32>], min_cluster_size: usize) -> Result<ClusterResult> {
     let n = points.len();
     if n < 2 {
         return Ok(ClusterResult {
@@ -63,7 +48,7 @@ pub fn cluster(points: &[Vec<f32>], cfg: &ClusterConfig) -> Result<ClusterResult
         });
     }
 
-    let min_cluster_size = cfg.min_cluster_size.clamp(2, n);
+    let min_cluster_size = min_cluster_size.clamp(2, n);
     let params = HdbscanHyperParams::builder()
         .min_cluster_size(min_cluster_size)
         .dist_metric(DistanceMetric::Euclidean)
@@ -101,10 +86,7 @@ mod tests {
         }
         points.push(vec![100.0, 100.0]); // lone outlier
 
-        let cfg = ClusterConfig {
-            min_cluster_size: 5,
-        };
-        let res = cluster(&points, &cfg).unwrap();
+        let res = cluster(&points, 5).unwrap();
         assert_eq!(res.n_topics, 2, "labels: {:?}", res.labels);
         assert_eq!(*res.labels.last().unwrap(), OUTLIER_LABEL);
         // Real labels are contiguous from zero.
@@ -116,14 +98,14 @@ mod tests {
 
     #[test]
     fn single_point_is_an_outlier_without_a_fabricated_topic() {
-        let res = cluster(&[vec![1.0, 2.0]], &ClusterConfig::default()).unwrap();
+        let res = cluster(&[vec![1.0, 2.0]], 10).unwrap();
         assert_eq!(res.n_topics, 0);
         assert_eq!(res.labels, vec![OUTLIER_LABEL]);
     }
 
     #[test]
     fn empty_input_is_no_topics() {
-        let res = cluster(&[], &ClusterConfig::default()).unwrap();
+        let res = cluster(&[], 10).unwrap();
         assert_eq!(res.n_topics, 0);
         assert!(res.labels.is_empty());
     }

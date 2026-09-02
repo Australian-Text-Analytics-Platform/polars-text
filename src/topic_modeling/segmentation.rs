@@ -66,12 +66,6 @@ impl Default for SegmentationConfig {
     }
 }
 
-/// Topic Segments produced during segmentation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentationResult {
-    pub segments: Vec<TopicSegment>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TokenSpan {
     start: usize,
@@ -129,7 +123,7 @@ pub fn segment_documents(
     docs: &[&str],
     tokenizer: &Tokenizer,
     cfg: &SegmentationConfig,
-) -> Result<SegmentationResult> {
+) -> Result<Vec<TopicSegment>> {
     if cfg.max_tokens == 0 {
         bail!("segmentation max_tokens must be > 0");
     }
@@ -184,7 +178,7 @@ pub fn segment_documents(
             }
         }
     }
-    Ok(SegmentationResult { segments })
+    Ok(segments)
 }
 
 fn token_spans(text: &str, tokenizer: &Tokenizer) -> Result<(Vec<TokenSpan>, usize)> {
@@ -501,7 +495,6 @@ mod tests {
         let tokenizer = whitespace_tokenizer(&words);
         segment_documents(&[doc], &tokenizer, &cfg)
             .unwrap()
-            .segments
             .into_iter()
             .map(|segment| segment.text(doc).unwrap().to_string())
             .collect()
@@ -599,7 +592,6 @@ mod tests {
         let doc = "one two three four five";
         let result = segment_documents(&[doc], &tokenizer, &cfg).unwrap();
         let texts = result
-            .segments
             .iter()
             .map(|segment| segment.text(doc).unwrap())
             .collect::<Vec<_>>();
@@ -640,7 +632,6 @@ mod tests {
         let tokenizer = character_tokenizer(doc);
         let segments = segment_documents(&[doc], &tokenizer, &cfg)
             .unwrap()
-            .segments
             .into_iter()
             .map(|segment| segment.text(doc).unwrap().to_string())
             .collect::<Vec<_>>();
@@ -658,7 +649,6 @@ mod tests {
         let doc = "one two three\n\n four five";
         let result = segment_documents(&[doc], &tokenizer, &cfg).unwrap();
         let texts = result
-            .segments
             .into_iter()
             .map(|segment| segment.text(doc).unwrap().to_string())
             .collect::<Vec<_>>();
@@ -677,7 +667,6 @@ mod tests {
         let doc = "Value is 3.14. Next item.";
         let result = segment_documents(&[doc], &tokenizer, &cfg).unwrap();
         let texts = result
-            .segments
             .into_iter()
             .map(|segment| segment.text(doc).unwrap().to_string())
             .collect::<Vec<_>>();
@@ -696,7 +685,6 @@ mod tests {
         let doc = "Mr. Fox jumped.";
         let result = segment_documents(&[doc], &tokenizer, &cfg).unwrap();
         let texts = result
-            .segments
             .into_iter()
             .map(|segment| segment.text(doc).unwrap().to_string())
             .collect::<Vec<_>>();
@@ -715,7 +703,6 @@ mod tests {
         let doc = "猫 狗 鳥";
         let result = segment_documents(&[doc], &tokenizer, &cfg).unwrap();
         let texts = result
-            .segments
             .iter()
             .map(|segment| segment.text(doc).unwrap())
             .collect::<Vec<_>>();

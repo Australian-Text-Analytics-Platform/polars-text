@@ -121,12 +121,11 @@ impl TokenizerBackend {
     pub fn tokenize_text(
         &self,
         text: &str,
-        add_special_tokens: bool,
         lowercase: bool,
         remove_punctuation: bool,
     ) -> Result<Vec<String>> {
         Ok(self
-            .tokenize_records(text, add_special_tokens, lowercase, remove_punctuation)?
+            .tokenize_records(text, lowercase, remove_punctuation)?
             .into_iter()
             .map(|record| record.token)
             .collect())
@@ -135,7 +134,6 @@ impl TokenizerBackend {
     fn tokenize_records(
         &self,
         text: &str,
-        add_special_tokens: bool,
         lowercase: bool,
         remove_punctuation: bool,
     ) -> Result<Vec<TokenRecord>> {
@@ -146,7 +144,7 @@ impl TokenizerBackend {
             TokenizerBackend::PlainWordsEn => plain_word_records(processed_ref, remove_punctuation),
             TokenizerBackend::HuggingFace(tokenizer) => {
                 let encoding = tokenizer
-                    .encode(processed_ref, add_special_tokens)
+                    .encode(processed_ref, false)
                     .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
                 let toks = encoding.get_tokens();
                 let offsets = encoding.get_offsets();
@@ -201,7 +199,7 @@ impl TokenizerBackend {
         remove_punctuation: bool,
     ) -> Result<Vec<(String, i64, i64)>> {
         let result: Vec<(String, i64, i64)> = self
-            .tokenize_records(text, false, lowercase, remove_punctuation)?
+            .tokenize_records(text, lowercase, remove_punctuation)?
             .into_iter()
             .map(|record| (record.token, record.start, record.end))
             .collect();
@@ -216,10 +214,11 @@ fn registry() -> &'static RwLock<HashMap<String, Arc<TokenizerBackend>>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub fn ensure_tokenizer_for_model(model_id: Option<&str>) -> Result<Arc<TokenizerBackend>> {
-    let key = model_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Tokenizer model id is required"))?;
+pub fn ensure_tokenizer_for_model(model_id: &str) -> Result<Arc<TokenizerBackend>> {
+    let key = model_id.trim();
+    if key.is_empty() {
+        anyhow::bail!("Tokenizer model id is required");
+    }
 
     {
         let map = registry()
@@ -345,7 +344,7 @@ pub fn tokenizer_cache_fingerprint(model_id: &str) -> Result<String> {
 #[cfg(test)]
 pub fn tokenize_plain_text(text: &str, lowercase: bool, remove_punctuation: bool) -> Vec<String> {
     TokenizerBackend::PlainWordsEn
-        .tokenize_text(text, false, lowercase, remove_punctuation)
+        .tokenize_text(text, lowercase, remove_punctuation)
         .unwrap_or_default()
 }
 
@@ -401,7 +400,7 @@ mod tests {
     fn test_plain_words_en_backend_matches_plain_helper() {
         let backend = TokenizerBackend::PlainWordsEn;
         let text = "Hello, [UNK] ##sta Queensland";
-        let tokens = backend.tokenize_text(text, false, true, true).unwrap();
+        let tokens = backend.tokenize_text(text, true, true).unwrap();
         assert_eq!(tokens, tokenize_plain_text(text, true, true));
     }
 
@@ -478,9 +477,9 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_model_id_is_rejected() {
-        let err = match super::ensure_tokenizer_for_model(None) {
-            Ok(_) => panic!("missing model id should be rejected"),
+    fn test_empty_model_id_is_rejected() {
+        let err = match super::ensure_tokenizer_for_model("") {
+            Ok(_) => panic!("empty model id should be rejected"),
             Err(err) => err.to_string(),
         };
         assert!(err.contains("Tokenizer model id is required"), "{err}");

@@ -5,16 +5,12 @@ from numbers import Integral
 
 import polars as pl
 
-from ._internal import compiled_features
 from ._internal import token_frequencies as _token_frequencies
+from .namespace import _require_feature
 
 
 def token_frequencies(series: pl.Series, model: str) -> dict[str, int]:
-    if "tokenization" not in compiled_features():
-        raise RuntimeError(
-            "token_frequencies requires the 'tokenization' feature; rebuild "
-            "polars-text with that feature or install the default full wheel"
-        )
+    _require_feature("tokenization", "token_frequencies")
     if not isinstance(series, pl.Series):
         raise TypeError("token_frequencies expects a Polars Series")
     if not model.strip():

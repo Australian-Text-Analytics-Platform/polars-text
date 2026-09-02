@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ._expressions import _positive, _require_feature
 from ._internal import project_topic_modeling_basis as _project_topic_basis
 from ._internal import project_topic_modeling_context as _project_topics
+from .namespace import _positive, _require_feature
 
 
 def project_topics(projection_context: bytes, topic_count: int) -> dict[str, Any]:

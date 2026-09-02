@@ -104,8 +104,7 @@ pub fn concordance(inputs: &[Series], kwargs: ConcordanceKwargs) -> PolarsResult
 struct TokenizeKwargs {
     lowercase: bool,
     remove_punct: bool,
-    #[serde(default)]
-    model_id: Option<String>,
+    model_id: String,
     #[serde(default)]
     cache: Option<String>,
 }
@@ -524,7 +523,7 @@ fn embed_list_string_series(
 #[polars_expr(output_type_func=list_token_struct_output)]
 pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Series> {
     let ca = inputs[0].str()?;
-    let backend = ensure_tokenizer_for_model(kwargs.model_id.as_deref())
+    let backend = ensure_tokenizer_for_model(&kwargs.model_id)
         .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
 
     if let Some(cache_path) = kwargs.cache.as_deref() {
@@ -542,7 +541,7 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
 
         let params_hash = token_params_hash(kwargs.lowercase, kwargs.remove_punct)
             .map_err(|e| PolarsError::ComputeError(format!("Token cache failed: {e:#}").into()))?;
-        let model_id = kwargs.model_id.as_deref().unwrap_or_default();
+        let model_id = kwargs.model_id.as_str();
         let fingerprint = tokenizer_cache_fingerprint(model_id)
             .map_err(|e| PolarsError::ComputeError(format!("Token cache failed: {e:#}").into()))?;
         let table = TokenCacheTable {

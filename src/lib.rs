@@ -67,7 +67,7 @@ fn compiled_features(py: Python<'_>) -> PyResult<Bound<'_, PyFrozenSet>> {
 #[pyfunction(name = "token_frequencies")]
 #[pyo3(signature = (series, model))]
 fn token_frequencies_py(py: Python<'_>, series: PySeries, model: String) -> PyResult<Py<PyAny>> {
-    token_frequencies::token_frequencies_py(py, series, Some(model.as_str()))
+    token_frequencies::token_frequencies_py(py, series, model.as_str())
 }
 
 #[cfg(feature = "topic-modeling")]

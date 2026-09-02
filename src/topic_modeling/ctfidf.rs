@@ -117,12 +117,12 @@ pub fn representative_words(
 /// "vectorizer corpora" so CJK topics get word-segmented, not split per byte.
 ///
 /// `model_id` selects the segmentation backend (`lindera:jieba` for Chinese,
-/// `native:plain_words_en` for English, a HF id for WordPiece, etc.); `None`
-/// uses the registry default. Returns one map per input topic, aligned by index.
+/// `native:plain_words_en` for English, a HF id for WordPiece, etc.). Returns
+/// one map per input topic, aligned by index.
 pub fn count_topic_terms<'a>(
     topic_count: usize,
     assigned_segments: impl IntoIterator<Item = (i32, &'a str)>,
-    model_id: Option<&str>,
+    model_id: &str,
     lowercase: bool,
 ) -> Result<Vec<HashMap<String, usize>>> {
     let backend: Arc<TokenizerBackend> = ensure_tokenizer_for_model(model_id)?;
@@ -136,7 +136,7 @@ pub fn count_topic_terms<'a>(
         let counts = per_topic
             .get_mut(topic)
             .ok_or_else(|| anyhow::anyhow!("Topic label {label} is outside the topic count"))?;
-        for token in backend.tokenize_text(text, false, lowercase, true)? {
+        for token in backend.tokenize_text(text, lowercase, true)? {
             *counts.entry(token).or_insert(0) += 1;
         }
     }

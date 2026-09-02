@@ -7,10 +7,9 @@ from typing import Any, cast
 
 import polars as pl
 import polars_text
+import polars_text.namespace as namespace_module
 import pytest
-from polars_text import _expressions
-from polars_text.namespace import TextNamespace
-from polars_text.utils import PLUGIN_PATH
+from polars_text.namespace import PLUGIN_PATH, TextNamespace
 
 
 def test_expression_operations_are_namespace_only() -> None:
@@ -62,9 +61,9 @@ def test_embedding_registers_validated_plugin_kwargs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(_expressions, "compiled_features", lambda: {"embedding"})
+    monkeypatch.setattr(namespace_module, "compiled_features", lambda: {"embedding"})
     monkeypatch.setattr(
-        _expressions,
+        namespace_module,
         "register_plugin_function",
         lambda **kwargs: calls.append(kwargs) or pl.lit([0.0]),
     )
@@ -90,9 +89,11 @@ def test_topic_modeling_registers_only_the_supported_fit_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(_expressions, "compiled_features", lambda: {"topic-modeling"})
     monkeypatch.setattr(
-        _expressions,
+        namespace_module, "compiled_features", lambda: {"topic-modeling"}
+    )
+    monkeypatch.setattr(
+        namespace_module,
         "register_plugin_function",
         lambda **kwargs: calls.append(kwargs) or pl.lit([0]),
     )

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cluster::OUTLIER_LABEL;
 use super::ctfidf;
-use super::reduce::{self, ReduceConfig};
+use super::reduce;
 use super::rollup;
 use super::{DocumentResult, TopicInfo, TopicModelingResult};
 
@@ -427,13 +427,7 @@ fn topic_coordinates(embedding_sums: &[Vec<f64>], seed: u64) -> Result<Vec<[f32;
                 .iter()
                 .map(|embedding| normalize_embedding(embedding))
                 .collect::<Result<Vec<_>>>()?;
-            let reduced = reduce::reduce(
-                &normalized,
-                &ReduceConfig {
-                    output_dims: 2,
-                    seed,
-                },
-            )?;
+            let reduced = reduce::reduce(&normalized, 2, seed)?;
             reduced
                 .into_iter()
                 .map(|point| {
