@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use anyhow::{Context, Result};
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use hf_hub::{Repo, RepoType};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use ort::ep;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionInputValue};
