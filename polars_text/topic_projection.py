@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ._internal import project_topic_modeling_basis as _project_topic_basis
-from ._internal import project_topic_modeling_context as _project_topics
 from .namespace import _positive, _require_feature
 
 
 def project_topics(projection_context: bytes, topic_count: int) -> dict[str, Any]:
     _require_feature("topic-modeling", "project_topics")
+    from ._internal import project_topic_modeling_context as _project_topics
     _positive(topic_count, "topic_count")
     return json.loads(_project_topics(projection_context, topic_count))
 
@@ -20,6 +19,7 @@ def project_topic_basis(
     corpus_sizes: list[int],
 ) -> dict[str, Any]:
     _require_feature("topic-modeling", "project_topic_basis")
+    from ._internal import project_topic_modeling_basis as _project_topic_basis
     _positive(topic_count, "topic_count")
     if any(
         isinstance(size, bool) or not isinstance(size, int) or size < 0

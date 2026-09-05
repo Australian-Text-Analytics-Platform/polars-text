@@ -1,6 +1,6 @@
 [package]
 name = "polars_text"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 
 [lib]
@@ -9,7 +9,8 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["full"]
-full = ["topic-modeling"]
+full = ["topic-modeling", "quotation"]
+quotation = ["dep:cxx", "dep:cxx-build", "dep:thiserror", "dep:polars-arrow"]
 cache = ["dep:duckdb", "dep:fs2", "dep:serde_json", "dep:sha2", "dep:tempfile"]
 tokenization = [
     "dep:hf-hub",
@@ -37,7 +38,12 @@ topic-modeling = [
     "dep:zstd",
 ]
 
+[build-dependencies]
+cxx-build = { version = "1", optional = true }
+
 [dependencies]
+cxx = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
 anyhow = "1.0"
 duckdb = { version = "1.10504.0", features = ["bundled", "json"], optional = true }
 fs2 = { version = "0.4", optional = true }
@@ -138,6 +144,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
 
 [dev-dependencies]
 ahash = "0.8"
+proptest = "1"
 
 [profile.dev]
 debug = 0

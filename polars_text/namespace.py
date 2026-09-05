@@ -56,6 +56,23 @@ class TextNamespace:
     def __init__(self, expr: pl.Expr) -> None:
         self._expr = expr
 
+    def quotation(self, *, model_path: str | os.PathLike[str]) -> pl.Expr:
+        """Extract English quotations with an explicit local UDPipe model.
+
+        Returns source-aligned quotation structs with Unicode character offsets.
+        No model loading or I/O occurs until the expression is evaluated.
+        """
+        _require_feature("quotation", "quotation")
+        if not os.fspath(model_path).strip():
+            raise ValueError("quotation requires a nonempty model_path")
+        return register_plugin_function(
+            plugin_path=PLUGIN_PATH,
+            function_name="quotation",
+            args=self._expr,
+            kwargs={"model_path": os.fspath(model_path)},
+            is_elementwise=True,
+        )
+
     def tokenize(
         self,
         *,

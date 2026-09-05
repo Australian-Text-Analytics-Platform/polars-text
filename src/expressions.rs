@@ -621,3 +621,17 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
         end_col,
     )
 }
+
+#[cfg(feature = "quotation")]
+fn quotation_output(input: &[Field]) -> PolarsResult<Field> {
+    crate::quotation::output(input)
+}
+
+#[cfg(feature = "quotation")]
+#[polars_expr(output_type_func=quotation_output)]
+pub(crate) fn quotation(
+    inputs: &[Series],
+    kwargs: crate::quotation::QuotationKwargs,
+) -> PolarsResult<Series> {
+    crate::quotation::expression(inputs, kwargs)
+}

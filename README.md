@@ -203,3 +203,20 @@ make test
 For faster Rust iteration, use feature-scoped targets such as
 `make check-tokenization`, `make build-tokenization`, or `make build-topic`.
 Leave `JOBS` unset for Cargo's default parallelism, or pass `JOBS=<n>` to cap it.
+
+## English quotation extraction
+
+```python
+import polars as pl
+import polars_text
+
+quotes = pl.col("document").text.quotation(model_path="/absolute/path/model.udpipe")
+```
+
+Available in 0.8.0 with the `quotation` feature (included in `full`). Returns
+one list of quotation structs per String row, with quote, speaker, verb, type,
+counts and original Unicode character offsets. Null/blank input returns an empty
+list. The expression is lazy and never downloads models. Supply an external
+UDPipe model explicitly. Model predictions differ from spaCy; English is supported.
+See [quotation notices](polars_text/QUOTATION_NOTICES.md) for upstream and model
+licensing. The default Wordflow model is CC BY-NC-SA 4.0, for non-commercial use.

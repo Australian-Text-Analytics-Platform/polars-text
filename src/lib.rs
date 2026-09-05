@@ -11,10 +11,12 @@ mod concordance;
 pub mod expressions;
 #[cfg(feature = "tokenization")]
 mod lindera_dict;
-#[cfg(any(feature = "embedding", feature = "tokenization"))]
+#[cfg(any(feature = "embedding", feature = "tokenization", feature = "quotation"))]
 mod list_output;
 #[cfg(feature = "tokenization")]
 mod offsets;
+#[cfg(feature = "quotation")]
+mod quotation;
 #[cfg(feature = "tokenization")]
 mod token_frequencies;
 #[cfg(feature = "tokenization")]
@@ -42,6 +44,9 @@ fn compiled_feature_names() -> Vec<&'static str> {
     let mut features = Vec::new();
     if cfg!(feature = "full") {
         features.push("full");
+    }
+    if cfg!(feature = "quotation") {
+        features.push("quotation");
     }
     if cfg!(feature = "cache") {
         features.push("cache");
@@ -107,6 +112,7 @@ mod tests {
         let features = compiled_feature_names();
 
         assert_eq!(features.contains(&"full"), cfg!(feature = "full"));
+        assert_eq!(features.contains(&"quotation"), cfg!(feature = "quotation"));
         assert_eq!(features.contains(&"cache"), cfg!(feature = "cache"));
         assert_eq!(
             features.contains(&"tokenization"),

@@ -43,3 +43,10 @@ check-full:
 
 test:
 	pytest -q
+
+.PHONY: check-quotation build-quotation
+check-quotation:
+	cargo check --no-default-features --features quotation --locked $(JOBS_ARG)
+
+build-quotation:
+	maturin develop --no-default-features --features quotation --locked $(JOBS_ARG)
