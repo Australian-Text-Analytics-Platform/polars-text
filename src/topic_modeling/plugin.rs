@@ -246,29 +246,7 @@ mod tests {
     use crate::topic_modeling::ctfidf::RepresentativeWord;
     use crate::topic_modeling::{DocumentResult, TopicInfo};
 
-    #[test]
-    fn output_contains_separate_run_level_document_and_topic_lists() {
-        let output = topic_modeling_output(&[Field::new("text".into(), DataType::String)])
-            .expect("topic output dtype");
-        let DataType::Struct(fields) = output.dtype() else {
-            panic!("topic output must be a struct")
-        };
-        assert_eq!(
-            fields,
-            &vec![
-                Field::new(
-                    "documents".into(),
-                    DataType::List(Box::new(document_struct_type())),
-                ),
-                Field::new(
-                    "topics".into(),
-                    DataType::List(Box::new(topic_struct_type())),
-                ),
-                Field::new("n_segments".into(), DataType::UInt32),
-                Field::new("projection_context".into(), DataType::Binary),
-            ]
-        );
-    }
+
 
     #[test]
     fn scalar_result_preserves_topic_metadata_when_topic_never_dominates() {
@@ -314,5 +292,13 @@ mod tests {
             .expect("scalar topic rows");
 
         assert_eq!((series.len(), topic_rows.len()), (1, 2));
+        let declared = topic_modeling_output(&[Field::new("text".into(), DataType::String)]).unwrap();
+        assert_eq!(series.dtype(), declared.dtype());
+        let rows = topic_rows.struct_().unwrap();
+        assert_eq!(rows.field_by_name("id").unwrap().i32().unwrap().into_no_null_iter().collect::<Vec<_>>(), [0, 1]);
+        let words = rows.field_by_name("representative_words").unwrap();
+        let hidden = words.list().unwrap().get_as_series(1).unwrap();
+        assert_eq!(hidden.struct_().unwrap().field_by_name("word").unwrap().str().unwrap().get(0), Some("hidden"));
+        assert_eq!(hidden.struct_().unwrap().field_by_name("occurrence_count").unwrap().u64().unwrap().get(0), Some(2));
     }
 }

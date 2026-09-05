@@ -1,6 +1,8 @@
 from typing import Any, cast
 
 import polars as pl
+import pytest
+
 import polars_text  # noqa: F401
 
 
@@ -89,7 +91,11 @@ def _single_concordance(
 ) -> dict[str, object]:
     return (
         pl.DataFrame({"text": [text]})
-        .select(cast(Any, pl.col("text")).text.concordance(search_word, **kwargs).alias("hits"))
+        .select(
+            cast(Any, pl.col("text"))
+            .text.concordance(search_word, **kwargs)
+            .alias("hits")
+        )
         .item()
     )[0]
 
@@ -262,7 +268,19 @@ def test_concordance_many_hits_remain_ordered_with_unicode_offsets() -> None:
 def test_concordance_zero_width_matches_are_source_ordered() -> None:
     hits = (
         pl.DataFrame({"text": ["ab"]})
-        .select(cast(Any, pl.col("text")).text.concordance(r"^", regex=True).alias("hits"))
+        .select(
+            cast(Any, pl.col("text")).text.concordance(r"^", regex=True).alias("hits")
+        )
         .item()
     )
     assert [(hit["start_idx"], hit["end_idx"]) for hit in hits] == [(0, 0)]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Audit finding: native concordance returns the match as l1 at document start",
+)
+def test_concordance_document_start_has_no_left_neighbour():
+    hit = _single_concordance("the quick brown", "the", left_tokens=2, right_tokens=2)
+    assert hit["left_context"] == ""
+    assert hit["l1"] == ""

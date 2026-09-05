@@ -89,9 +89,31 @@ jobs:
           # Transitive deps (polars==1.44.1) still resolve from PyPI.
           python -m pip install --force-reinstall dist/polars_text-*.whl
 
+      - name: Download pinned quotation test model
+        shell: bash
+        run: python scripts/download_quotation_test_model.py "$RUNNER_TEMP/quotation.udpipe"
+
       - name: Run pytest
         shell: bash
-        run: pytest -q
+        run: |
+          cd "$RUNNER_TEMP"
+          WORDFLOW_TEST_UDPIPE_MODEL="$RUNNER_TEMP/quotation.udpipe" python -m pytest --require-models -q "$GITHUB_WORKSPACE/tests"
+
+      - name: Run native quotation model acceptance
+        if: runner.os == 'Linux'
+        shell: bash
+        run: WORDFLOW_TEST_UDPIPE_MODEL="$RUNNER_TEMP/quotation.udpipe" cargo test --locked --no-default-features --features quotation -- --ignored
+
+      - name: Build source distribution and rebuild its wheel
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -m pip install maturin==1.15.0
+          maturin sdist --out sdist
+          python -m pip wheel --no-deps --wheel-dir rebuilt sdist/*.tar.gz
+          python -m pip install --force-reinstall --no-deps rebuilt/*.whl
+          cd "$RUNNER_TEMP"
+          WORDFLOW_TEST_UDPIPE_MODEL="$RUNNER_TEMP/quotation.udpipe" python -m pytest --require-models -q "$GITHUB_WORKSPACE/tests/test_quotation.py"
 
       - name: Show sccache stats
         if: always() && runner.os != 'Windows'
@@ -116,12 +138,15 @@ jobs:
             args: --no-default-features --features tokenization,embedding
           - name: topic
             args: --no-default-features --features topic-modeling
+          - name: quotation
+            args: --no-default-features --features quotation
           - name: full
             args: --all-features
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked ${{ matrix.args }}
+      - run: cargo test --locked ${{ matrix.args }}
 
   clippy:
     name: Strict Clippy
@@ -130,3 +155,26 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  reduced-wheels:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [base, tokenization, quotation]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - run: python -m pip install maturin==1.15.0 pytest==9.1.1
+      - shell: bash
+        run: |
+          if [ "${{ matrix.features }}" = base ]; then
+            maturin build --release --locked --no-default-features --out dist
+          else
+            maturin build --release --locked --no-default-features --features "${{ matrix.features }}" --out dist
+          fi
+          python -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -m pytest -q "$GITHUB_WORKSPACE/tests/test_installed_features.py"

@@ -186,7 +186,11 @@ mod tests {
             .collect::<HashMap<_, _>>();
         let res = representative_words(&[topic]);
         assert_eq!(res[0].len(), REPRESENTATIVE_WORD_CANDIDATE_LIMIT);
-        assert!(res[0][0].score >= res[0][1].score);
+        assert!(res[0].windows(2).all(|pair| pair[0].score >= pair[1].score));
+        for (offset, term) in res[0].iter().enumerate() {
+            assert_eq!(term.word, format!("term-{:03}", 104 - offset));
+            assert_eq!(term.occurrence_count, 105 - offset);
+        }
         assert!(res[0].iter().all(|term| term.occurrence_count > 0));
         assert_eq!(res[0][0].occurrence_count, 105);
     }

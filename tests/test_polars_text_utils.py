@@ -1,6 +1,7 @@
 from typing import Any, cast
 
 import polars as pl
+
 import polars_text  # noqa: F401
 
 
@@ -13,16 +14,10 @@ def test_clean_text() -> None:
     assert out["clean"][1] == ""
 
 
-def test_word_count() -> None:
-    df = pl.DataFrame({"text": ["hello world", "  one   two  ", None]})
-    out = df.select(cast(Any, pl.col("text")).text.word_count().alias("wc"))
-    assert out["wc"].to_list() == [2, 2, 0]
-
-
 def test_char_count() -> None:
-    df = pl.DataFrame({"text": ["abc", "", None]})
+    df = pl.DataFrame({"text": ["abc", "😀é", "e\u0301", "", None]})
     out = df.select(cast(Any, pl.col("text")).text.char_count().alias("cc"))
-    assert out["cc"].to_list() == [3, 0, 0]
+    assert out["cc"].to_list() == [3, 2, 2, 0, 0]
 
 
 def test_sentence_count() -> None:

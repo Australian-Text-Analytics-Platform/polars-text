@@ -13,8 +13,9 @@ import os
 from typing import Any, cast
 
 import polars as pl
-import polars_text  # noqa: F401
 import pytest
+
+import polars_text  # noqa: F401
 
 _HF_TESTS_ENV = "POLARS_TEXT_RUN_HF_TESTS"
 

@@ -293,8 +293,7 @@ mod tests {
         })?;
 
         assert_eq!(batch_lengths, vec![32, 32, 6]);
-        assert_eq!(vectors.first(), Some(&vec![0.0]));
-        assert_eq!(vectors.last(), Some(&vec![69.0]));
+        assert_eq!(vectors, (0..70).map(|index| vec![index as f32]).collect::<Vec<_>>());
         Ok(())
     }
 

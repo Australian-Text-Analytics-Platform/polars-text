@@ -53,6 +53,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn unicode_spans_match_character_slices(chars in prop::collection::vec(any::<char>(), 0..128)) {
+            let text: String = chars.iter().collect();
+            let mut boundaries: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
+            boundaries.push(text.len());
+            let spans: Vec<_> = boundaries.windows(2).map(|pair| (pair[0], pair[1])).collect();
+            let converted = byte_spans_to_char_spans(&text, spans.clone());
+            prop_assert_eq!(converted.len(), chars.len());
+            for (index, ((start, end), (byte_start, byte_end))) in converted.into_iter().zip(spans).enumerate() {
+                prop_assert_eq!((start, end), (index as i64, index as i64 + 1));
+                prop_assert_eq!(&text[byte_start..byte_end], chars[index].to_string());
+            }
+        }
+    }
 
     /// Reference implementation — the original O(N²) walker. Kept here as
     /// the property-test oracle so any future change to the fast path can

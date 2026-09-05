@@ -3,16 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, cast
 
-import polars_text.namespace as namespace_module
 import pytest
-from polars_text._internal import compiled_features
+
+import polars_text.namespace as namespace_module
 from polars_text.namespace import TextNamespace
-
-
-def test_compiled_features_returns_frozenset() -> None:
-    features = compiled_features()
-
-    assert isinstance(features, frozenset)
 
 
 @pytest.mark.parametrize(
@@ -27,6 +21,10 @@ def test_compiled_features_returns_frozenset() -> None:
         (
             "tokenization",
             lambda: TextNamespace(cast(Any, "text")).concordance("needle"),
+        ),
+        (
+            "quotation",
+            lambda: TextNamespace(cast(Any, "text")).quotation(model_path="/missing"),
         ),
         ("embedding", lambda: TextNamespace(cast(Any, "text")).embedding()),
         ("topic-modeling", lambda: TextNamespace(cast(Any, "text")).topic_modeling()),

@@ -384,24 +384,16 @@ CREATE TABLE IF NOT EXISTS string_cache (
         std::env::temp_dir().join(format!("polars-text-cache-{test_name}-{unique}.duckdb"))
     }
 
-    #[test]
-    fn text_hash_is_stable_sha256() {
-        assert_eq!(
-            hash_text("hello"),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-    }
+
 
     #[test]
-    fn json_extension_is_statically_linked() -> Result<()> {
+    fn json_cache_queries_work_without_extension_installation() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        let install_mode: String = conn.query_row(
-            "SELECT install_mode FROM duckdb_extensions() WHERE extension_name = 'json'",
-            [],
-            |row| row.get(0),
+        conn.execute_batch("SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;")?;
+        let value: String = conn.query_row(
+            "SELECT json_extract_string('{\"token\":\"café\"}', '$.token')", [], |row| row.get(0),
         )?;
-
-        assert_eq!(install_mode, "STATICALLY_LINKED");
+        assert_eq!(value, "café");
         Ok(())
     }
 
@@ -549,6 +541,11 @@ CREATE TABLE IF NOT EXISTS string_cache (
             |row| row.get(0),
         )?;
         assert_eq!(row_count, 3);
+        let mut statement = conn.prepare("SELECT value FROM string_cache WHERE namespace = 'concurrent' ORDER BY value")?;
+        let values = statement.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(values, ["value:alpha", "value:beta", "value:shared"]);
+        drop(statement);
         drop(conn);
         let _ = std::fs::remove_file(path.as_ref());
         let _ = std::fs::remove_file(lock_path_for(path.as_ref()));

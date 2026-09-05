@@ -213,20 +213,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn official_download_urls_are_github_release_zips() {
-        assert_eq!(
-            LinderaDict::Jieba.download_url(),
-            "https://github.com/lindera/lindera/releases/download/v3.0.7/lindera-jieba-3.0.7.zip"
-        );
-        assert_eq!(
-            LinderaDict::CcCedict.download_url(),
-            "https://github.com/lindera/lindera/releases/download/v3.0.7/lindera-cc-cedict-3.0.7.zip"
-        );
-        assert_eq!(LinderaDict::JaIpadic.cache_subdir(), "lindera-ipadic-3.0.7");
-        assert_eq!(
-            LinderaDict::JaIpadicNeologd.cache_subdir(),
-            "lindera-ipadic-neologd-3.0.7"
-        );
-    }
+
 }

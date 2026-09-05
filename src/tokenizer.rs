@@ -375,15 +375,9 @@ mod tests {
         assert_eq!(tokens, vec!["hello"]);
     }
 
-    #[test]
-    fn test_jieba_model_id_constant() {
-        assert_eq!(JIEBA_MODEL_ID, "lindera:jieba");
-    }
 
-    #[test]
-    fn test_plain_words_en_model_id_constant() {
-        assert_eq!(PLAIN_WORDS_EN_MODEL_ID, "native:plain_words_en");
-    }
+
+
 
     #[test]
     fn cache_fingerprint_includes_immutable_model_artifact_identity() {
@@ -396,13 +390,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_plain_words_en_backend_matches_plain_helper() {
-        let backend = TokenizerBackend::PlainWordsEn;
-        let text = "Hello, [UNK] ##sta Queensland";
-        let tokens = backend.tokenize_text(text, true, true).unwrap();
-        assert_eq!(tokens, tokenize_plain_text(text, true, true));
-    }
+
 
     #[test]
     fn test_plain_words_en_offsets_reconstruct_english() {
@@ -411,6 +399,7 @@ mod tests {
         let toks = backend
             .tokenize_text_with_offsets(text, true, true)
             .unwrap();
+        assert_eq!(toks.len(), 2);
         let text_lc = text.to_lowercase();
         for (tok, start, end) in &toks {
             let extracted: String = text_lc

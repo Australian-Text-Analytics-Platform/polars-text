@@ -88,6 +88,10 @@ mod tests {
 
         let res = cluster(&points, 5).unwrap();
         assert_eq!(res.n_topics, 2, "labels: {:?}", res.labels);
+        assert_eq!(res.labels.len(), points.len());
+        assert!(res.labels[..10].iter().all(|label| *label == res.labels[0]));
+        assert!(res.labels[10..20].iter().all(|label| *label == res.labels[10]));
+        assert_ne!(res.labels[0], res.labels[10]);
         assert_eq!(*res.labels.last().unwrap(), OUTLIER_LABEL);
         // Real labels are contiguous from zero.
         assert!(res

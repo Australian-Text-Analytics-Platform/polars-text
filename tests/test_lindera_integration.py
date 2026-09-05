@@ -17,8 +17,9 @@ import os
 from typing import Any, cast
 
 import polars as pl
-import polars_text  # noqa: F401
 import pytest
+
+import polars_text  # noqa: F401
 
 _LINDERA_TESTS_ENV = "POLARS_TEXT_RUN_LINDERA_TESTS"
 
@@ -97,6 +98,7 @@ def test_lindera_offsets_reconstruct_source() -> None:
         .collect(),
     )
     rows = result.to_series(0).item(0).to_list()
+    assert rows
     chars = list(text)
     for entry in rows:
         tok = entry["token"]

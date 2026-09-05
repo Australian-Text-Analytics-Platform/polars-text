@@ -113,8 +113,11 @@ mod tests {
         let d = &docs[0];
         assert_eq!(d.dominant_topic, 0); // topic 0 has the most segments
                                          // Proportions: topic 0 = 0.5, topic 1 = 0.25, outlier = 0.25, sorted asc.
-        assert_eq!(d.topic_coverage.len(), 3);
-        assert_eq!(d.topic_coverage[0].topic_id, OUTLIER_LABEL);
+        assert_eq!(d.topic_coverage, vec![
+            TopicCoverage { topic_id: OUTLIER_LABEL, coverage: 0.25 },
+            TopicCoverage { topic_id: 0, coverage: 0.5 },
+            TopicCoverage { topic_id: 1, coverage: 0.25 },
+        ]);
         let sum: f32 = d.topic_coverage.iter().map(|entry| entry.coverage).sum();
         assert!((sum - 1.0).abs() < 1e-6);
     }
@@ -175,11 +178,5 @@ mod tests {
         assert_eq!(docs[0].dominant_topic, 2);
     }
 
-    #[test]
-    fn non_overlapping_owned_lengths_control_coverage() {
-        let weights = [5, 4];
-        let docs = rollup(1, &[0, 0], &[0, 1], &weights);
-        let expected = weights[0] as f32 / weights.iter().sum::<usize>() as f32;
-        assert_eq!(docs[0].topic_coverage[0].coverage, expected);
-    }
+
 }

@@ -959,6 +959,7 @@ mod tests {
             3.0,
             4.0,
         ];
+        assert_eq!(row.len(), expected.len());
         assert!(
             row.iter()
                 .zip(expected)

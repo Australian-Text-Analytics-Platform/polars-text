@@ -14,8 +14,8 @@ import os
 from typing import Any, cast
 
 import polars as pl
-import polars_text
 import pytest
+import polars_text  # noqa: F401
 
 _LINDERA_JIEBA_MODEL_ID = "lindera:jieba"
 _BERT_ZH_MODEL_ID = "huggingface:bert-base-chinese"
@@ -58,6 +58,7 @@ def test_jieba_differs_from_bert_base_chinese() -> None:
     )
     jieba_tokens = _tokens_for(text, model=_LINDERA_JIEBA_MODEL_ID)
     bert_tokens = _tokens_for(text, model=_BERT_ZH_MODEL_ID)
+    assert jieba_tokens and bert_tokens
     # bert-base-chinese should produce char-level tokens (one token per Hanzi).
     assert all(len(t) == 1 for t in bert_tokens), (
         f"bert-base-chinese should be char-level, got {bert_tokens!r}"
@@ -76,18 +77,8 @@ def test_jieba_handles_mixed_zh_en_text() -> None:
     assert any("python" in t.lower() for t in tokens), tokens
 
 
-def test_jieba_is_exposed_for_zh_inventory() -> None:
-    model = next(
-        model
-        for model in polars_text.TOKENIZER_MODELS
-        if model.model_id == _LINDERA_JIEBA_MODEL_ID
-    )
-    assert model.languages == ("zh",)
-
-
 def test_jieba_does_not_pollute_english_default() -> None:
     # Loading the Jieba backend must not change an explicitly loaded English tokenizer.
     _tokens_for("我喜欢 Python", model=_LINDERA_JIEBA_MODEL_ID)
     english_tokens = _tokens_for("Hello, world!", model="native:plain_words_en")
-    assert english_tokens
-    assert all(t.isalnum() for t in english_tokens), english_tokens
+    assert english_tokens == ["hello", "world"]

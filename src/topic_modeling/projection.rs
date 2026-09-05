@@ -730,10 +730,9 @@ mod tests {
     fn serialization_round_trip_rejects_corruption_and_old_versions() {
         let context = fixture();
         let bytes = serialize_context(&context).unwrap();
-        assert_eq!(
-            project_serialized_context(&bytes, 2).unwrap().topics.len(),
-            2
-        );
+        let restored = project_serialized_context(&bytes, 2).unwrap();
+        let expected = project(&context, 2).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), serde_json::to_value(&expected).unwrap());
         assert!(project_serialized_context(b"not zstd", 2).is_err());
 
         let mut old = context;

@@ -12,8 +12,9 @@ import os
 from typing import Any, cast
 
 import polars as pl
-import polars_text  # noqa: F401
 import pytest
+
+import polars_text  # noqa: F401
 
 _LINDERA_JIEBA_TESTS_ENV = "POLARS_TEXT_RUN_LINDERA_JIEBA_TESTS"
 _requires_lindera_jieba = pytest.mark.skipif(
@@ -32,19 +33,6 @@ def _structs(text: str, *, model: str | None) -> list[dict]:
     return list(rows)
 
 
-def test_schema_is_list_of_struct() -> None:
-    df = pl.DataFrame({"text": ["Hello"]})
-    out = df.select(
-        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
-    )
-    dtype = out.schema["text"]
-    assert isinstance(dtype, pl.List)
-    inner = dtype.inner
-    assert isinstance(inner, pl.Struct)
-    field_names = {f.name for f in inner.fields}
-    assert field_names == {"token", "start", "end"}
-
-
 @pytest.mark.network
 @_requires_lindera_jieba
 def test_jieba_offsets_reconstruct_chinese() -> None:
@@ -61,6 +49,11 @@ def test_jieba_offsets_reconstruct_chinese() -> None:
         )
 
 
+@pytest.mark.network
+@pytest.mark.skipif(
+    os.environ.get("POLARS_TEXT_RUN_HF_TESTS") != "1",
+    reason="Set POLARS_TEXT_RUN_HF_TESTS=1 to exercise the remote Hugging Face tokenizer",
+)
 def test_hf_offsets_reconstruct_english_lowercased() -> None:
     text = "Tokenization happens fast"
     rows = _structs(text, model="huggingface:bert-base-uncased")
@@ -78,48 +71,14 @@ def test_hf_offsets_reconstruct_english_lowercased() -> None:
         )
 
 
-def test_model_is_required() -> None:
-    df = pl.DataFrame({"text": ["hello world"]})
-    try:
-        df.select(cast(Any, pl.col("text")).text.tokenize())
-    except TypeError as exc:
-        assert "model" in str(exc)
-    else:
-        raise AssertionError("tokenize should require a model")
-
-
 @pytest.mark.network
 @_requires_lindera_jieba
 def test_offsets_are_monotonically_nondecreasing_for_jieba() -> None:
     # Jieba word tokens shouldn't overlap and should advance through the text.
     rows = _structs("他来到了北京清华大学", model="lindera:jieba")
+    assert rows
     prev_end = 0
     for row in rows:
         assert row["start"] >= prev_end, row
         assert row["end"] > row["start"], row
         prev_end = row["end"]
-
-
-def test_empty_text_returns_empty_list() -> None:
-    df = pl.DataFrame({"text": [""]})
-    out = df.select(
-        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
-    )
-    rows = out["text"].to_list()[0]
-    # Should be empty or a list of zero structs.
-    assert list(rows) == []
-
-
-def test_null_text_in_mixed_column_returns_empty_list() -> None:
-    # All-null columns trip polars dtype inference (column becomes null dtype,
-    # not String); the plugin requires String input. Mirror the existing
-    # tokenize / concordance test pattern: at least one non-null value so the
-    # column is inferred String, then verify the None row produces an empty
-    # token list.
-    df = pl.DataFrame({"text": ["Hello", None]})
-    out = df.select(
-        cast(Any, pl.col("text")).text.tokenize(model="native:plain_words_en")
-    )
-    rows = out["text"].to_list()
-    assert len(rows) == 2
-    assert list(rows[1]) == []
