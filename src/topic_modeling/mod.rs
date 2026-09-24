@@ -147,6 +147,20 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         .iter()
         .map(|segment| segment.owned_character_count)
         .collect::<Vec<_>>();
+    // Unicode-character spans (how Python and Polars index strings), kept in
+    // the projection context for per-topic detach.
+    let segment_character_spans = segments
+        .iter()
+        .map(|segment| {
+            let document = documents[segment.doc_index];
+            let start = document
+                .get(..segment.start_byte)
+                .context("Topic Segment start is not a character boundary")?
+                .chars()
+                .count();
+            Ok((start, start + segment.owned_character_count))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // PaCMAP needs at least three points and HDBSCAN needs at least one full
     // minimum cluster. Anything smaller has no defensible density-based Topic.
@@ -230,6 +244,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         embedding_points: &embedding_points,
         document_indices: &segment_doc_indices,
         owned_character_weights: &segment_weights,
+        character_spans: &segment_character_spans,
         per_leaf_term_counts: &term_counts,
         seed: cfg.seed,
     })?;

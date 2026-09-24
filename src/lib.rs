@@ -34,6 +34,10 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         module.add_function(wrap_pyfunction!(project_topic_modeling_context_py, module)?)?;
         module.add_function(wrap_pyfunction!(project_topic_modeling_basis_py, module)?)?;
+        module.add_function(wrap_pyfunction!(
+            project_topic_modeling_segments_py,
+            module
+        )?)?;
     }
     Ok(())
 }
@@ -95,6 +99,17 @@ fn project_topic_modeling_basis_py(
     )
     .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
     serde_json::to_string(&basis)
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
+}
+
+#[cfg(feature = "topic-modeling")]
+#[pyfunction(name = "project_topic_modeling_segments")]
+#[pyo3(signature = (context, cluster_count))]
+fn project_topic_modeling_segments_py(context: Vec<u8>, cluster_count: usize) -> PyResult<String> {
+    let segments =
+        topic_modeling::projection::project_serialized_context_segments(&context, cluster_count)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
+    serde_json::to_string(&segments)
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
 }
 
