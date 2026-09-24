@@ -20,6 +20,9 @@ struct TopicModelingKwargs {
     max_tokens: usize,
     seed: u64,
     min_cluster_size: usize,
+    /// Largest selectable topic in segments; `None` means Auto (a share of all segments).
+    #[serde(default)]
+    max_cluster_size: Option<usize>,
     vectorizer_model: Option<String>,
     lowercase: bool,
 }
@@ -72,6 +75,7 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
             DataType::List(Box::new(topic_struct_type())),
         ),
         Field::new("n_segments".into(), DataType::UInt32),
+        Field::new("max_topic_size".into(), DataType::UInt32),
         Field::new("projection_context".into(), DataType::Binary),
     ]);
     Ok(Field::new(input_fields[0].name().clone(), dtype))
@@ -98,6 +102,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         },
         seed: kwargs.seed,
         min_cluster_size: kwargs.min_cluster_size,
+        max_cluster_size: kwargs.max_cluster_size,
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
     };
@@ -228,10 +233,16 @@ fn topic_modeling_result_to_series(
 
     let n_segments = u32::try_from(result.n_segments)
         .map_err(|_| PolarsError::ComputeError("Topic Segment count exceeds UInt32".into()))?;
+    let max_topic_size = result
+        .max_topic_size
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PolarsError::ComputeError("Max topic size exceeds UInt32".into()))?;
     let fields = [
         document_list,
         topic_list,
         Series::new("n_segments".into(), [n_segments]),
+        Series::new("max_topic_size".into(), [max_topic_size]),
         Series::new(
             "projection_context".into(),
             [result.projection_context.as_deref()],
@@ -265,6 +276,7 @@ mod tests {
                     DataType::List(Box::new(topic_struct_type())),
                 ),
                 Field::new("n_segments".into(), DataType::UInt32),
+                Field::new("max_topic_size".into(), DataType::UInt32),
                 Field::new("projection_context".into(), DataType::Binary),
             ]
         );
@@ -297,6 +309,7 @@ mod tests {
                 },
             ],
             n_segments: 2,
+            max_topic_size: None,
             projection_context: Some(vec![1, 2, 3]),
         };
 

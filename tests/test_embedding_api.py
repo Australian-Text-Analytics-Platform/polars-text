@@ -46,7 +46,8 @@ def test_namespace_signatures_match_the_public_contract() -> None:
         "embedding_cache: 'str | os.PathLike[str] | None' = None, "
         "segmentation: \"Literal['automatic', 'line', 'sentence']\" = 'automatic', "
         "max_tokens: 'int' = 256, seed: 'int' = 42, "
-        "min_topic_size: 'int' = 10, tokenizer_model: 'str | None' = None, "
+        "min_topic_size: 'int' = 10, max_topic_size: 'int | None' = None, "
+        "tokenizer_model: 'str | None' = None, "
         "lowercase: 'bool' = True) -> 'pl.Expr'"
     )
 
@@ -109,6 +110,7 @@ def test_topic_modeling_registers_only_the_supported_fit_controls(
         "max_tokens": 80,
         "seed": 7,
         "min_cluster_size": 2,
+        "max_cluster_size": None,
         "vectorizer_model": None,
         "lowercase": True,
     }

@@ -60,6 +60,8 @@ pub struct RunConfig {
     pub segmentation: SegmentationConfig,
     pub seed: u64,
     pub min_cluster_size: usize,
+    /// Largest selectable topic in segments; `None` resolves to Auto in `cluster`.
+    pub max_cluster_size: Option<usize>,
     pub vectorizer_model_id: Option<String>,
     pub lowercase: bool,
 }
@@ -92,6 +94,9 @@ pub struct TopicModelingResult {
     pub topics: Vec<TopicInfo>,
     pub documents: Vec<DocumentResult>,
     pub n_segments: usize,
+    /// Max topic size (in segments) that produced the topics: the user's fixed
+    /// value, or the cap Auto applied. `None` when no cap was needed.
+    pub max_topic_size: Option<usize>,
     #[serde(skip)]
     pub projection_context: Option<Vec<u8>>,
 }
@@ -192,7 +197,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         anyhow::bail!("topic embeddings do not have enough usable dimensions");
     }
     let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
-    let clustered = cluster::cluster(&reduced, cfg.min_cluster_size)?;
+    let clustered = cluster::cluster(&reduced, cfg.min_cluster_size, cfg.max_cluster_size)?;
     if clustered.n_topics == 0 {
         return Ok(no_topic_result(
             documents.len(),
@@ -229,6 +234,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         seed: cfg.seed,
     })?;
     let mut result = projection::project(&context, clustered.n_topics)?;
+    result.max_topic_size = clustered.max_cluster_size;
     result.projection_context = Some(projection::serialize_context(&context)?);
     Ok(result)
 }
@@ -262,6 +268,7 @@ fn no_topic_result(
         topics: Vec::new(),
         documents,
         n_segments: segment_doc_indices.len(),
+        max_topic_size: None,
         projection_context: None,
     }
 }

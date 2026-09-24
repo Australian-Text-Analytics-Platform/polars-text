@@ -168,6 +168,7 @@ class TextNamespace:
         max_tokens: int = 256,
         seed: int = 42,
         min_topic_size: int = 10,
+        max_topic_size: int | None = None,
         tokenizer_model: str | None = None,
         lowercase: bool = True,
     ) -> pl.Expr:
@@ -181,6 +182,9 @@ class TextNamespace:
             raise ValueError("segmentation must be 'automatic', 'line', or 'sentence'")
         _positive(max_tokens, "max_tokens")
         _positive(min_topic_size, "min_topic_size", minimum=2)
+        if max_topic_size is not None:
+            # None means Auto: the native pipeline caps topics at a share of all segments.
+            _positive(max_topic_size, "max_topic_size", minimum=min_topic_size + 1)
 
         return register_plugin_function(
             plugin_path=PLUGIN_PATH,
@@ -193,6 +197,7 @@ class TextNamespace:
                 "max_tokens": max_tokens,
                 "seed": seed,
                 "min_cluster_size": min_topic_size,
+                "max_cluster_size": max_topic_size,
                 "vectorizer_model": _model_id(tokenizer_model),
                 "lowercase": lowercase,
             },
