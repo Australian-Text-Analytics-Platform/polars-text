@@ -4,9 +4,21 @@
 //! modelling pipeline. Segmenting before embedding lets long documents
 //! contribute several points and ultimately multi-Topic Coverage.
 //!
-//! Automatic mode prefers blank-line, Unicode sentence, word, and finally token
-//! boundaries. Line and Sentence modes retain their semantic units and split an
-//! oversized unit into complete, non-overlapping token-budgeted spans.
+//! All three modes keep semantic units whole when they fit the token budget and
+//! never pack several units into one segment:
+//! - Automatic: paragraphs, then sentences within an oversized paragraph.
+//!   Paragraphs are blank-line blocks when the document has any blank line
+//!   (single newlines inside them are line wrapping); otherwise every non-empty
+//!   line is a paragraph.
+//! - Line: every non-empty line, then sentences within an oversized line.
+//! - Sentence: every Unicode UAX #29 sentence.
+//!
+//! A unit that is still over budget is split at the clause punctuation nearest
+//! its middle, recursively, so pieces stay nearly equal and end at natural
+//! pauses. Only a run with no usable punctuation is cut at the token budget
+//! (preferring word starts), and a tiny leftover from such a cut is dropped.
+//! Segments with no letters or digits (a stray quote mark, a lone full stop)
+//! carry no topic content and are dropped in every mode.
 //!
 //! Called by: `topic_modeling::run` (orchestrator) before embedding.
 
@@ -15,11 +27,16 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// A leftover chunk from a punctuation-free budget cut is dropped when it has
+/// fewer content tokens than this (capped at half the budget, so tiny budgets
+/// never discard everything).
+const MIN_FRAGMENT_TOKENS: usize = 4;
+
 /// Selects how source documents become Topic Segments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentationMethod {
-    /// Hierarchically split and pack text up to the configured token budget.
+    /// Paragraphs first, then sentences, then punctuation-balanced pieces.
     #[default]
     Automatic,
     /// Treat every non-empty newline-delimited line as one segment.
@@ -72,53 +89,26 @@ struct TokenSpan {
     end: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Boundary {
-    token_end: usize,
-    byte_end: usize,
-}
-
-struct BoundaryCursor {
-    boundaries: Vec<Boundary>,
-    next: usize,
-}
-
-impl BoundaryCursor {
-    fn new(boundaries: Vec<Boundary>) -> Self {
-        Self {
-            boundaries,
-            next: 0,
-        }
-    }
-
-    fn latest(&mut self, token_start: usize, token_limit: usize) -> Option<Boundary> {
-        while self
-            .boundaries
-            .get(self.next)
-            .is_some_and(|boundary| boundary.token_end <= token_limit)
-        {
-            self.next += 1;
-        }
-        self.next
-            .checked_sub(1)
-            .and_then(|index| self.boundaries.get(index))
-            .copied()
-            .filter(|boundary| boundary.token_end > token_start)
-    }
+/// Shared inputs for splitting one document's units into segments.
+struct DocumentSplitter<'a> {
+    doc_index: usize,
+    doc: &'a str,
+    tokens: &'a [TokenSpan],
+    max_tokens: usize,
 }
 
 /// Split every document into token-budgeted Topic Segments.
 ///
-/// Flow: tokenize each document once, select the configured semantic ranges,
-/// and split only oversized ranges at source-faithful token boundaries. A
-/// non-whitespace document always yields at least one segment (a short document
-/// yields exactly one). Whitespace-only/empty documents yield zero segments; the
-/// rollup stage maps those to an empty coverage value with `-1` dominant.
+/// Flow: tokenize each document once, select the configured semantic units,
+/// and split only oversized units. A document with any letters or digits
+/// yields at least one segment. Whitespace-only/empty documents yield zero
+/// segments; the rollup stage maps those to an empty coverage value with `-1`
+/// dominant.
 ///
-/// The `tokenizer` must have truncation disabled by the caller — otherwise the
-/// sizer would cap segment sizes at the tokenizer's truncation limit instead of
-/// `max_tokens`. `embedding` loads the tokenizer and clears truncation before
-/// handing a clone here.
+/// The `tokenizer` must have truncation and padding disabled by the caller:
+/// otherwise the sizer would cap segment sizes at the tokenizer's truncation
+/// limit, or count padding as special tokens. `embedding` loads the tokenizer
+/// and clears both before handing a clone here.
 pub fn segment_documents(
     docs: &[&str],
     tokenizer: &Tokenizer,
@@ -141,39 +131,26 @@ pub fn segment_documents(
                     cfg.max_tokens
                 )
             })?;
+        let splitter = DocumentSplitter {
+            doc_index,
+            doc,
+            tokens: &tokens,
+            max_tokens: content_token_budget,
+        };
         match cfg.method {
             SegmentationMethod::Automatic => {
-                segments.extend(segment_document_automatic(
-                    doc_index,
-                    doc,
-                    &tokens,
-                    content_token_budget,
-                )?);
+                for (start, end) in paragraph_ranges(doc) {
+                    splitter.split_block(start, end, &mut segments)?;
+                }
             }
             SegmentationMethod::Line => {
                 for (start, end) in line_ranges(doc) {
-                    segment_line(
-                        doc_index,
-                        doc,
-                        &tokens,
-                        start,
-                        end,
-                        content_token_budget,
-                        &mut segments,
-                    )?;
+                    splitter.split_block(start, end, &mut segments)?;
                 }
             }
             SegmentationMethod::Sentence => {
                 for (start, sentence) in doc.split_sentence_bound_indices() {
-                    split_range_by_tokens(
-                        doc_index,
-                        doc,
-                        &tokens,
-                        start,
-                        start + sentence.len(),
-                        content_token_budget,
-                        &mut segments,
-                    )?;
+                    splitter.split_unit(start, start + sentence.len(), &mut segments)?;
                 }
             }
         }
@@ -221,75 +198,228 @@ fn token_spans(text: &str, tokenizer: &Tokenizer) -> Result<(Vec<TokenSpan>, usi
     Ok((tokens, special_token_count))
 }
 
-fn segment_document_automatic(
-    doc_index: usize,
-    doc: &str,
-    tokens: &[TokenSpan],
-    max_tokens: usize,
-) -> Result<Vec<TopicSegment>> {
-    let Some((trimmed_start, trimmed_end)) = trimmed_range(doc, 0, doc.len())? else {
-        return Ok(Vec::new());
-    };
-    if tokens.is_empty() || tokens.len() <= max_tokens {
-        return Ok(vec![topic_segment(
-            doc_index,
-            doc,
-            trimmed_start,
-            trimmed_end,
-        )?]);
+impl DocumentSplitter<'_> {
+    /// Emits a paragraph or line whole when it fits, otherwise its sentences.
+    fn split_block(
+        &self,
+        start: usize,
+        end: usize,
+        segments: &mut Vec<TopicSegment>,
+    ) -> Result<()> {
+        let Some((start, end)) = trimmed_range(self.doc, start, end)? else {
+            return Ok(());
+        };
+        if tokens_in_range(self.tokens, start, end).len() <= self.max_tokens {
+            return self.push(start, end, segments);
+        }
+        let block = self
+            .doc
+            .get(start..end)
+            .context("segmentation received an invalid source range")?;
+        for (relative_start, sentence) in block.split_sentence_bound_indices() {
+            let sentence_start = start + relative_start;
+            self.split_unit(sentence_start, sentence_start + sentence.len(), segments)?;
+        }
+        Ok(())
     }
 
-    let mut paragraph_boundaries = BoundaryCursor::new(index_boundaries(
-        tokens,
-        paragraph_end_offsets(doc).into_iter(),
-    ));
-    let mut sentence_boundaries = BoundaryCursor::new(index_boundaries(
-        tokens,
-        doc.split_sentence_bound_indices()
-            .map(|(start, sentence)| start + sentence.len()),
-    ));
-    let mut word_boundaries = BoundaryCursor::new(index_boundaries(
-        tokens,
-        doc.split_word_bound_indices()
-            .map(|(start, word)| start + word.len()),
-    ));
-
-    let mut segments = Vec::new();
-    let mut token_start = 0usize;
-    let mut byte_start = trimmed_start;
-    while token_start < tokens.len() {
-        let token_limit = (token_start + max_tokens).min(tokens.len());
-        let mut boundary = paragraph_boundaries
-            .latest(token_start, token_limit)
-            .or_else(|| sentence_boundaries.latest(token_start, token_limit))
-            .or_else(|| word_boundaries.latest(token_start, token_limit))
-            .unwrap_or(Boundary {
-                token_end: token_limit,
-                byte_end: tokens[token_limit - 1].end,
-            });
-        if boundary.token_end == tokens.len() {
-            boundary.byte_end = trimmed_end;
+    /// Emits a sentence-level unit whole when it fits; otherwise splits it at
+    /// the clause punctuation nearest its middle, recursively, and falls back
+    /// to budget cuts only when no punctuation is usable.
+    fn split_unit(&self, start: usize, end: usize, segments: &mut Vec<TopicSegment>) -> Result<()> {
+        let Some((start, end)) = trimmed_range(self.doc, start, end)? else {
+            return Ok(());
+        };
+        let unit_tokens = tokens_in_range(self.tokens, start, end);
+        if unit_tokens.len() <= self.max_tokens {
+            return self.push(start, end, segments);
         }
-        if boundary.token_end <= token_start
-            || boundary.byte_end <= byte_start
-            || boundary.byte_end > doc.len()
-            || !doc.is_char_boundary(boundary.byte_end)
-        {
-            bail!("automatic segmentation could not make progress at token {token_start}");
+        match self.middle_punctuation_split(start, end, unit_tokens) {
+            Some(split) => {
+                self.split_unit(start, split, segments)?;
+                self.split_unit(split, end, segments)
+            }
+            None => self.cut_by_budget(start, end, unit_tokens, segments),
         }
-
-        if let Some((start, end)) = trimmed_range(doc, byte_start, boundary.byte_end)? {
-            segments.push(topic_segment(doc_index, doc, start, end)?);
-        }
-        if boundary.token_end == tokens.len() {
-            break;
-        }
-
-        byte_start = boundary.byte_end;
-        token_start = boundary.token_end;
     }
 
-    Ok(segments)
+    /// Byte offset just after the clause punctuation whose left side holds the
+    /// token count closest to half the unit. Both sides must keep at least the
+    /// tiny-fragment minimum, so an opening "However," is never split off.
+    fn middle_punctuation_split(
+        &self,
+        start: usize,
+        end: usize,
+        unit_tokens: &[TokenSpan],
+    ) -> Option<usize> {
+        let unit = self.doc.get(start..end)?;
+        let half = unit_tokens.len() as f64 / 2.0;
+        let min_side = self.min_fragment_tokens();
+        let mut best: Option<(f64, usize)> = None;
+        let mut chars = unit.char_indices().peekable();
+        while let Some((offset, character)) = chars.next() {
+            if !is_clause_punctuation(character) {
+                continue;
+            }
+            let mut split = start + offset + character.len_utf8();
+            // Keep closing quotes and brackets with the clause they close.
+            while let Some(&(next_offset, next)) = chars.peek() {
+                if !is_closing_mark(next) {
+                    break;
+                }
+                split = start + next_offset + next.len_utf8();
+                chars.next();
+            }
+            let followed_by_space = self.doc[split..end]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
+            if !(followed_by_space || is_wide_punctuation(character)) {
+                continue;
+            }
+            let left = unit_tokens.partition_point(|token| token.end <= split);
+            if left < min_side || unit_tokens.len() - left < min_side {
+                continue;
+            }
+            let distance = (left as f64 - half).abs();
+            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                best = Some((distance, split));
+            }
+        }
+        best.map(|(_, split)| split)
+    }
+
+    /// Cuts a punctuation-free run into budget-sized chunks that start at word
+    /// starts where possible, dropping a tiny leftover.
+    fn cut_by_budget(
+        &self,
+        start: usize,
+        end: usize,
+        unit_tokens: &[TokenSpan],
+        segments: &mut Vec<TopicSegment>,
+    ) -> Result<()> {
+        let min_fragment = self.min_fragment_tokens();
+        let mut first = 0usize;
+        while first < unit_tokens.len() {
+            let mut next = (first + self.max_tokens).min(unit_tokens.len());
+            if next < unit_tokens.len() {
+                if let Some(word_start) = (first + 1..=next)
+                    .rev()
+                    .find(|&index| self.starts_word(unit_tokens[index].start))
+                {
+                    next = word_start;
+                }
+            }
+            let span_start = if first == 0 {
+                start
+            } else {
+                unit_tokens[first].start
+            };
+            let span_end = unit_tokens.get(next).map_or(end, |token| token.start);
+            let is_leftover = next == unit_tokens.len() && first > 0;
+            if !(is_leftover && next - first < min_fragment) {
+                if let Some((span_start, span_end)) = trimmed_range(self.doc, span_start, span_end)?
+                {
+                    self.push(span_start, span_end, segments)?;
+                }
+            }
+            first = next;
+        }
+        Ok(())
+    }
+
+    /// Smallest piece worth keeping, capped at half the budget so tiny budgets
+    /// never discard everything.
+    fn min_fragment_tokens(&self) -> usize {
+        MIN_FRAGMENT_TOKENS.min(self.max_tokens.div_ceil(2)).max(1)
+    }
+
+    fn starts_word(&self, byte: usize) -> bool {
+        byte == 0
+            || self.doc[..byte]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+    }
+
+    /// Records a segment unless it has no letters or digits.
+    fn push(&self, start: usize, end: usize, segments: &mut Vec<TopicSegment>) -> Result<()> {
+        let text = self
+            .doc
+            .get(start..end)
+            .context("Topic Segment received an invalid source range")?;
+        if !text.chars().any(char::is_alphanumeric) {
+            return Ok(());
+        }
+        segments.push(TopicSegment {
+            doc_index: self.doc_index,
+            start_byte: start,
+            end_byte: end,
+            owned_character_count: text.chars().count(),
+        });
+        Ok(())
+    }
+}
+
+/// Punctuation that ends a clause and makes a natural split point.
+fn is_clause_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ',' | ';' | ':' | '.' | '!' | '?' | '\u{2014}' | '\u{2013}' | '\u{2026}'
+    ) || is_wide_punctuation(character)
+}
+
+/// Full-width CJK punctuation, which is not followed by a space.
+fn is_wide_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3001}' | '\u{3002}' | '\u{FF0C}' | '\u{FF1B}' | '\u{FF1A}' | '\u{FF01}' | '\u{FF1F}'
+    )
+}
+
+fn is_closing_mark(character: char) -> bool {
+    matches!(
+        character,
+        '"' | '\''
+            | ')'
+            | ']'
+            | '}'
+            | '\u{201D}'
+            | '\u{2019}'
+            | '\u{300D}'
+            | '\u{300F}'
+            | '\u{FF09}'
+    )
+}
+
+/// Paragraph ranges for Automatic mode: blank-line blocks when the document has
+/// a blank line, otherwise its non-empty lines.
+fn paragraph_ranges(text: &str) -> Vec<(usize, usize)> {
+    let lines = line_ranges(text);
+    let has_blank_line = lines
+        .iter()
+        .any(|&(start, end)| text[start..end].trim().is_empty())
+        && lines
+            .iter()
+            .filter(|&&(start, end)| !text[start..end].trim().is_empty())
+            .count()
+            > 1;
+    if !has_blank_line {
+        return lines;
+    }
+    let mut paragraphs = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for (start, end) in lines {
+        if text[start..end].trim().is_empty() {
+            if let Some(paragraph) = open.take() {
+                paragraphs.push(paragraph);
+            }
+        } else {
+            open = Some(open.map_or((start, end), |(first, _)| (first, end)));
+        }
+    }
+    paragraphs.extend(open);
+    paragraphs
 }
 
 fn line_ranges(text: &str) -> Vec<(usize, usize)> {
@@ -304,73 +434,6 @@ fn line_ranges(text: &str) -> Vec<(usize, usize)> {
         ranges.push((start, text.len()));
     }
     ranges
-}
-
-fn segment_line(
-    doc_index: usize,
-    doc: &str,
-    tokens: &[TokenSpan],
-    start: usize,
-    end: usize,
-    max_tokens: usize,
-    segments: &mut Vec<TopicSegment>,
-) -> Result<()> {
-    let Some((start, end)) = trimmed_range(doc, start, end)? else {
-        return Ok(());
-    };
-    if tokens_in_range(tokens, start, end).len() <= max_tokens {
-        segments.push(topic_segment(doc_index, doc, start, end)?);
-        return Ok(());
-    }
-
-    let line = doc
-        .get(start..end)
-        .context("line segmentation received an invalid source range")?;
-    for (relative_start, sentence) in line.split_sentence_bound_indices() {
-        split_range_by_tokens(
-            doc_index,
-            doc,
-            tokens,
-            start + relative_start,
-            start + relative_start + sentence.len(),
-            max_tokens,
-            segments,
-        )?;
-    }
-    Ok(())
-}
-
-fn split_range_by_tokens(
-    doc_index: usize,
-    doc: &str,
-    tokens: &[TokenSpan],
-    start: usize,
-    end: usize,
-    max_tokens: usize,
-    segments: &mut Vec<TopicSegment>,
-) -> Result<()> {
-    let Some((start, end)) = trimmed_range(doc, start, end)? else {
-        return Ok(());
-    };
-    let unit_tokens = tokens_in_range(tokens, start, end);
-    if unit_tokens.len() <= max_tokens || unit_tokens.is_empty() {
-        segments.push(topic_segment(doc_index, doc, start, end)?);
-        return Ok(());
-    }
-
-    for token_start in (0..unit_tokens.len()).step_by(max_tokens) {
-        let token_end = (token_start + max_tokens).min(unit_tokens.len());
-        let span_start = if token_start == 0 {
-            start
-        } else {
-            unit_tokens[token_start].start
-        };
-        let span_end = unit_tokens.get(token_end).map_or(end, |token| token.start);
-        if let Some((span_start, span_end)) = trimmed_range(doc, span_start, span_end)? {
-            segments.push(topic_segment(doc_index, doc, span_start, span_end)?);
-        }
-    }
-    Ok(())
 }
 
 fn tokens_in_range(tokens: &[TokenSpan], start: usize, end: usize) -> &[TokenSpan] {
@@ -388,77 +451,6 @@ fn trimmed_range(text: &str, start: usize, end: usize) -> Result<Option<(usize, 
     let start = start + leading;
     let end = end.saturating_sub(trailing);
     Ok((start < end).then_some((start, end)))
-}
-
-fn topic_segment(
-    doc_index: usize,
-    doc: &str,
-    start_byte: usize,
-    end_byte: usize,
-) -> Result<TopicSegment> {
-    let text = doc
-        .get(start_byte..end_byte)
-        .context("Topic Segment received an invalid source range")?;
-    Ok(TopicSegment {
-        doc_index,
-        start_byte,
-        end_byte,
-        owned_character_count: text.chars().count(),
-    })
-}
-
-fn index_boundaries(tokens: &[TokenSpan], byte_ends: impl Iterator<Item = usize>) -> Vec<Boundary> {
-    let mut boundaries = Vec::<Boundary>::new();
-    let mut token_end = 0usize;
-    for byte_end in byte_ends {
-        while tokens
-            .get(token_end)
-            .is_some_and(|token| token.end <= byte_end)
-        {
-            token_end += 1;
-        }
-        if token_end == 0 {
-            continue;
-        }
-        if let Some(previous) = boundaries
-            .last_mut()
-            .filter(|boundary| boundary.token_end == token_end)
-        {
-            previous.byte_end = byte_end;
-        } else {
-            boundaries.push(Boundary {
-                token_end,
-                byte_end,
-            });
-        }
-    }
-    boundaries
-}
-
-fn paragraph_end_offsets(text: &str) -> Vec<usize> {
-    let mut ends = Vec::new();
-    let mut byte_offset = 0usize;
-    let mut paragraph_open = false;
-    let mut paragraph_end = 0usize;
-    for line in text.split_inclusive('\n') {
-        let line_start = byte_offset;
-        byte_offset += line.len();
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        let content = content.strip_suffix('\r').unwrap_or(content);
-        if content.trim().is_empty() {
-            if paragraph_open {
-                ends.push(paragraph_end);
-                paragraph_open = false;
-            }
-        } else {
-            paragraph_open = true;
-            paragraph_end = line_start + content.trim_end().len();
-        }
-    }
-    if paragraph_open {
-        ends.push(paragraph_end);
-    }
-    ends
 }
 
 #[cfg(test)]
@@ -613,13 +605,79 @@ mod tests {
     }
 
     #[test]
-    fn automatic_segments_do_not_repeat_boundary_text() {
+    fn automatic_keeps_sentences_separate_instead_of_packing() {
         let cfg = SegmentationConfig {
             method: SegmentationMethod::Automatic,
             max_tokens: 4,
         };
         let segments = word_segments("a b. C d. E f.", cfg);
-        assert_eq!(segments, vec!["a b. C d.", "E f."]);
+        assert_eq!(segments, vec!["a b.", "C d.", "E f."]);
+    }
+
+    #[test]
+    fn automatic_uses_single_newlines_as_paragraphs_without_blank_lines() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Automatic,
+            max_tokens: 64,
+        };
+        let segments = word_segments("alpha beta.\ngamma delta.", cfg);
+        assert_eq!(segments, vec!["alpha beta.", "gamma delta."]);
+    }
+
+    #[test]
+    fn automatic_treats_single_newlines_as_wrapping_when_blank_lines_exist() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Automatic,
+            max_tokens: 64,
+        };
+        let segments = word_segments("alpha\nbeta.\n\ngamma delta.", cfg);
+        assert_eq!(segments, vec!["alpha\nbeta.", "gamma delta."]);
+    }
+
+    #[test]
+    fn oversized_units_split_at_the_middle_punctuation() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Sentence,
+            max_tokens: 6,
+        };
+        let segments = word_segments("one two, three four, five six, seven eight.", cfg);
+        assert_eq!(
+            segments,
+            vec!["one two, three four,", "five six, seven eight."]
+        );
+    }
+
+    #[test]
+    fn punctuation_near_an_edge_does_not_split_off_a_fragment() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Sentence,
+            max_tokens: 8,
+        };
+        let segments = word_segments("However, w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13", cfg);
+        assert!(
+            segments.iter().all(|segment| segment != "However,"),
+            "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn punctuation_free_cuts_drop_a_tiny_leftover() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Sentence,
+            max_tokens: 8,
+        };
+        let segments = word_segments("w1 w2 w3 w4 w5 w6 w7 w8 w9", cfg);
+        assert_eq!(segments, vec!["w1 w2 w3 w4 w5 w6 w7 w8"]);
+    }
+
+    #[test]
+    fn segments_without_letters_or_digits_are_dropped() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Line,
+            max_tokens: 64,
+        };
+        let segments = word_segments("hello world\n\"\n.", cfg);
+        assert_eq!(segments, vec!["hello world"]);
     }
 
     #[test]
