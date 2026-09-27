@@ -52,11 +52,10 @@ def test_lindera_ja_tokenize_produces_morphemes(
     # `.text.tokenize` returns List(Struct{token,start,end}); `.item(0)` hands
     # back a polars Series (not a Python list), so extract token strings from
     # its dictionaries.
-    result = cast(
-        pl.DataFrame,
+    result = (
         df.lazy()
         .select(cast(Any, pl.col("text")).text.tokenize(model=model_id))
-        .collect(),
+        .collect()
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     assert any(expected_substring == t or expected_substring in t for t in tokens), (
@@ -66,11 +65,10 @@ def test_lindera_ja_tokenize_produces_morphemes(
 
 def test_lindera_ko_tokenize_produces_morphemes() -> None:
     df = pl.DataFrame({"text": ["한국어 형태소 분석은 흥미롭다"]})
-    result = cast(
-        pl.DataFrame,
+    result = (
         df.lazy()
         .select(cast(Any, pl.col("text")).text.tokenize(model="lindera:ko-dic"))
-        .collect(),
+        .collect()
     )
     tokens = [entry["token"] for entry in result.to_series(0).item(0).to_list()]
     # 한국어 = "Korean (language)"; one of the most common standalone
@@ -91,11 +89,10 @@ def test_lindera_offsets_reconstruct_source() -> None:
     df = pl.DataFrame({"text": [text]})
     # `tokenize` returns a List(Struct{token,start,end}).
     # `.to_list()` on the inner Series surfaces a Python list of dicts.
-    result = cast(
-        pl.DataFrame,
+    result = (
         df.lazy()
         .select(cast(Any, pl.col("text")).text.tokenize(model="lindera:ja-ipadic"))
-        .collect(),
+        .collect()
     )
     rows = result.to_series(0).item(0).to_list()
     assert rows

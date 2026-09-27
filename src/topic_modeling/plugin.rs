@@ -20,6 +20,9 @@ struct TopicModelingKwargs {
     max_tokens: usize,
     seed: u64,
     min_cluster_size: usize,
+    /// Largest selectable topic in segments; `None` means Auto (a share of all segments).
+    #[serde(default)]
+    max_cluster_size: Option<usize>,
     vectorizer_model: Option<String>,
     lowercase: bool,
 }
@@ -72,6 +75,7 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
             DataType::List(Box::new(topic_struct_type())),
         ),
         Field::new("n_segments".into(), DataType::UInt32),
+        Field::new("max_topic_size".into(), DataType::UInt32),
         Field::new("projection_context".into(), DataType::Binary),
     ]);
     Ok(Field::new(input_fields[0].name().clone(), dtype))
@@ -98,6 +102,10 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         },
         seed: kwargs.seed,
         min_cluster_size: kwargs.min_cluster_size,
+        topic_size_limit: kwargs.max_cluster_size.map_or(
+            ldaca_rs::topic_modeling::TopicSizeLimit::Auto,
+            ldaca_rs::topic_modeling::TopicSizeLimit::Fixed,
+        ),
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
     };
@@ -228,10 +236,16 @@ fn topic_modeling_result_to_series(
 
     let n_segments = u32::try_from(result.n_segments)
         .map_err(|_| PolarsError::ComputeError("Topic Segment count exceeds UInt32".into()))?;
+    let max_topic_size = result
+        .max_topic_size
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PolarsError::ComputeError("Max topic size exceeds UInt32".into()))?;
     let fields = [
         document_list,
         topic_list,
         Series::new("n_segments".into(), [n_segments]),
+        Series::new("max_topic_size".into(), [max_topic_size]),
         Series::new(
             "projection_context".into(),
             [result.projection_context.as_deref()],
@@ -244,6 +258,31 @@ fn topic_modeling_result_to_series(
 mod tests {
     use super::*;
     use ldaca_rs::topic_modeling::{DocumentResult, TopicInfo};
+
+    #[test]
+    fn output_contains_separate_run_level_document_and_topic_lists() {
+        let output = topic_modeling_output(&[Field::new("text".into(), DataType::String)])
+            .expect("topic output dtype");
+        let DataType::Struct(fields) = output.dtype() else {
+            panic!("topic output must be a struct")
+        };
+        assert_eq!(
+            fields,
+            &vec![
+                Field::new(
+                    "documents".into(),
+                    DataType::List(Box::new(document_struct_type())),
+                ),
+                Field::new(
+                    "topics".into(),
+                    DataType::List(Box::new(topic_struct_type())),
+                ),
+                Field::new("n_segments".into(), DataType::UInt32),
+                Field::new("max_topic_size".into(), DataType::UInt32),
+                Field::new("projection_context".into(), DataType::Binary),
+            ]
+        );
+    }
 
     #[test]
     fn scalar_result_preserves_topic_metadata_when_topic_never_dominates() {
@@ -271,6 +310,7 @@ mod tests {
                 },
             ],
             n_segments: 2,
+            max_topic_size: None,
             projection_context: Some(vec![1, 2, 3]),
         };
 
