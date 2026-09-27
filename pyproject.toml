@@ -13,7 +13,7 @@ build-backend = "maturin"
 [tool.maturin]
 python-source = "."
 module-name = "polars_text._internal"
-include = [{ path = "vendor/udpipe/**", format = "sdist" }, { path = "src/quotation/**", format = "sdist" }, { path = "scripts/*quotation*", format = "sdist" }, { path = "scripts/vendor_udpipe.py", format = "sdist" }]
+include = [{ path = "scripts/*quotation*", format = "sdist" }, { path = "scripts/vendor_udpipe.py", format = "sdist" }]
 
 [dependency-groups]
 dev = ["maturin==1.15.0", "pytest==9.1.1"]

@@ -4,24 +4,15 @@ use pyo3_polars::PolarsAllocator;
 #[cfg(feature = "tokenization")]
 use pyo3_polars::PySeries;
 
-#[cfg(feature = "cache")]
-mod cache;
 #[cfg(feature = "tokenization")]
 mod concordance;
 pub mod expressions;
-#[cfg(feature = "tokenization")]
-mod lindera_dict;
 #[cfg(any(feature = "embedding", feature = "tokenization", feature = "quotation"))]
 mod list_output;
-#[cfg(feature = "tokenization")]
-mod offsets;
 #[cfg(feature = "quotation")]
 mod quotation;
-#[cfg(feature = "tokenization")]
 mod token_frequencies;
-#[cfg(feature = "tokenization")]
-mod tokenizer;
-#[cfg(any(feature = "embedding", feature = "topic-modeling"))]
+#[cfg(feature = "topic-modeling")]
 pub mod topic_modeling;
 
 #[global_allocator]
@@ -30,6 +21,11 @@ static ALLOC: PolarsAllocator = PolarsAllocator::new();
 #[pymodule]
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compiled_features, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        token_frequencies::frequency_stats,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(tokenizer_models, module)?)?;
     #[cfg(feature = "tokenization")]
     module.add_function(wrap_pyfunction!(token_frequencies_py, module)?)?;
     #[cfg(feature = "topic-modeling")]
@@ -124,4 +120,12 @@ mod tests {
             cfg!(feature = "topic-modeling")
         );
     }
+}
+
+#[pyfunction]
+fn tokenizer_models() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+    ldaca_rs::text::TOKENIZER_MODELS
+        .iter()
+        .map(|model| (model.model_id, model.label, model.languages.to_vec()))
+        .collect()
 }

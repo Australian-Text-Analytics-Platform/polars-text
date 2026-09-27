@@ -220,3 +220,10 @@ list. The expression is lazy and never downloads models. Supply an external
 UDPipe model explicitly. Model predictions differ from spaCy; English is supported.
 See [quotation notices](polars_text/QUOTATION_NOTICES.md) for upstream and model
 licensing. The default Wordflow model is CC BY-NC-SA 4.0, for non-commercial use.
+
+## Shared native implementation
+
+The native algorithms and data SDK live in the sibling `ldaca-rs/` crate. This
+package is a Polars/PyO3 adapter and local builds require `../ldaca-rs`. Its public
+Python interface, lazy expressions and schemas are unchanged. CI/publication
+setup for the shared dependency is deferred.

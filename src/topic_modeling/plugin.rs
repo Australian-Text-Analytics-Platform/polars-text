@@ -91,7 +91,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
 
     let cfg = RunConfig {
         embedder_repo_id: kwargs.embedder_model,
-        embedding_cache_path: kwargs.cache,
+        embedding_cache_path: kwargs.cache.map(Into::into),
         segmentation: super::segmentation::SegmentationConfig {
             method: kwargs.segmentation_method,
             max_tokens: kwargs.max_tokens,
@@ -243,10 +243,7 @@ fn topic_modeling_result_to_series(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topic_modeling::ctfidf::RepresentativeWord;
-    use crate::topic_modeling::{DocumentResult, TopicInfo};
-
-
+    use ldaca_rs::topic_modeling::{DocumentResult, TopicInfo};
 
     #[test]
     fn scalar_result_preserves_topic_metadata_when_topic_never_dominates() {
@@ -265,11 +262,10 @@ mod tests {
                 },
                 TopicInfo {
                     id: 1,
-                    representative_words: vec![RepresentativeWord {
-                        word: "hidden".to_string(),
-                        occurrence_count: 2,
-                        score: 1.0,
-                    }],
+                    representative_words: vec![serde_json::from_value(
+                        serde_json::json!({"word": "hidden", "occurrence_count": 2}),
+                    )
+                    .unwrap()],
                     x: 1.0,
                     y: 1.0,
                 },
@@ -292,13 +288,42 @@ mod tests {
             .expect("scalar topic rows");
 
         assert_eq!((series.len(), topic_rows.len()), (1, 2));
-        let declared = topic_modeling_output(&[Field::new("text".into(), DataType::String)]).unwrap();
+        let declared =
+            topic_modeling_output(&[Field::new("text".into(), DataType::String)]).unwrap();
         assert_eq!(series.dtype(), declared.dtype());
         let rows = topic_rows.struct_().unwrap();
-        assert_eq!(rows.field_by_name("id").unwrap().i32().unwrap().into_no_null_iter().collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(
+            rows.field_by_name("id")
+                .unwrap()
+                .i32()
+                .unwrap()
+                .into_no_null_iter()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
         let words = rows.field_by_name("representative_words").unwrap();
         let hidden = words.list().unwrap().get_as_series(1).unwrap();
-        assert_eq!(hidden.struct_().unwrap().field_by_name("word").unwrap().str().unwrap().get(0), Some("hidden"));
-        assert_eq!(hidden.struct_().unwrap().field_by_name("occurrence_count").unwrap().u64().unwrap().get(0), Some(2));
+        assert_eq!(
+            hidden
+                .struct_()
+                .unwrap()
+                .field_by_name("word")
+                .unwrap()
+                .str()
+                .unwrap()
+                .get(0),
+            Some("hidden")
+        );
+        assert_eq!(
+            hidden
+                .struct_()
+                .unwrap()
+                .field_by_name("occurrence_count")
+                .unwrap()
+                .u64()
+                .unwrap()
+                .get(0),
+            Some(2)
+        );
     }
 }

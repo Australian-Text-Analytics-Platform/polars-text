@@ -1,32 +1,6 @@
-"""Reproduce the unmodified UDPipe library sources from the pinned release."""
-import hashlib
-import io
+"""Delegate model/source provisioning to the owning native crate."""
 from pathlib import Path
-import urllib.request
-import zipfile
-
-URL = "https://github.com/ufal/udpipe/releases/download/v1.4.0/udpipe-1.4.0-bin.zip"
-SHA256 = "457f541e204737d354c749b473060a28b2debf625f23075543d9eba78be016c1"
-
-
-def main() -> None:
-    payload = urllib.request.urlopen(URL, timeout=120).read()
-    if hashlib.sha256(payload).hexdigest() != SHA256:
-        raise ValueError("UDPipe release checksum mismatch")
-    destination = Path(__file__).resolve().parents[1] / "vendor" / "udpipe"
-    destination.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-        for source, target in (
-            ("src_lib_only/udpipe.cpp", "udpipe.cpp"),
-            ("src_lib_only/udpipe.h", "udpipe.h"),
-            ("LICENSE", "LICENSE"),
-        ):
-            (destination / target).write_bytes(archive.read("udpipe-1.4.0-bin/" + source))
-
-    (destination.parents[1] / "polars_text" / "UDPIPE_LICENSE").write_bytes(
-        (destination / "LICENSE").read_bytes()
-    )
-
+import runpy
 
 if __name__ == "__main__":
-    main()
+    runpy.run_path(str(Path(__file__).resolve().parents[2] / "ldaca-rs" / "scripts" / "vendor_udpipe.py"), run_name="__main__")

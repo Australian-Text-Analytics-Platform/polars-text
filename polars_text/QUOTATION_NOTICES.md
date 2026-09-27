@@ -2,7 +2,7 @@
 
 UDPipe 1.4.0, copyright Institute of Formal and Applied Linguistics,
 Charles University, is statically linked under MPL-2.0. Its unmodified source
-and licence are included in the polars-text source distribution under vendor/udpipe.
+and licence are owned by the sibling ldaca-rs crate under vendor/udpipe. The wheel retains the licence notices below.
 Upstream: https://github.com/ufal/udpipe/releases/tag/v1.4.0
 
 Quotation rules and reporting verbs are adapted from Gender Gap Tracker,

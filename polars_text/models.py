@@ -11,15 +11,11 @@ class TokenizerModel:
     languages: tuple[str, ...]
 
 
-TOKENIZER_MODELS: Final[tuple[TokenizerModel, ...]] = (
-    TokenizerModel("native:plain_words_en", "Plain words (English)", ("en",)),
-    TokenizerModel("huggingface:bert-base-uncased", "BERT base uncased", ("en",)),
-    TokenizerModel("lindera:jieba", "Jieba", ("zh",)),
-    TokenizerModel("lindera:cc-cedict", "CC-CEDICT", ("zh",)),
-    TokenizerModel("lindera:ja-ipadic", "IPADIC", ("ja",)),
-    TokenizerModel("lindera:ja-ipadic-neologd", "IPADIC Neologd", ("ja",)),
-    TokenizerModel("lindera:ja-unidic", "UniDic", ("ja",)),
-    TokenizerModel("lindera:ko-dic", "ko-dic", ("ko",)),
+from ._internal import tokenizer_models
+
+TOKENIZER_MODELS: Final[tuple[TokenizerModel, ...]] = tuple(
+    TokenizerModel(model_id, label, tuple(languages))
+    for model_id, label, languages in tokenizer_models()
 )
 
 

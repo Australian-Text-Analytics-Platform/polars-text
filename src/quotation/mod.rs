@@ -1,35 +1,32 @@
-//! English quotation extraction over an owned, thread-confined UDPipe model.
-mod bridge;
-mod document;
-mod normalize;
-mod rules;
-
-use document::Document;
-use normalize::Normalized;
+//! Polars quotation schema and row conversion.
+use ldaca_rs::quotation::{QuotationExtractor, Quote};
 use polars::prelude::*;
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
 };
-
-#[derive(Debug, thiserror::Error)]
-enum Error {
-    #[error("quotation model I/O: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("quotation parser: {0}")]
-    Parser(#[from] cxx::Exception),
-    #[error("quotation parser returned invalid dependency or source ranges")]
-    InvalidParse,
-    #[error("quotation model is already borrowed on this thread")]
-    Borrow,
+thread_local! { static MODEL: RefCell<Option<(PathBuf, QuotationExtractor)>> = const { RefCell::new(None) }; }
+fn extract(source: &str, path: &Path) -> PolarsResult<Vec<Quote>> {
+    MODEL.with(|slot| {
+        let mut slot = slot
+            .try_borrow_mut()
+            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+        let path = path.canonicalize().map_err(|e| {
+            PolarsError::ComputeError(ldaca_rs::quotation::Error::Io(e).to_string().into())
+        })?;
+        if slot.as_ref().is_none_or(|(cached, _)| *cached != path) {
+            let model = QuotationExtractor::load(&path)
+                .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+            *slot = Some((path, model));
+        }
+        let (_, model) = slot
+            .as_mut()
+            .ok_or_else(|| PolarsError::ComputeError("quotation model unavailable".into()))?;
+        model
+            .extract(source)
+            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+    })
 }
-
-struct CachedModel {
-    path: PathBuf,
-    model: cxx::UniquePtr<bridge::ffi::Model>,
-}
-thread_local! { static MODEL: RefCell<Option<CachedModel>> = const { RefCell::new(None) }; }
-
 #[derive(serde::Deserialize)]
 pub(crate) struct QuotationKwargs {
     model_path: String,
@@ -66,23 +63,6 @@ fn fields() -> Vec<Field> {
     .collect()
 }
 
-fn extract(source: &str, path: &Path) -> Result<Vec<rules::Quote>, Error> {
-    let normalized = Normalized::new(source);
-    let parsed = MODEL.with(|slot| {
-        let mut slot = slot.try_borrow_mut().map_err(|_| Error::Borrow)?;
-        let path = path.canonicalize()?;
-        if slot.as_ref().is_none_or(|cached| cached.path != path) {
-            let bytes = std::fs::read(&path)?;
-            let model = bridge::ffi::load_model(&bytes)?;
-            *slot = Some(CachedModel { path, model });
-        }
-        let cached = slot.as_mut().ok_or(Error::InvalidParse)?;
-        Ok::<_, Error>(cached.model.pin_mut().parse(&normalized.text)?)
-    })?;
-    let doc = Document::new(&normalized.text, parsed)?;
-    Ok(rules::extract(&doc, &normalized, source))
-}
-
 pub(crate) fn expression(inputs: &[Series], kwargs: QuotationKwargs) -> PolarsResult<Series> {
     let input = inputs[0].str()?;
     let mut quotes = Vec::new();
@@ -103,76 +83,29 @@ pub(crate) fn expression(inputs: &[Series], kwargs: QuotationKwargs) -> PolarsRe
         };
     }
     let columns = vec![
-        col!("speaker", |q: &rules::Quote| q
+        col!("speaker", |q: &Quote| q
             .speaker
             .as_ref()
             .map(|s| s.0.as_str())),
-        col!("speaker_start_idx", |q: &rules::Quote| q
+        col!("speaker_start_idx", |q: &Quote| q
             .speaker
             .as_ref()
             .map(|s| s.1)),
-        col!("speaker_end_idx", |q: &rules::Quote| q
+        col!("speaker_end_idx", |q: &Quote| q
             .speaker
             .as_ref()
             .map(|s| s.2)),
-        col!("quote", |q: &rules::Quote| q.quote.0.as_str()),
-        col!("quote_start_idx", |q: &rules::Quote| q.quote.1),
-        col!("quote_end_idx", |q: &rules::Quote| q.quote.2),
-        col!("verb", |q: &rules::Quote| q
-            .verb
-            .as_ref()
-            .map(|s| s.0.as_str())),
-        col!("verb_start_idx", |q: &rules::Quote| q
-            .verb
-            .as_ref()
-            .map(|s| s.1)),
-        col!("verb_end_idx", |q: &rules::Quote| q
-            .verb
-            .as_ref()
-            .map(|s| s.2)),
-        col!("quote_type", |q: &rules::Quote| q.kind.as_str()),
-        col!("quote_token_count", |q: &rules::Quote| q.tokens),
-        col!("is_floating_quote", |q: &rules::Quote| q.floating),
-        col!("quote_row_idx", |q: &rules::Quote| q.index),
+        col!("quote", |q: &Quote| q.quote.0.as_str()),
+        col!("quote_start_idx", |q: &Quote| q.quote.1),
+        col!("quote_end_idx", |q: &Quote| q.quote.2),
+        col!("verb", |q: &Quote| q.verb.as_ref().map(|s| s.0.as_str())),
+        col!("verb_start_idx", |q: &Quote| q.verb.as_ref().map(|s| s.1)),
+        col!("verb_end_idx", |q: &Quote| q.verb.as_ref().map(|s| s.2)),
+        col!("quote_type", |q: &Quote| q.kind.as_str()),
+        col!("quote_token_count", |q: &Quote| q.tokens),
+        col!("is_floating_quote", |q: &Quote| q.floating),
+        col!("quote_row_idx", |q: &Quote| q.index),
     ];
     let flat = StructChunked::from_series("".into(), quotes.len(), columns.iter())?.into_series();
     crate::list_output::list_from_spans(input.name().clone(), &flat, &spans)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bridge::ffi;
-
-    #[test]
-    fn corrupt_model_is_an_error() {
-        assert!(ffi::load_model(b"corrupt").is_err());
-    }
-
-    #[test]
-    #[ignore = "requires WORDFLOW_TEST_UDPIPE_MODEL; run in the provisioned model job"]
-    fn native_load_parse_drop_and_independent_threads() {
-        let path = std::env::var("WORDFLOW_TEST_UDPIPE_MODEL")
-            .expect("provision WORDFLOW_TEST_UDPIPE_MODEL before running model tests");
-        let bytes = std::fs::read(path).unwrap();
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                let bytes = &bytes;
-                scope.spawn(move || {
-                    for _ in 0..3 {
-                        let mut model = ffi::load_model(bytes).unwrap();
-                        let sentences = model
-                            .pin_mut()
-                            .parse(
-                                "Noise\0 Alice said, \"The project will finish tomorrow morning.\"",
-                            )
-                            .unwrap();
-                        assert!(sentences
-                            .iter()
-                            .flat_map(|s| &s.words)
-                            .any(|w| w.form == "morning"));
-                    }
-                });
-            }
-        });
-    }
 }

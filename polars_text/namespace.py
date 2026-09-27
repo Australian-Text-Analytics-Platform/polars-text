@@ -124,13 +124,9 @@ class TextNamespace:
         )
 
     def clean_text(self) -> pl.Expr:
-        return (
-            self._expr.cast(pl.String)
-            .fill_null("")
-            .str.to_lowercase()
-            .str.replace_all(r"[[:punct:]0-9]+", " ")
-            .str.replace_all(r"\s+", " ")
-            .str.strip_chars()
+        return register_plugin_function(
+            plugin_path=PLUGIN_PATH, function_name="clean_text",
+            args=self._expr.cast(pl.String), is_elementwise=True,
         )
 
     def word_count(self) -> pl.Expr:
@@ -142,8 +138,9 @@ class TextNamespace:
         )
 
     def char_count(self) -> pl.Expr:
-        return (
-            self._expr.cast(pl.String).str.len_chars().fill_null(0).cast(pl.Int64)
+        return register_plugin_function(
+            plugin_path=PLUGIN_PATH, function_name="char_count",
+            args=self._expr.cast(pl.String), is_elementwise=True,
         )
 
     def sentence_count(self) -> pl.Expr:

@@ -7,7 +7,7 @@ public expression or namespace contract.
 
 ## Boundaries
 
-- Rust expression plugins own vectorized computation; Python exposes typed
+- Rust expression plugins adapt `ldaca-rs` results to Series; Python exposes typed
   wrappers and the `Expr.text` namespace.
 - Keep the extension ABI and Python wrapper signatures synchronized.
 - Serialized Polars-plan source inspection and rewriting belongs exclusively in

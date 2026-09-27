@@ -276,10 +276,6 @@ def test_concordance_zero_width_matches_are_source_ordered() -> None:
     assert [(hit["start_idx"], hit["end_idx"]) for hit in hits] == [(0, 0)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Audit finding: native concordance returns the match as l1 at document start",
-)
 def test_concordance_document_start_has_no_left_neighbour():
     hit = _single_concordance("the quick brown", "the", left_tokens=2, right_tokens=2)
     assert hit["left_context"] == ""
