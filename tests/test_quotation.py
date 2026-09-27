@@ -65,7 +65,7 @@ def test_nonstring_and_empty_model_arguments_are_rejected():
 
 
 _CORPUS = json.loads(
-    (Path(__file__).parent / "fixtures/quotation_spacy_baseline.json").read_text()
+    (Path(__file__).parent / "fixtures/quotation_spacy_baseline.json").read_text(encoding="utf-8")
 )["cases"]
 # These are category/speaker expectations for the supported Rust behavior, not
 # exact spaCy output snapshots. Source spans are verified independently below.
