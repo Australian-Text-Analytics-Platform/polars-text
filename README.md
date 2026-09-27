@@ -3,6 +3,8 @@
 Polars 1.44.1 expression plugins for fast, practical text analysis. The
 `pl.col("text").text.*` namespace is the sole expression façade; whole-Series
 token-frequency and topic-projection utilities remain top-level functions.
+The native algorithms come from the locked `ldaca-rs` Git dependency in
+[Wordflow](https://github.com/Australian-Text-Analytics-Platform/ldaca-wordflow).
 
 ## Quick start
 
@@ -135,8 +137,11 @@ non-overlapping source span by its owned Unicode-character length.
 The token budget includes model-added special tokens. Oversized semantic units
 are split without overlap or discarded tail text.
 Corpora with too little density evidence return no Topics and a null projection
-context. Use `project_topics` and `project_topic_basis` with a non-null context
-for supported post-fit projections down to one Topic.
+context. Use `project_topics`, `project_topic_basis`, and
+`project_topic_segments` with a non-null context for supported post-fit
+projections down to one Topic. The segment projector returns Unicode-character
+source spans for per-topic extraction. The optional `max_topic_size` argument
+uses an adaptive cap by default, or accepts a fixed maximum in segments.
 
 ## Token frequencies and stats
 
@@ -190,9 +195,9 @@ platform.
 ## Development
 
 Build the extension locally with maturin and then import as `polars_text`.
-See the repository-level
-[development](../docs/runbooks/polars-text-development.md) and
-[release](../docs/runbooks/polars-text-release.md) runbooks for complete
+See Wordflow's
+[development](https://github.com/Australian-Text-Analytics-Platform/ldaca-wordflow/blob/main/docs/runbooks/polars-text-development.md) and
+[release](https://github.com/Australian-Text-Analytics-Platform/ldaca-wordflow/blob/main/docs/runbooks/polars-text-release.md) runbooks for complete
 procedures.
 
 ```bash
@@ -223,7 +228,6 @@ licensing. The default Wordflow model is CC BY-NC-SA 4.0, for non-commercial use
 
 ## Shared native implementation
 
-The native algorithms and data SDK live in the sibling `ldaca-rs/` crate. This
-package is a Polars/PyO3 adapter and local builds require `../ldaca-rs`. Its public
-Python interface, lazy expressions and schemas are unchanged. CI/publication
-setup for the shared dependency is deferred.
+The native algorithms and data SDK live in Wordflow's `ldaca-rs` crate. This
+package is a Polars/PyO3 adapter that pins the shared core in `Cargo.lock`, so
+standalone builds do not require a sibling checkout.
