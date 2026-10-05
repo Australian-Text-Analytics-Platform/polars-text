@@ -266,3 +266,24 @@ def test_concordance_zero_width_matches_are_source_ordered() -> None:
         .item()
     )
     assert [(hit["start_idx"], hit["end_idx"]) for hit in hits] == [(0, 0)]
+
+
+def test_concordance_match_at_text_start_has_no_l1() -> None:
+    """A match that starts the text has nothing before it: L1 is empty, as
+    R1 is for a match that ends the text (ldaca-wordflow issue 312)."""
+
+    hit = _single_concordance(
+        "No matter what", "no", left_tokens=3, right_tokens=3, case_sensitive=False
+    )
+    assert (hit["left_context"], hit["matched_text"], hit["l1"], hit["r1"]) == (
+        "",
+        "No",
+        "",
+        "matter",
+    )
+
+    end = _single_concordance(
+        "I have no", "no", left_tokens=3, right_tokens=3, case_sensitive=False
+    )
+    assert (end["l1"], end["r1"], end["right_context"]) == ("have", "", "")
+

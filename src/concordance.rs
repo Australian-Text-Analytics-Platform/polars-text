@@ -143,8 +143,11 @@ fn raw_context_window(request: ContextRequest<'_>) -> Result<ContextWindow> {
             .map(|token| token.text.clone())
             .unwrap_or_default()
     } else {
-        tokens
-            .get(left_complete_end.saturating_sub(1))
+        // No token before a match at the start of the text: `saturating_sub`
+        // stayed at 0 and returned the matched token itself as L1.
+        left_complete_end
+            .checked_sub(1)
+            .and_then(|index| tokens.get(index))
             .filter(|_| left_full_take > 0)
             .map(|token| token.text.clone())
             .unwrap_or_default()
