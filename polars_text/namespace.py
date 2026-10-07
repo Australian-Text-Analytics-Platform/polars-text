@@ -184,6 +184,13 @@ class TextNamespace:
         takes its nearest sampled segment's topic; ``clustered_segments`` in
         the output reports the sample size (null when all were clustered).
 
+        With ``max_topic_size=None`` (Auto), a topic that is the main topic of
+        more than half of the documents is split with a cap below its size
+        when the split keeps most of its segments in topics; the output's
+        ``auto_decision`` ("not_needed", "split" or "kept") and
+        ``auto_document_share`` (that topic's share of documents before Auto)
+        explain the outcome.
+
         Output contains separate document outcomes, complete topic metadata,
         segment counts, and an optional projection context.
         """

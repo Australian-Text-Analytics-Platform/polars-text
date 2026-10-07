@@ -105,6 +105,11 @@ pub struct TopicModelingResult {
     /// Segments that went through PaCMAP and HDBSCAN when a sample was
     /// clustered; `None` when every segment was clustered.
     pub clustered_segments: Option<usize>,
+    /// Auto's decision ("not_needed", "split" or "kept"); `None` with a fixed
+    /// Max topic size or when no topic was found.
+    pub auto_decision: Option<&'static str>,
+    /// Share of documents whose main topic was the largest topic before Auto.
+    pub auto_document_share: Option<f64>,
     #[serde(skip)]
     pub projection_context: Option<Vec<u8>>,
 }
@@ -231,16 +236,41 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                 .map(|&index| std::sync::Arc::clone(&embeddings[index]))
                 .collect::<Vec<_>>();
             let reduced = reduce::reduce(&sample_embeddings, reduce_dims, cfg.seed)?;
-            let on_sample = cluster::cluster(&reduced, cfg.min_cluster_size, cfg.max_cluster_size)?;
+            let sample_doc_indices = indices
+                .iter()
+                .map(|&index| segment_doc_indices[index])
+                .collect::<Vec<_>>();
+            let sample_weights = indices
+                .iter()
+                .map(|&index| segment_weights[index])
+                .collect::<Vec<_>>();
+            let on_sample = cluster::cluster(
+                &reduced,
+                cfg.min_cluster_size,
+                cfg.max_cluster_size,
+                Some(cluster::PointDocuments {
+                    doc_indices: &sample_doc_indices,
+                    weights: &sample_weights,
+                }),
+            )?;
             cluster::ClusterResult {
                 labels: sample::assign_to_nearest_sampled(&embeddings, indices, &on_sample.labels),
                 n_topics: on_sample.n_topics,
                 max_cluster_size: on_sample.max_cluster_size,
+                auto: on_sample.auto,
             }
         }
         None => {
             let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
-            cluster::cluster(&reduced, cfg.min_cluster_size, cfg.max_cluster_size)?
+            cluster::cluster(
+                &reduced,
+                cfg.min_cluster_size,
+                cfg.max_cluster_size,
+                Some(cluster::PointDocuments {
+                    doc_indices: &segment_doc_indices,
+                    weights: &segment_weights,
+                }),
+            )?
         }
     };
     if clustered.n_topics == 0 {
@@ -282,6 +312,8 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     let mut result = projection::project(&context, clustered.n_topics)?;
     result.max_topic_size = clustered.max_cluster_size;
     result.clustered_segments = sampled.as_ref().map(Vec::len);
+    result.auto_decision = clustered.auto.map(|auto| auto.decision.as_str());
+    result.auto_document_share = clustered.auto.map(|auto| auto.document_share);
     result.projection_context = Some(projection::serialize_context(&context)?);
     Ok(result)
 }
@@ -317,6 +349,8 @@ fn no_topic_result(
         n_segments: segment_doc_indices.len(),
         max_topic_size: None,
         clustered_segments: None,
+        auto_decision: None,
+        auto_document_share: None,
         projection_context: None,
     }
 }

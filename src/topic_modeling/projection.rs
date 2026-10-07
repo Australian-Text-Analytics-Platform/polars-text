@@ -549,6 +549,8 @@ pub fn project(
         // Set by `topic_modeling::run`, which knows the clustering cap.
         max_topic_size: None,
         clustered_segments: None,
+        auto_decision: None,
+        auto_document_share: None,
         projection_context: None,
     })
 }

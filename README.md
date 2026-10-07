@@ -152,6 +152,12 @@ sample of N segments (the `seed` argument picks it) and gives every other
 segment the topic of its nearest sampled segment by embedding cosine
 similarity. `clustered_segments` in the output reports N, or null when every
 segment was clustered.
+
+With `max_topic_size=None` (Auto), a topic that is the main topic of more than
+half of the documents (a document's main topic owns most of its characters) is
+split by re-clustering with a cap below its segment count, as long as most of
+its segments stay in topics. `auto_decision` (`not_needed`, `split`, `kept`)
+and `auto_document_share` report what happened.
 Corpora with too little density evidence return no Topics and a null projection
 context. Use `project_topics` and `project_topic_basis` with a non-null context
 for supported post-fit projections down to one Topic.
