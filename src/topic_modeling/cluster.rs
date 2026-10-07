@@ -169,6 +169,16 @@ pub fn cluster(
     Ok(best)
 }
 
+/// Segments in the largest topic of `labels` (outliers excluded), the number a
+/// fixed Max topic size is compared with.
+pub fn largest_topic_size(labels: &[i32]) -> Option<usize> {
+    let mut sizes = std::collections::HashMap::<i32, usize>::new();
+    for &label in labels.iter().filter(|&&label| label != OUTLIER_LABEL) {
+        *sizes.entry(label).or_default() += 1;
+    }
+    sizes.into_values().max()
+}
+
 /// The topic that is the main topic of the most documents, and the share of
 /// documents (with any segment) it is the main topic of. A document's main
 /// topic is the label owning most of its characters, as in the rollup; a
@@ -427,6 +437,12 @@ mod tests {
         let auto = by_documents.auto.unwrap();
         assert_ne!(auto.decision, AutoDecision::NotNeeded);
         assert!((auto.document_share - 10.0 / 12.0).abs() < 1e-9, "{auto:?}");
+    }
+
+    #[test]
+    fn largest_topic_size_ignores_outliers() {
+        assert_eq!(largest_topic_size(&[-1, -1, -1, 0, 1, 1]), Some(2));
+        assert_eq!(largest_topic_size(&[-1, -1]), None);
     }
 
     #[test]

@@ -110,6 +110,9 @@ pub struct TopicModelingResult {
     pub auto_decision: Option<&'static str>,
     /// Share of documents whose main topic was the largest topic before Auto.
     pub auto_document_share: Option<f64>,
+    /// Segments in the largest topic of the clustering (of the sample, with
+    /// topic sampling): the scale a fixed Max topic size works on.
+    pub largest_topic_size: Option<usize>,
     #[serde(skip)]
     pub projection_context: Option<Vec<u8>>,
 }
@@ -229,6 +232,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         .cluster_sample_size
         .filter(|&limit| limit >= minimum_evidence && segments.len() > limit)
         .map(|limit| sample::sample_indices(segments.len(), limit, cfg.seed));
+    let largest_clustered;
     let clustered = match &sampled {
         Some(indices) => {
             let sample_embeddings = indices
@@ -253,6 +257,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                     weights: &sample_weights,
                 }),
             )?;
+            largest_clustered = cluster::largest_topic_size(&on_sample.labels);
             cluster::ClusterResult {
                 labels: sample::assign_to_nearest_sampled(&embeddings, indices, &on_sample.labels),
                 n_topics: on_sample.n_topics,
@@ -262,7 +267,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         }
         None => {
             let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
-            cluster::cluster(
+            let full = cluster::cluster(
                 &reduced,
                 cfg.min_cluster_size,
                 cfg.max_cluster_size,
@@ -270,7 +275,9 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                     doc_indices: &segment_doc_indices,
                     weights: &segment_weights,
                 }),
-            )?
+            )?;
+            largest_clustered = cluster::largest_topic_size(&full.labels);
+            full
         }
     };
     if clustered.n_topics == 0 {
@@ -314,6 +321,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     result.clustered_segments = sampled.as_ref().map(Vec::len);
     result.auto_decision = clustered.auto.map(|auto| auto.decision.as_str());
     result.auto_document_share = clustered.auto.map(|auto| auto.document_share);
+    result.largest_topic_size = largest_clustered;
     result.projection_context = Some(projection::serialize_context(&context)?);
     Ok(result)
 }
@@ -351,6 +359,7 @@ fn no_topic_result(
         clustered_segments: None,
         auto_decision: None,
         auto_document_share: None,
+        largest_topic_size: None,
         projection_context: None,
     }
 }

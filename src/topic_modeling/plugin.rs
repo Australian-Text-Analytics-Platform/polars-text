@@ -82,6 +82,7 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
         Field::new("clustered_segments".into(), DataType::UInt32),
         Field::new("auto_decision".into(), DataType::String),
         Field::new("auto_document_share".into(), DataType::Float64),
+        Field::new("largest_topic_size".into(), DataType::UInt32),
         Field::new("projection_context".into(), DataType::Binary),
     ]);
     Ok(Field::new(input_fields[0].name().clone(), dtype))
@@ -250,6 +251,11 @@ fn topic_modeling_result_to_series(
         .map(u32::try_from)
         .transpose()
         .map_err(|_| PolarsError::ComputeError("Clustered segment count exceeds UInt32".into()))?;
+    let largest_topic_size = result
+        .largest_topic_size
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PolarsError::ComputeError("Largest topic size exceeds UInt32".into()))?;
     let fields = [
         document_list,
         topic_list,
@@ -258,6 +264,7 @@ fn topic_modeling_result_to_series(
         Series::new("clustered_segments".into(), [clustered_segments]),
         Series::new("auto_decision".into(), [result.auto_decision]),
         Series::new("auto_document_share".into(), [result.auto_document_share]),
+        Series::new("largest_topic_size".into(), [largest_topic_size]),
         Series::new(
             "projection_context".into(),
             [result.projection_context.as_deref()],
@@ -295,6 +302,7 @@ mod tests {
                 Field::new("clustered_segments".into(), DataType::UInt32),
                 Field::new("auto_decision".into(), DataType::String),
                 Field::new("auto_document_share".into(), DataType::Float64),
+                Field::new("largest_topic_size".into(), DataType::UInt32),
                 Field::new("projection_context".into(), DataType::Binary),
             ]
         );
@@ -331,6 +339,7 @@ mod tests {
             clustered_segments: None,
             auto_decision: None,
             auto_document_share: None,
+            largest_topic_size: None,
             projection_context: Some(vec![1, 2, 3]),
         };
 

@@ -189,7 +189,8 @@ class TextNamespace:
         when the split keeps most of its segments in topics; the output's
         ``auto_decision`` ("not_needed", "split" or "kept") and
         ``auto_document_share`` (that topic's share of documents before Auto)
-        explain the outcome.
+        explain the outcome; ``largest_topic_size`` is the segment count of
+        the largest topic, the scale a fixed ``max_topic_size`` works on.
 
         Output contains separate document outcomes, complete topic metadata,
         segment counts, and an optional projection context.

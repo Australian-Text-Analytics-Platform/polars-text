@@ -551,6 +551,7 @@ pub fn project(
         clustered_segments: None,
         auto_decision: None,
         auto_document_share: None,
+        largest_topic_size: None,
         projection_context: None,
     })
 }
