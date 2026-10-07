@@ -548,6 +548,7 @@ pub fn project(
         n_segments: context.n_segments,
         // Set by `topic_modeling::run`, which knows the clustering cap.
         max_topic_size: None,
+        clustered_segments: None,
         projection_context: None,
     })
 }

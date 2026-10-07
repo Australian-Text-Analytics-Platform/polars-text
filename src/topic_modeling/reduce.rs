@@ -9,7 +9,10 @@
 //!
 //! PaCMAP (JMLR 2021) is the selected Rust-native reducer, not an assumed UMAP
 //! equivalent. The repository's one-time quality audit compares this choice
-//! with UMAP and PCA. Output is seeded for reproducibility.
+//! with UMAP and PCA. Output is seeded, but PaCMAP's parallel neighbour search
+//! and float reductions are not bit-exact across runs, so repeated runs give
+//! very similar, not always identical, topics (measured 2026-10-07: also true
+//! of 0.6.2; sequential HDBSCAN did not change it; Wordflow issue 333).
 //!
 //! Called by: `topic_modeling::run` between embedding and clustering and by the
 //! projector for merged-Topic coordinates. Corpora below three points are

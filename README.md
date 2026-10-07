@@ -134,6 +134,24 @@ non-overlapping source span by its owned Unicode-character length.
 
 The token budget includes model-added special tokens. Oversized semantic units
 are split without overlap or discarded tail text.
+
+- `automatic` packs neighbouring paragraphs into one segment while together
+  they fit `max_tokens`; a paragraph is never split to make room, and one over
+  the budget on its own splits into sentences, packed the same way within that
+  paragraph. Paragraphs are blank-line blocks, or lines when a document has no
+  blank line.
+- `line` gives every non-empty line its own segment (at most one paragraph per
+  segment). A line over the budget is split at the sentence boundary nearest
+  its middle, repeatedly, so it becomes a few nearly equal pieces that end at
+  full stops.
+- `sentence` gives every Unicode sentence its own segment.
+
+HDBSCAN compares every pair of segments, so its time grows with the square of
+the segment count. On large corpora, `cluster_sample_size=N` clusters a seeded
+sample of N segments (the `seed` argument picks it) and gives every other
+segment the topic of its nearest sampled segment by embedding cosine
+similarity. `clustered_segments` in the output reports N, or null when every
+segment was clustered.
 Corpora with too little density evidence return no Topics and a null projection
 context. Use `project_topics` and `project_topic_basis` with a non-null context
 for supported post-fit projections down to one Topic.
@@ -183,9 +201,10 @@ The initial call may take longer while models download and cache.
 
 Embedding features download ONNX artifacts on first use. Some ONNX repositories
 store tensor data in sidecar files such as `onnx/model.onnx_data`; those files
-are fetched automatically when present. ONNX Runtime uses CoreML on macOS,
-DirectML on Windows, the CPU provider on Linux, and CPU fallback on every
-platform.
+are fetched automatically when present. Embeddings run on ONNX Runtime's CPU
+provider with every core on all platforms (Core ML was several times slower for
+the default sentence model). Set `POLARS_TEXT_EMBEDDING_THREADS` to cap the
+threads each embedding job uses, for example on a shared server.
 
 ## Development
 

@@ -1616,6 +1616,7 @@ checksum = "466aa8bfaa22c81efcf67c84e6ad046de13a05c6cc9d41a5094361bff464247a"
 dependencies = [
  "kdtree",
  "num-traits",
+ "rayon",
 ]
 
 [[package]]
@@ -3431,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "polars_text"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3447,6 +3448,7 @@ dependencies = [
  "polars-arrow",
  "pyo3",
  "pyo3-polars",
+ "rayon",
  "regex",
  "rmp-serde",
  "serde",

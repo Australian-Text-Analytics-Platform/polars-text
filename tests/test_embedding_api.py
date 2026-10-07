@@ -48,7 +48,7 @@ def test_namespace_signatures_match_the_public_contract() -> None:
         "max_tokens: 'int' = 256, seed: 'int' = 42, "
         "min_topic_size: 'int' = 10, max_topic_size: 'int | None' = None, "
         "tokenizer_model: 'str | None' = None, "
-        "lowercase: 'bool' = True) -> 'pl.Expr'"
+        "lowercase: 'bool' = True, cluster_sample_size: 'int | None' = None) -> 'pl.Expr'"
     )
 
 
@@ -113,6 +113,7 @@ def test_topic_modeling_registers_only_the_supported_fit_controls(
         "max_cluster_size": None,
         "vectorizer_model": None,
         "lowercase": True,
+        "cluster_sample_size": None,
     }
     with pytest.raises(ValueError, match="automatic.*line.*sentence"):
         cast(Any, pl.col("text")).text.topic_modeling(segmentation="paragraph")

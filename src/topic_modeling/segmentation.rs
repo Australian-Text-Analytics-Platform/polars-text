@@ -4,14 +4,24 @@
 //! modelling pipeline. Segmenting before embedding lets long documents
 //! contribute several points and ultimately multi-Topic Coverage.
 //!
-//! All three modes keep semantic units whole when they fit the token budget and
-//! never pack several units into one segment:
-//! - Automatic: paragraphs, then sentences within an oversized paragraph.
-//!   Paragraphs are blank-line blocks when the document has any blank line
-//!   (single newlines inside them are line wrapping); otherwise every non-empty
-//!   line is a paragraph.
-//! - Line: every non-empty line, then sentences within an oversized line.
-//! - Sentence: every Unicode UAX #29 sentence.
+//! All three modes keep semantic units whole when they fit the token budget:
+//! - Automatic: paragraphs, packed with their neighbours (Wordflow issue
+//!   331). Neighbouring paragraphs share one segment while together they fit
+//!   the budget, so a news article of many one-line paragraphs becomes a few
+//!   segments instead of dozens (about 5x fewer on a 26k-article news corpus
+//!   at 256 tokens).
+//!   A paragraph never splits to make room: one that does not fit starts the
+//!   next segment. One over the budget on its own is split into its
+//!   sentences, packed the same way within that paragraph (a whole article
+//!   stored as one paragraph gives a few full segments, not one per
+//!   sentence). Paragraphs are blank-line blocks when the document has any
+//!   blank line (single newlines inside them are line wrapping); otherwise
+//!   every non-empty line is a paragraph.
+//! - Line: every non-empty line, never packed, so at most one paragraph (line)
+//!   per segment. A line over the budget is split at the sentence boundary
+//!   nearest its middle, recursively, so a long paragraph becomes a few
+//!   nearly equal pieces that end at full stops, not one per sentence.
+//! - Sentence: every Unicode UAX #29 sentence. Never packs.
 //!
 //! A unit that is still over budget is split at the clause punctuation nearest
 //! its middle, recursively, so pieces stay nearly equal and end at natural
@@ -36,10 +46,13 @@ const MIN_FRAGMENT_TOKENS: usize = 4;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentationMethod {
-    /// Paragraphs first, then sentences, then punctuation-balanced pieces.
+    /// Neighbouring paragraphs packed up to the budget; an oversized paragraph
+    /// splits into its sentences, packed within it, then punctuation-balanced
+    /// pieces.
     #[default]
     Automatic,
-    /// Treat every non-empty newline-delimited line as one segment.
+    /// Treat every non-empty newline-delimited line as one segment; an
+    /// oversized line splits at the sentence boundary nearest its middle.
     Line,
     /// Treat every Unicode UAX #29 sentence as one segment.
     Sentence,
@@ -139,9 +152,7 @@ pub fn segment_documents(
         };
         match cfg.method {
             SegmentationMethod::Automatic => {
-                for (start, end) in paragraph_ranges(doc) {
-                    splitter.split_block(start, end, &mut segments)?;
-                }
+                splitter.pack_paragraphs(&paragraph_ranges(doc), &mut segments)?;
             }
             SegmentationMethod::Line => {
                 for (start, end) in line_ranges(doc) {
@@ -199,7 +210,94 @@ fn token_spans(text: &str, tokenizer: &Tokenizer) -> Result<(Vec<TokenSpan>, usi
 }
 
 impl DocumentSplitter<'_> {
-    /// Emits a paragraph or line whole when it fits, otherwise its sentences.
+    /// Automatic mode: packs neighbouring paragraphs into one segment while the
+    /// span from the first to the last still fits the budget. A paragraph over
+    /// the budget on its own closes the open group, and its sentences are packed
+    /// the same way within it, so a whole article stored as one paragraph gives
+    /// a few full segments rather than one per sentence. Units with no letters
+    /// or digits never open or close a group, so a "* * *" divider only travels
+    /// inside one.
+    fn pack_paragraphs(
+        &self,
+        paragraphs: &[(usize, usize)],
+        segments: &mut Vec<TopicSegment>,
+    ) -> Result<()> {
+        let mut open: Option<(usize, usize)> = None;
+        for &(start, end) in paragraphs {
+            let Some((start, end)) = self.content_range(start, end)? else {
+                continue;
+            };
+            if self.fits(start, end) {
+                self.pack_into(&mut open, start, end, segments)?;
+                continue;
+            }
+            self.close_group(&mut open, segments)?;
+            let paragraph = &self.doc[start..end];
+            let mut sentences: Option<(usize, usize)> = None;
+            for (relative_start, sentence) in paragraph.split_sentence_bound_indices() {
+                let sentence_start = start + relative_start;
+                let Some((sentence_start, sentence_end)) =
+                    self.content_range(sentence_start, sentence_start + sentence.len())?
+                else {
+                    continue;
+                };
+                if self.fits(sentence_start, sentence_end) {
+                    self.pack_into(&mut sentences, sentence_start, sentence_end, segments)?;
+                } else {
+                    self.close_group(&mut sentences, segments)?;
+                    self.split_unit(sentence_start, sentence_end, segments)?;
+                }
+            }
+            self.close_group(&mut sentences, segments)?;
+        }
+        self.close_group(&mut open, segments)
+    }
+
+    /// The trimmed range, or `None` when it is blank or has no letters or digits.
+    fn content_range(&self, start: usize, end: usize) -> Result<Option<(usize, usize)>> {
+        Ok(trimmed_range(self.doc, start, end)?
+            .filter(|&(start, end)| self.doc[start..end].chars().any(char::is_alphanumeric)))
+    }
+
+    fn fits(&self, start: usize, end: usize) -> bool {
+        tokens_in_range(self.tokens, start, end).len() <= self.max_tokens
+    }
+
+    /// Extends the open group with a fitting unit while the whole span still
+    /// fits; otherwise emits the group and opens a new one with the unit.
+    fn pack_into(
+        &self,
+        open: &mut Option<(usize, usize)>,
+        start: usize,
+        end: usize,
+        segments: &mut Vec<TopicSegment>,
+    ) -> Result<()> {
+        *open = match *open {
+            Some((group_start, _)) if self.fits(group_start, end) => Some((group_start, end)),
+            Some((group_start, group_end)) => {
+                self.push(group_start, group_end, segments)?;
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+        Ok(())
+    }
+
+    fn close_group(
+        &self,
+        open: &mut Option<(usize, usize)>,
+        segments: &mut Vec<TopicSegment>,
+    ) -> Result<()> {
+        match open.take() {
+            Some((start, end)) => self.push(start, end, segments),
+            None => Ok(()),
+        }
+    }
+
+    /// Line mode: emits a line whole when it fits; otherwise splits it at the
+    /// sentence boundary nearest its middle, recursively, so the pieces stay
+    /// nearly equal, each under the budget, and end at full stops. A line with
+    /// no usable sentence boundary goes to `split_unit`.
     fn split_block(
         &self,
         start: usize,
@@ -209,18 +307,47 @@ impl DocumentSplitter<'_> {
         let Some((start, end)) = trimmed_range(self.doc, start, end)? else {
             return Ok(());
         };
-        if tokens_in_range(self.tokens, start, end).len() <= self.max_tokens {
+        let block_tokens = tokens_in_range(self.tokens, start, end);
+        if block_tokens.len() <= self.max_tokens {
             return self.push(start, end, segments);
         }
+        match self.middle_sentence_split(start, end, block_tokens)? {
+            Some(split) => {
+                self.split_block(start, split, segments)?;
+                self.split_block(split, end, segments)
+            }
+            None => self.split_unit(start, end, segments),
+        }
+    }
+
+    /// Byte offset of the sentence start whose left side holds the token count
+    /// closest to half the block. Both sides keep at least the tiny-fragment
+    /// minimum, so an abbreviation such as "Mr." is never split off alone.
+    fn middle_sentence_split(
+        &self,
+        start: usize,
+        end: usize,
+        block_tokens: &[TokenSpan],
+    ) -> Result<Option<usize>> {
         let block = self
             .doc
             .get(start..end)
             .context("segmentation received an invalid source range")?;
-        for (relative_start, sentence) in block.split_sentence_bound_indices() {
-            let sentence_start = start + relative_start;
-            self.split_unit(sentence_start, sentence_start + sentence.len(), segments)?;
+        let half = block_tokens.len() as f64 / 2.0;
+        let min_side = self.min_fragment_tokens();
+        let mut best: Option<(f64, usize)> = None;
+        for (relative_start, _) in block.split_sentence_bound_indices().skip(1) {
+            let split = start + relative_start;
+            let left = block_tokens.partition_point(|token| token.end <= split);
+            if left < min_side || block_tokens.len() - left < min_side {
+                continue;
+            }
+            let distance = (left as f64 - half).abs();
+            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                best = Some((distance, split));
+            }
         }
-        Ok(())
+        Ok(best.map(|(_, split)| split))
     }
 
     /// Emits a sentence-level unit whole when it fits; otherwise splits it at
@@ -482,6 +609,13 @@ mod tests {
         tokenizer
     }
 
+    fn cfg_with(max_tokens: usize) -> SegmentationConfig {
+        SegmentationConfig {
+            method: SegmentationMethod::Automatic,
+            max_tokens,
+        }
+    }
+
     fn word_segments(doc: &str, cfg: SegmentationConfig) -> Vec<String> {
         let words = doc.split_whitespace().collect::<Vec<_>>();
         let tokenizer = whitespace_tokenizer(&words);
@@ -605,9 +739,15 @@ mod tests {
     }
 
     #[test]
-    fn automatic_keeps_sentences_separate_instead_of_packing() {
+    fn automatic_packs_the_sentences_of_an_oversized_paragraph() {
+        let segments = word_segments("a b. C d. E f.", cfg_with(4));
+        assert_eq!(segments, vec!["a b. C d.", "E f."]);
+    }
+
+    #[test]
+    fn sentence_mode_keeps_sentences_separate() {
         let cfg = SegmentationConfig {
-            method: SegmentationMethod::Automatic,
+            method: SegmentationMethod::Sentence,
             max_tokens: 4,
         };
         let segments = word_segments("a b. C d. E f.", cfg);
@@ -618,7 +758,7 @@ mod tests {
     fn automatic_uses_single_newlines_as_paragraphs_without_blank_lines() {
         let cfg = SegmentationConfig {
             method: SegmentationMethod::Automatic,
-            max_tokens: 64,
+            max_tokens: 3,
         };
         let segments = word_segments("alpha beta.\ngamma delta.", cfg);
         assert_eq!(segments, vec!["alpha beta.", "gamma delta."]);
@@ -628,10 +768,134 @@ mod tests {
     fn automatic_treats_single_newlines_as_wrapping_when_blank_lines_exist() {
         let cfg = SegmentationConfig {
             method: SegmentationMethod::Automatic,
-            max_tokens: 64,
+            max_tokens: 3,
         };
         let segments = word_segments("alpha\nbeta.\n\ngamma delta.", cfg);
         assert_eq!(segments, vec!["alpha\nbeta.", "gamma delta."]);
+    }
+
+    #[test]
+    fn automatic_packs_neighbouring_paragraphs_up_to_the_budget() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Automatic,
+            max_tokens: 4,
+        };
+        let segments = word_segments("a b.\n\nc d.\n\ne f.", cfg);
+        assert_eq!(segments, vec!["a b.\n\nc d.", "e f."]);
+
+        let segments = word_segments("a b.\nc d.\ne f.", cfg_with(4));
+        assert_eq!(segments, vec!["a b.\nc d.", "e f."]);
+    }
+
+    #[test]
+    fn automatic_never_splits_a_fitting_paragraph_to_fill_a_segment() {
+        let segments = word_segments("a b c.\n\nd e f.\n\ng.", cfg_with(4));
+        assert_eq!(segments, vec!["a b c.", "d e f.\n\ng."]);
+    }
+
+    #[test]
+    fn an_oversized_paragraph_closes_the_group_and_packs_its_own_sentences() {
+        let segments = word_segments("a b.\n\nC d. E f. G h.\n\ni j.\n\nk l.", cfg_with(4));
+        assert_eq!(segments, vec!["a b.", "C d. E f.", "G h.", "i j.\n\nk l."]);
+    }
+
+    #[test]
+    fn content_free_paragraphs_do_not_open_or_close_a_group() {
+        let segments = word_segments("* * *\n\na b.\n\n* * *", cfg_with(64));
+        assert_eq!(segments, vec!["a b."]);
+    }
+
+    #[test]
+    fn line_mode_splits_a_long_line_at_the_middle_sentence_boundary() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Line,
+            max_tokens: 4,
+        };
+        let segments = word_segments("A b. C d. E f. G h.", cfg);
+        assert_eq!(segments, vec!["A b. C d.", "E f. G h."]);
+
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Line,
+            max_tokens: 3,
+        };
+        let segments = word_segments("A b. C d. E f. G h.", cfg);
+        assert_eq!(segments, vec!["A b.", "C d.", "E f.", "G h."]);
+    }
+
+    #[test]
+    fn line_mode_does_not_split_off_a_tiny_first_sentence() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Line,
+            max_tokens: 8,
+        };
+        let segments = word_segments("Mr. Fox w2 w3, w4 w5 w6 w7 w8 w9 w10.", cfg);
+        assert!(
+            segments.iter().all(|segment| segment != "Mr."),
+            "{segments:?}"
+        );
+    }
+
+    /// Every mode keeps the spans that rollup, projection and per-topic detach
+    /// rely on: in source order, non-overlapping, inside the document, within
+    /// the budget, and together covering every word, packed or not.
+    /// (No comma-free run here is longer than a budget, so the documented
+    /// tiny-leftover drop never applies.)
+    #[test]
+    fn segment_spans_stay_ordered_disjoint_in_budget_and_complete() {
+        let doc = "Title line\n\nShort one. Short two.\n\nA long paragraph begins here, \
+            and it goes on. It has a second sentence, with more words. \
+            A third one follows, then a fourth, longer still, with clauses, \
+            commas, and pauses. The fifth closes it.\n\n* * *\n\nTail paragraph \
+            here.\nWrapped line inside it.\n\nLast.";
+        let words = doc.split_whitespace().collect::<Vec<_>>();
+        let tokenizer = whitespace_tokenizer(&words);
+        for method in [
+            SegmentationMethod::Automatic,
+            SegmentationMethod::Line,
+            SegmentationMethod::Sentence,
+        ] {
+            for max_tokens in [6, 9, 16, 64] {
+                let cfg = SegmentationConfig { method, max_tokens };
+                let segments = segment_documents(&[doc], &tokenizer, &cfg).unwrap();
+                let context = format!("{method:?} at {max_tokens}");
+                let mut previous_end = 0;
+                for segment in &segments {
+                    assert!(segment.start_byte < segment.end_byte, "{context}");
+                    assert!(segment.start_byte >= previous_end, "{context}: overlap");
+                    let text = segment.text(doc).unwrap();
+                    assert!(
+                        text.split_whitespace().count() <= max_tokens,
+                        "{context}: {text:?}"
+                    );
+                    assert_eq!(segment.owned_character_count, text.chars().count());
+                    previous_end = segment.end_byte;
+                }
+                let mut offset = 0;
+                for word in doc.split_whitespace() {
+                    let start = offset + doc[offset..].find(word).unwrap();
+                    offset = start + word.len();
+                    if !word.chars().any(char::is_alphanumeric) {
+                        continue;
+                    }
+                    assert!(
+                        segments.iter().any(
+                            |segment| segment.start_byte <= start && offset <= segment.end_byte
+                        ),
+                        "{context}: {word:?} is in no segment"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_mode_never_packs_lines() {
+        let cfg = SegmentationConfig {
+            method: SegmentationMethod::Line,
+            max_tokens: 64,
+        };
+        let segments = word_segments("a b.\nc d.", cfg);
+        assert_eq!(segments, vec!["a b.", "c d."]);
     }
 
     #[test]

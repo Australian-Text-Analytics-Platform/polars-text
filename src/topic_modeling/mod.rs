@@ -28,6 +28,8 @@ pub mod reduce;
 #[cfg(feature = "topic-modeling")]
 pub mod rollup;
 #[cfg(feature = "topic-modeling")]
+pub mod sample;
+#[cfg(feature = "topic-modeling")]
 pub mod segmentation;
 
 #[cfg(feature = "topic-modeling")]
@@ -64,6 +66,9 @@ pub struct RunConfig {
     pub max_cluster_size: Option<usize>,
     pub vectorizer_model_id: Option<String>,
     pub lowercase: bool,
+    /// Cluster at most this many segments (a seeded sample); every other
+    /// segment takes its nearest sampled segment's topic. `None` clusters all.
+    pub cluster_sample_size: Option<usize>,
 }
 
 /// One Topic for the bubble chart and Topic table.
@@ -97,6 +102,9 @@ pub struct TopicModelingResult {
     /// Max topic size (in segments) that produced the topics: the user's fixed
     /// value, or the cap Auto applied. `None` when no cap was needed.
     pub max_topic_size: Option<usize>,
+    /// Segments that went through PaCMAP and HDBSCAN when a sample was
+    /// clustered; `None` when every segment was clustered.
+    pub clustered_segments: Option<usize>,
     #[serde(skip)]
     pub projection_context: Option<Vec<u8>>,
 }
@@ -210,8 +218,31 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     if reduce_dims < 2 {
         anyhow::bail!("topic embeddings do not have enough usable dimensions");
     }
-    let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
-    let clustered = cluster::cluster(&reduced, cfg.min_cluster_size, cfg.max_cluster_size)?;
+    // Large corpora cluster a seeded sample, then every other segment takes
+    // its nearest sampled segment's topic (issue 330).
+    let sampled = cfg
+        .cluster_sample_size
+        .filter(|&limit| limit >= minimum_evidence && segments.len() > limit)
+        .map(|limit| sample::sample_indices(segments.len(), limit, cfg.seed));
+    let clustered = match &sampled {
+        Some(indices) => {
+            let sample_embeddings = indices
+                .iter()
+                .map(|&index| std::sync::Arc::clone(&embeddings[index]))
+                .collect::<Vec<_>>();
+            let reduced = reduce::reduce(&sample_embeddings, reduce_dims, cfg.seed)?;
+            let on_sample = cluster::cluster(&reduced, cfg.min_cluster_size, cfg.max_cluster_size)?;
+            cluster::ClusterResult {
+                labels: sample::assign_to_nearest_sampled(&embeddings, indices, &on_sample.labels),
+                n_topics: on_sample.n_topics,
+                max_cluster_size: on_sample.max_cluster_size,
+            }
+        }
+        None => {
+            let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
+            cluster::cluster(&reduced, cfg.min_cluster_size, cfg.max_cluster_size)?
+        }
+    };
     if clustered.n_topics == 0 {
         return Ok(no_topic_result(
             documents.len(),
@@ -250,6 +281,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     })?;
     let mut result = projection::project(&context, clustered.n_topics)?;
     result.max_topic_size = clustered.max_cluster_size;
+    result.clustered_segments = sampled.as_ref().map(Vec::len);
     result.projection_context = Some(projection::serialize_context(&context)?);
     Ok(result)
 }
@@ -284,6 +316,7 @@ fn no_topic_result(
         documents,
         n_segments: segment_doc_indices.len(),
         max_topic_size: None,
+        clustered_segments: None,
         projection_context: None,
     }
 }

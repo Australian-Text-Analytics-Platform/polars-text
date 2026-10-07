@@ -22,8 +22,6 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use anyhow::{Context, Result};
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use hf_hub::{Repo, RepoType};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use ort::ep;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionInputValue};
 use ort::value::{Tensor, ValueType};
@@ -798,19 +796,15 @@ fn build_session(onnx_path: &Path) -> Result<(Session, String)> {
         .with_memory_pattern(false)
         .map_err(|err| anyhow::anyhow!("configure ONNX memory pattern: {err:?}"))?;
 
-    if embedding_threads().is_some() {
+    // Without the variable ONNX Runtime uses every physical core. A server can
+    // cap each embedding job (for example 8 of 32 cores) by setting it; the
+    // number given is used, not always 1.
+    if let Some(threads) = embedding_threads() {
         builder = builder
-            .with_intra_threads(1)
+            .with_intra_threads(threads)
             .map_err(|err| anyhow::anyhow!("configure ONNX intra-op threads: {err:?}"))?
             .with_inter_threads(1)
             .map_err(|err| anyhow::anyhow!("configure ONNX inter-op threads: {err:?}"))?;
-    }
-
-    let providers = execution_providers();
-    if !providers.is_empty() {
-        builder = builder
-            .with_execution_providers(providers)
-            .map_err(|err| anyhow::anyhow!("configure ONNX execution providers: {err:?}"))?;
     }
 
     let session = builder
@@ -819,28 +813,14 @@ fn build_session(onnx_path: &Path) -> Result<(Session, String)> {
     Ok((session, provider_id))
 }
 
-fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
-    #[cfg(target_os = "windows")]
-    let providers = vec![ep::DirectML::default().build()];
-    #[cfg(target_os = "macos")]
-    let providers = vec![ep::CoreML::default().build()];
-    #[cfg(target_os = "linux")]
-    let providers = Vec::new();
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let providers = Vec::new();
-    providers
-}
-
+/// Every platform embeds on the CPU with all cores (ONNX Runtime's CPU
+/// provider). Core ML on macOS ran only 294 of the model's 418 nodes, in 50
+/// partitions, and re-planned for every batch shape: about 73 segments/s
+/// against 364 on the CPU on an M5 Pro (2026-10-07; the same finding as the
+/// May 2026 tm-optimisation log, 21 min against 3.3 min for 26k documents).
+/// DirectML on Windows is dropped with it until it is measured.
 fn planned_provider_id() -> String {
-    #[cfg(target_os = "windows")]
-    let providers = ["DmlExecutionProvider", "CPUExecutionProvider"];
-    #[cfg(target_os = "macos")]
-    let providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"];
-    #[cfg(target_os = "linux")]
-    let providers = ["CPUExecutionProvider"];
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let providers = ["CPUExecutionProvider"];
-    providers.join("+")
+    "CPUExecutionProvider".to_owned()
 }
 
 fn embedding_threads() -> Option<usize> {

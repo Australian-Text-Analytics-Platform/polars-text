@@ -171,8 +171,18 @@ class TextNamespace:
         max_topic_size: int | None = None,
         tokenizer_model: str | None = None,
         lowercase: bool = True,
+        cluster_sample_size: int | None = None,
     ) -> pl.Expr:
         """Cluster a document column and emit one run-level topic struct.
+
+        ``segmentation="automatic"`` packs neighbouring paragraphs into one
+        segment while they fit ``max_tokens``; ``"line"`` keeps one line per
+        segment and ``"sentence"`` one sentence per segment.
+
+        With ``cluster_sample_size`` and more segments than that, a seeded
+        sample of that many segments is clustered and every other segment
+        takes its nearest sampled segment's topic; ``clustered_segments`` in
+        the output reports the sample size (null when all were clustered).
 
         Output contains separate document outcomes, complete topic metadata,
         segment counts, and an optional projection context.
@@ -185,6 +195,8 @@ class TextNamespace:
         if max_topic_size is not None:
             # None means Auto: the native pipeline caps topics at a share of all segments.
             _positive(max_topic_size, "max_topic_size", minimum=min_topic_size + 1)
+        if cluster_sample_size is not None:
+            _positive(cluster_sample_size, "cluster_sample_size", minimum=min_topic_size)
 
         return register_plugin_function(
             plugin_path=PLUGIN_PATH,
@@ -200,6 +212,7 @@ class TextNamespace:
                 "max_cluster_size": max_topic_size,
                 "vectorizer_model": _model_id(tokenizer_model),
                 "lowercase": lowercase,
+                "cluster_sample_size": cluster_sample_size,
             },
             is_elementwise=False,
             returns_scalar=True,

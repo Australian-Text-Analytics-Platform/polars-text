@@ -112,7 +112,7 @@ fn run_hdbscan(
     }
     let clusterer = Hdbscan::new(points, builder.build());
     let labels = clusterer
-        .cluster()
+        .cluster_par()
         .map_err(|e| anyhow::anyhow!("HDBSCAN clustering failed: {e}"))?;
     let n_topics = labels
         .iter()
