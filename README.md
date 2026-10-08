@@ -163,6 +163,18 @@ Corpora with too little density evidence return no Topics and a null projection
 context. Use `project_topics` and `project_topic_basis` with a non-null context
 for supported post-fit projections down to one Topic.
 
+### Typical segments of a Topic
+
+From version 0.6.6 a run's projection context also keeps a compact code of
+every segment's embedding (its 64 leading principal components, one signed
+byte each plus a scale; about 68 bytes per segment).
+`polars_text.topic_projection.topic_segment_similarities(context, topic_count,
+topic_id)` returns every segment of one (possibly merged) Topic as
+`(segment_index, document_index, start_char, end_char, similarity)`, where the
+similarity is the cosine to the Topic's centre (the mean of its segments). It
+ranks how typical a segment is within one Topic; it is not a probability and
+is not comparable across Topics or runs. Older contexts return `None`.
+
 ### Progress
 
 `tokenize` and `topic_modeling` take an optional `progress_path`. During the

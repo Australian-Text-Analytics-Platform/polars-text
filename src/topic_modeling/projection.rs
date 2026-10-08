@@ -3,7 +3,9 @@
 //! HDBSCAN's natural Topics are retained as the maximum-resolution leaves.
 //! A deterministic cosine average-linkage tree records how those leaves merge.
 //! Cuts aggregate sufficient statistics, so Result queries never need source
-//! text, segment embeddings, or HDBSCAN.
+//! text, full segment embeddings, or HDBSCAN. Version 4 also keeps a compact
+//! 64-dimension code of every segment's embedding, so a Topic's segments can
+//! be ranked by how typical they are of it (Wordflow issue 353).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
@@ -18,9 +20,62 @@ use super::rollup;
 use super::{DocumentResult, TopicInfo, TopicModelingResult};
 
 /// Version 3 adds each segment's character span, used by per-topic detach.
+/// Version 4 adds compact segment embeddings, used to rank a Topic's segments.
 /// Version 2 contexts (no spans) are still read for every other projection.
-const CONTEXT_VERSION: u8 = 3;
+const CONTEXT_VERSION: u8 = 4;
 const MIN_READABLE_CONTEXT_VERSION: u8 = 2;
+/// Dimensions kept of each segment embedding: its leading principal
+/// components, enough to rank similarity to a Topic's centre.
+const COMPACT_DIMENSIONS: usize = 64;
+/// Segments used to estimate the principal components.
+const COMPACT_SAMPLE_SIZE: usize = 20_000;
+/// Orthogonal-iteration rounds for the leading principal subspace.
+const COMPACT_ITERATIONS: usize = 40;
+
+/// Every segment's embedding as its centred leading principal components,
+/// each segment scaled to signed bytes: `component = code * scale / 127`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactEmbeddings {
+    dimensions: usize,
+    scales: Vec<f32>,
+    /// `dimensions` two's-complement codes per segment, row-major.
+    #[serde(with = "byte_field")]
+    codes: Vec<u8>,
+}
+
+/// Stores a byte vector as one MessagePack binary value, not an array.
+mod byte_field {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("bytes")
+            }
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(value.to_vec())
+            }
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(value)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Leaf {
@@ -64,6 +119,9 @@ pub struct TopicProjectionContext {
     segments: Vec<SegmentFact>,
     n_segments: usize,
     seed: u64,
+    /// Absent before version 4.
+    #[serde(default)]
+    segment_embeddings: Option<CompactEmbeddings>,
 }
 
 pub struct ProjectionInput<'a> {
@@ -219,6 +277,7 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
         )
         .collect();
     let merges = build_average_linkage_tree(&leaves)?;
+    let segment_embeddings = Some(compact_embeddings(embedding_points, seed)?);
 
     Ok(TopicProjectionContext {
         version: CONTEXT_VERSION,
@@ -230,6 +289,154 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
         segments,
         n_segments: segment_count,
         seed,
+        segment_embeddings,
+    })
+}
+
+/// SplitMix64, the same seeded generator as `sample::sample_indices`.
+fn split_mix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Orthonormalizes the columns of a `rows x columns` row-major matrix in place
+/// (modified Gram-Schmidt); a column that collapses is left at zero.
+fn orthonormalize_columns(matrix: &mut [f64], rows: usize, columns: usize) {
+    for column in 0..columns {
+        for previous in 0..column {
+            let dot: f64 = (0..rows)
+                .map(|row| matrix[row * columns + column] * matrix[row * columns + previous])
+                .sum();
+            for row in 0..rows {
+                matrix[row * columns + column] -= dot * matrix[row * columns + previous];
+            }
+        }
+        let norm = (0..rows)
+            .map(|row| matrix[row * columns + column].powi(2))
+            .sum::<f64>()
+            .sqrt();
+        for row in 0..rows {
+            matrix[row * columns + column] = if norm > 1e-12 {
+                matrix[row * columns + column] / norm
+            } else {
+                0.0
+            };
+        }
+    }
+}
+
+/// Codes every segment embedding as its centred leading principal components
+/// (issue 353). Components come from a seeded sample of segments, so the same
+/// run gives the same codes.
+fn compact_embeddings(points: &[&[f32]], seed: u64) -> Result<CompactEmbeddings> {
+    use rayon::prelude::*;
+
+    let width = points.first().map_or(0, |point| point.len());
+    if width == 0 {
+        bail!("Topic projection embeddings are empty");
+    }
+    let dimensions = COMPACT_DIMENSIONS.min(width);
+    let sample = super::sample::sample_indices(points.len(), COMPACT_SAMPLE_SIZE, seed);
+    let mut mean = vec![0.0f64; width];
+    for point in points {
+        for (total, &value) in mean.iter_mut().zip(point.iter()) {
+            *total += f64::from(value);
+        }
+    }
+    for total in &mut mean {
+        *total /= points.len() as f64;
+    }
+    // Covariance of the sample, row-major width x width.
+    let covariance = sample
+        .par_iter()
+        .fold(
+            || vec![0.0f64; width * width],
+            |mut sum, &index| {
+                let centred: Vec<f64> = points[index]
+                    .iter()
+                    .zip(&mean)
+                    .map(|(&value, &centre)| f64::from(value) - centre)
+                    .collect();
+                for row in 0..width {
+                    let left = centred[row];
+                    for column in 0..width {
+                        sum[row * width + column] += left * centred[column];
+                    }
+                }
+                sum
+            },
+        )
+        .reduce(
+            || vec![0.0f64; width * width],
+            |mut left, right| {
+                for (total, value) in left.iter_mut().zip(right) {
+                    *total += value;
+                }
+                left
+            },
+        );
+    // Leading principal subspace by orthogonal iteration from a seeded start.
+    let mut state = seed ^ 0x5EED_C0DE;
+    let mut basis: Vec<f64> = (0..width * dimensions)
+        .map(|_| (split_mix(&mut state) as f64 / u64::MAX as f64) * 2.0 - 1.0)
+        .collect();
+    orthonormalize_columns(&mut basis, width, dimensions);
+    for _ in 0..COMPACT_ITERATIONS {
+        let mut next = vec![0.0f64; width * dimensions];
+        for row in 0..width {
+            for inner in 0..width {
+                let weight = covariance[row * width + inner];
+                if weight == 0.0 {
+                    continue;
+                }
+                for column in 0..dimensions {
+                    next[row * dimensions + column] += weight * basis[inner * dimensions + column];
+                }
+            }
+        }
+        orthonormalize_columns(&mut next, width, dimensions);
+        basis = next;
+    }
+    let encoded: Vec<(f32, Vec<u8>)> = points
+        .par_iter()
+        .map(|point| {
+            let mut components = vec![0.0f64; dimensions];
+            for (row, (&value, &centre)) in point.iter().zip(&mean).enumerate() {
+                let centred = f64::from(value) - centre;
+                for (column, component) in components.iter_mut().enumerate() {
+                    *component += centred * basis[row * dimensions + column];
+                }
+            }
+            let scale = components
+                .iter()
+                .fold(0.0f64, |largest, value| largest.max(value.abs()));
+            let codes = components
+                .iter()
+                .map(|&value| {
+                    let code = if scale > 0.0 {
+                        (value / scale * 127.0).round()
+                    } else {
+                        0.0
+                    };
+                    (code as i8) as u8
+                })
+                .collect();
+            (scale as f32, codes)
+        })
+        .collect();
+    let mut scales = Vec::with_capacity(points.len());
+    let mut codes = Vec::with_capacity(points.len() * dimensions);
+    for (scale, segment_codes) in encoded {
+        scales.push(scale);
+        codes.extend(segment_codes);
+    }
+    Ok(CompactEmbeddings {
+        dimensions,
+        scales,
+        codes,
     })
 }
 
@@ -577,6 +784,15 @@ fn validate_context(context: &TopicProjectionContext) -> Result<()> {
     for leaf in &context.leaves {
         validate_nonzero_vector(&leaf.embedding_sum, "stored leaf embedding")?;
     }
+    if let Some(embeddings) = &context.segment_embeddings {
+        if embeddings.scales.len() != context.segments.len()
+            || embeddings.codes.len() != context.segments.len() * embeddings.dimensions
+        {
+            bail!("Topic projection segment embeddings do not match its segments");
+        }
+    } else if context.version >= 4 {
+        bail!("Topic projection context version 4 has no segment embeddings");
+    }
     Ok(())
 }
 
@@ -637,6 +853,85 @@ pub fn project_serialized_context_segments(
     topic_count: usize,
 ) -> Result<Vec<SegmentTopicAssignment>> {
     project_segments(&deserialize_context(bytes)?, topic_count)
+}
+
+/// One segment of a Topic with its similarity to the Topic's centre:
+/// `[segment_index, document_index, start_char, end_char, similarity]`;
+/// the similarity is null for contexts before version 4.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TopicSegmentSimilarity(pub usize, pub usize, pub usize, pub usize, pub Option<f32>);
+
+/// Every segment of `topic_id` at `topic_count`, with its cosine similarity
+/// to the Topic's centre (the mean of its segments' compact embeddings), so
+/// examples can be ranked by how typical they are (Wordflow issue 353).
+/// Segments come in segment order.
+pub fn topic_segment_similarities(
+    context: &TopicProjectionContext,
+    topic_count: usize,
+    topic_id: i32,
+) -> Result<Vec<TopicSegmentSimilarity>> {
+    if topic_id < 0 {
+        bail!("Topic examples need a real Topic, not No topic");
+    }
+    let assignments = project_segments(context, topic_count)?;
+    let members: Vec<usize> = assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, assignment)| assignment.3 == topic_id)
+        .map(|(index, _)| index)
+        .collect();
+    let similarities: Vec<Option<f32>> = match &context.segment_embeddings {
+        None => vec![None; members.len()],
+        Some(embeddings) => {
+            let dimensions = embeddings.dimensions;
+            let decode = |index: usize| -> Vec<f64> {
+                let scale = f64::from(embeddings.scales[index]);
+                embeddings.codes[index * dimensions..(index + 1) * dimensions]
+                    .iter()
+                    .map(|&code| f64::from(code as i8) * scale / 127.0)
+                    .collect()
+            };
+            let vectors: Vec<Vec<f64>> = members.iter().map(|&index| decode(index)).collect();
+            let mut centre = vec![0.0f64; dimensions];
+            for vector in &vectors {
+                for (total, value) in centre.iter_mut().zip(vector) {
+                    *total += value;
+                }
+            }
+            let centre_norm = centre.iter().map(|value| value * value).sum::<f64>().sqrt();
+            vectors
+                .iter()
+                .map(|vector| {
+                    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+                    if norm == 0.0 || centre_norm == 0.0 {
+                        return Some(0.0);
+                    }
+                    let dot: f64 = vector
+                        .iter()
+                        .zip(&centre)
+                        .map(|(left, right)| left * right)
+                        .sum();
+                    Some((dot / (norm * centre_norm)) as f32)
+                })
+                .collect()
+        }
+    };
+    Ok(members
+        .iter()
+        .zip(similarities)
+        .map(|(&index, similarity)| {
+            let SegmentTopicAssignment(document, start, end, _) = assignments[index];
+            TopicSegmentSimilarity(index, document, start, end, similarity)
+        })
+        .collect())
+}
+
+pub fn topic_segment_similarities_serialized(
+    bytes: &[u8],
+    topic_count: usize,
+    topic_id: i32,
+) -> Result<Vec<TopicSegmentSimilarity>> {
+    topic_segment_similarities(&deserialize_context(bytes)?, topic_count, topic_id)
 }
 
 pub fn project_basis(
@@ -891,5 +1186,53 @@ mod tests {
         let restored = deserialize_context(&bytes).unwrap();
         assert_eq!(restored.version, CONTEXT_VERSION);
         assert_eq!(restored.segments[6].span, Some((4, 8)));
+    }
+
+    #[test]
+    fn topic_segments_rank_by_similarity_to_the_topic_centre() {
+        let context = fixture();
+        // At three Topics, Topic 2 holds the two segments near (-1, 0).
+        let ranked = topic_segment_similarities(&context, 3, 2).unwrap();
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|item| (item.0, item.1))
+                .collect::<Vec<_>>(),
+            vec![(4, 1), (5, 1)]
+        );
+        for item in &ranked {
+            let similarity = item.4.unwrap();
+            assert!(similarity > 0.9 && similarity <= 1.0001, "{similarity}");
+        }
+        // At two Topics, Topics 0 and 1 merge, and their segments rank together.
+        let merged = topic_segment_similarities(&context, 2, 0).unwrap();
+        assert_eq!(
+            merged.iter().map(|item| item.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(topic_segment_similarities(&context, 2, OUTLIER_LABEL).is_err());
+    }
+
+    #[test]
+    fn compact_embeddings_round_trip_as_binary() {
+        let context = fixture();
+        let bytes = serialize_context(&context).unwrap();
+        let restored = deserialize_context(&bytes).unwrap();
+        let original = context.segment_embeddings.unwrap();
+        let round_tripped = restored.segment_embeddings.unwrap();
+        assert_eq!(original.codes, round_tripped.codes);
+        assert_eq!(original.scales, round_tripped.scales);
+        assert_eq!(round_tripped.dimensions, 2);
+    }
+
+    #[test]
+    fn version_three_contexts_list_segments_without_similarity() {
+        let mut context = fixture();
+        context.version = 3;
+        context.segment_embeddings = None;
+        let restored = deserialize_context(&serialize_context(&context).unwrap()).unwrap();
+        let ranked = topic_segment_similarities(&restored, 3, 2).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked.iter().all(|item| item.4.is_none()));
     }
 }

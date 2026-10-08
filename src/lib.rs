@@ -40,6 +40,10 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
             project_topic_modeling_segments_py,
             module
         )?)?;
+        module.add_function(wrap_pyfunction!(
+            topic_modeling_segment_similarities_py,
+            module
+        )?)?;
     }
     Ok(())
 }
@@ -111,6 +115,24 @@ fn project_topic_modeling_segments_py(context: Vec<u8>, cluster_count: usize) ->
     let segments =
         topic_modeling::projection::project_serialized_context_segments(&context, cluster_count)
             .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
+    serde_json::to_string(&segments)
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
+}
+
+#[cfg(feature = "topic-modeling")]
+#[pyfunction(name = "topic_modeling_segment_similarities")]
+#[pyo3(signature = (context, cluster_count, topic_id))]
+fn topic_modeling_segment_similarities_py(
+    context: Vec<u8>,
+    cluster_count: usize,
+    topic_id: i32,
+) -> PyResult<String> {
+    let segments = topic_modeling::projection::topic_segment_similarities_serialized(
+        &context,
+        cluster_count,
+        topic_id,
+    )
+    .map_err(|error| pyo3::exceptions::PyValueError::new_err(format!("{error:#}")))?;
     serde_json::to_string(&segments)
         .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("{error:#}")))
 }

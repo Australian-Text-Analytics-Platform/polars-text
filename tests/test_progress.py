@@ -44,3 +44,14 @@ def test_no_progress_path_writes_nothing(tmp_path: Path) -> None:
         cast(Any, pl.col("text")).text.tokenize(model=MODEL_ID)
     )
     assert list(tmp_path.iterdir()) == []
+
+
+def test_topic_segment_similarities_rejects_bad_input() -> None:
+    """The typical-segments query validates its input (Wordflow issue 353)."""
+    import pytest
+    from polars_text.topic_projection import topic_segment_similarities
+
+    with pytest.raises(ValueError):
+        topic_segment_similarities(b"not a context", 2, 0)
+    with pytest.raises(ValueError):
+        topic_segment_similarities(b"not a context", 0, 0)
