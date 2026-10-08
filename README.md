@@ -163,6 +163,23 @@ Corpora with too little density evidence return no Topics and a null projection
 context. Use `project_topics` and `project_topic_basis` with a non-null context
 for supported post-fit projections down to one Topic.
 
+### Progress
+
+`tokenize` and `topic_modeling` take an optional `progress_path`. During the
+call they rewrite that JSON file (atomically, at most twice a second):
+
+```json
+{"step": 2, "steps": 5, "label": "embedding", "done": 18900,
+ "total": 114461, "unit": "segments", "updated_at_ms": 1791428969000}
+```
+
+Topic modelling reports five steps: `segmenting` (documents), `embedding`
+(segments; cached segments count at once), `arranging`, `grouping` and
+`topic_words` (the last three without counts). The tokeniser reports documents
+tokenised; every chunk of the column adds to one count, so `total` is null and
+the caller supplies it. Polling the file lets an app show progress, since a
+Polars plugin cannot call back into Python.
+
 ## Token frequencies and stats
 
 Compute corpus token counts and compare corpora with standard statistics.

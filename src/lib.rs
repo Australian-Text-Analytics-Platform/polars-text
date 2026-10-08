@@ -15,6 +15,8 @@ mod lindera_dict;
 mod list_output;
 #[cfg(feature = "tokenization")]
 mod offsets;
+#[cfg(any(feature = "tokenization", feature = "topic-modeling"))]
+mod progress;
 #[cfg(feature = "tokenization")]
 mod token_frequencies;
 #[cfg(feature = "tokenization")]

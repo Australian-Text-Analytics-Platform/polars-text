@@ -127,6 +127,17 @@ pub fn segment_documents(
     tokenizer: &Tokenizer,
     cfg: &SegmentationConfig,
 ) -> Result<Vec<TopicSegment>> {
+    segment_documents_reporting(docs, tokenizer, cfg, || {})
+}
+
+/// `segment_documents`, calling `on_document` after each document so a long
+/// run can report progress (Wordflow issue 350).
+pub fn segment_documents_reporting(
+    docs: &[&str],
+    tokenizer: &Tokenizer,
+    cfg: &SegmentationConfig,
+    mut on_document: impl FnMut(),
+) -> Result<Vec<TopicSegment>> {
     if cfg.max_tokens == 0 {
         bail!("segmentation max_tokens must be > 0");
     }
@@ -165,6 +176,7 @@ pub fn segment_documents(
                 }
             }
         }
+        on_document();
     }
     Ok(segments)
 }

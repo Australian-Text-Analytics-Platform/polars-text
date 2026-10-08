@@ -28,6 +28,9 @@ struct TopicModelingKwargs {
     /// Cluster at most this many segments; `None` clusters every segment.
     #[serde(default)]
     cluster_sample_size: Option<usize>,
+    /// JSON file to report progress to (Wordflow issue 350).
+    #[serde(default)]
+    progress_path: Option<String>,
 }
 
 fn coverage_struct_type() -> DataType {
@@ -113,6 +116,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
         cluster_sample_size: kwargs.cluster_sample_size,
+        progress_path: kwargs.progress_path,
     };
 
     let result = run(&documents, &cfg).map_err(|error| {

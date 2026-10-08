@@ -33,8 +33,8 @@ def test_expression_operations_are_namespace_only() -> None:
 def test_namespace_signatures_match_the_public_contract() -> None:
     assert str(inspect.signature(TextNamespace.tokenize)) == (
         "(self, *, model: 'str', lowercase: 'bool' = True, "
-        "remove_punctuation: 'bool' = True, cache: 'str | os.PathLike[str] | None' = None) "
-        "-> 'pl.Expr'"
+        "remove_punctuation: 'bool' = True, cache: 'str | os.PathLike[str] | None' = None, "
+        "progress_path: 'str | os.PathLike[str] | None' = None) -> 'pl.Expr'"
     )
     assert str(inspect.signature(TextNamespace.concordance)) == (
         "(self, query: 'str', *, left_tokens: 'int' = 5, right_tokens: 'int' = 5, "
@@ -48,7 +48,8 @@ def test_namespace_signatures_match_the_public_contract() -> None:
         "max_tokens: 'int' = 256, seed: 'int' = 42, "
         "min_topic_size: 'int' = 10, max_topic_size: 'int | None' = None, "
         "tokenizer_model: 'str | None' = None, "
-        "lowercase: 'bool' = True, cluster_sample_size: 'int | None' = None) -> 'pl.Expr'"
+        "lowercase: 'bool' = True, cluster_sample_size: 'int | None' = None, "
+        "progress_path: 'str | os.PathLike[str] | None' = None) -> 'pl.Expr'"
     )
 
 
@@ -114,6 +115,7 @@ def test_topic_modeling_registers_only_the_supported_fit_controls(
         "vectorizer_model": None,
         "lowercase": True,
         "cluster_sample_size": None,
+        "progress_path": None,
     }
     with pytest.raises(ValueError, match="automatic.*line.*sentence"):
         cast(Any, pl.col("text")).text.topic_modeling(segmentation="paragraph")

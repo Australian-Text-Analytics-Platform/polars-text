@@ -52,6 +52,9 @@ use segmentation::SegmentationConfig;
 /// ORT inference batch size for Topic Segments.
 #[cfg(feature = "topic-modeling")]
 const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
+/// Progress steps of one run: segmenting, embedding, arranging, grouping, topic words.
+#[cfg(feature = "topic-modeling")]
+const TOPIC_STEPS: u32 = 5;
 
 /// Supported controls for one topic-modeling run.
 #[cfg(feature = "topic-modeling")]
@@ -69,6 +72,8 @@ pub struct RunConfig {
     /// Cluster at most this many segments (a seeded sample); every other
     /// segment takes its nearest sampled segment's topic. `None` clusters all.
     pub cluster_sample_size: Option<usize>,
+    /// JSON file to report progress to (Wordflow issue 350); see `crate::progress`.
+    pub progress_path: Option<String>,
 }
 
 /// One Topic for the bubble chart and Topic table.
@@ -121,10 +126,12 @@ pub struct TopicModelingResult {
 fn encode_topic_embedding_batches(
     texts: &[String],
     mut encode_batch: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
+    mut on_batch: impl FnMut(usize),
 ) -> Result<Vec<Vec<f32>>> {
     let mut vectors = Vec::with_capacity(texts.len());
     for batch in texts.chunks(TOPIC_EMBEDDING_BATCH_SIZE) {
         let encoded = encode_batch(batch)?;
+        on_batch(batch.len());
         if encoded.len() != batch.len() {
             anyhow::bail!(
                 "topic embedding batch encoder returned {} vectors for {} texts",
@@ -150,10 +157,25 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         );
     }
 
-    let segments = segmentation::segment_documents(
+    // Progress steps, reported to the caller's file (Wordflow issue 350).
+    let progress = crate::progress::for_path(cfg.progress_path.as_deref());
+    let step = |number: u32, label: &str, total: Option<usize>, unit: &str| {
+        if let Some(progress) = &progress {
+            progress.start_step(number, TOPIC_STEPS, label, total.map(|n| n as u64), unit);
+        }
+    };
+    let add = |count: usize| {
+        if let Some(progress) = &progress {
+            progress.add(count as u64);
+        }
+    };
+
+    step(1, "segmenting", Some(documents.len()), "documents");
+    let segments = segmentation::segment_documents_reporting(
         documents,
         &embedder.sizing_tokenizer(),
         &cfg.segmentation,
+        || add(1),
     )?;
     let segment_doc_indices = segments
         .iter()
@@ -199,6 +221,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                 .map(str::to_owned)
         })
         .collect::<Result<Vec<_>>>()?;
+    step(2, "embedding", Some(texts.len()), "segments");
     let embeddings: Vec<std::sync::Arc<Vec<f32>>> =
         if let Some(cache_path) = cfg.embedding_cache_path.as_deref() {
             get_or_insert_embeddings(
@@ -209,10 +232,16 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                     provider_id: embedder.provider_id(),
                 },
                 &texts,
-                |misses| encode_topic_embedding_batches(misses, |batch| embedder.encode(batch)),
+                |misses| {
+                    // Cached segments count as read straight away.
+                    if let Some(progress) = &progress {
+                        progress.set_done((texts.len() - misses.len()) as u64);
+                    }
+                    encode_topic_embedding_batches(misses, |batch| embedder.encode(batch), add)
+                },
             )?
         } else {
-            encode_topic_embedding_batches(&texts, |batch| embedder.encode(batch))?
+            encode_topic_embedding_batches(&texts, |batch| embedder.encode(batch), add)?
                 .into_iter()
                 .map(std::sync::Arc::new)
                 .collect()
@@ -239,7 +268,9 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                 .iter()
                 .map(|&index| std::sync::Arc::clone(&embeddings[index]))
                 .collect::<Vec<_>>();
+            step(3, "arranging", None, "");
             let reduced = reduce::reduce(&sample_embeddings, reduce_dims, cfg.seed)?;
+            step(4, "grouping", None, "");
             let sample_doc_indices = indices
                 .iter()
                 .map(|&index| segment_doc_indices[index])
@@ -266,7 +297,9 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
             }
         }
         None => {
+            step(3, "arranging", None, "");
             let reduced = reduce::reduce(&embeddings, reduce_dims, cfg.seed)?;
+            step(4, "grouping", None, "");
             let full = cluster::cluster(
                 &reduced,
                 cfg.min_cluster_size,
@@ -288,6 +321,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         ));
     }
 
+    step(5, "topic_words", None, "");
     let vectorizer = cfg
         .vectorizer_model_id
         .as_deref()
@@ -375,22 +409,29 @@ mod tests {
             .collect::<Vec<_>>();
         let mut batch_lengths = Vec::new();
 
-        let vectors = encode_topic_embedding_batches(&texts, |batch| {
-            batch_lengths.push(batch.len());
-            batch
-                .iter()
-                .map(|text| {
-                    let value = text
-                        .strip_prefix("text-")
-                        .context("test text prefix")?
-                        .parse::<f32>()
-                        .context("test text index parse")?;
-                    Ok(vec![value])
-                })
-                .collect()
-        })?;
+        let mut reported = Vec::new();
+        let vectors = encode_topic_embedding_batches(
+            &texts,
+            |batch| {
+                batch_lengths.push(batch.len());
+                batch
+                    .iter()
+                    .map(|text| {
+                        let value = text
+                            .strip_prefix("text-")
+                            .context("test text prefix")?
+                            .parse::<f32>()
+                            .context("test text index parse")?;
+                        Ok(vec![value])
+                    })
+                    .collect()
+            },
+            |count| reported.push(count),
+        )?;
 
         assert_eq!(batch_lengths, vec![32, 32, 6]);
+        // Each finished batch is reported for progress (Wordflow issue 350).
+        assert_eq!(reported, vec![32, 32, 6]);
         assert_eq!(vectors.first(), Some(&vec![0.0]));
         assert_eq!(vectors.last(), Some(&vec![69.0]));
         Ok(())

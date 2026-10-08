@@ -63,7 +63,15 @@ class TextNamespace:
         lowercase: bool = True,
         remove_punctuation: bool = True,
         cache: str | os.PathLike[str] | None = None,
+        progress_path: str | os.PathLike[str] | None = None,
     ) -> pl.Expr:
+        """Tokenise each document.
+
+        With ``progress_path``, the documents tokenised so far are written to
+        that JSON file (``{"step", "steps", "label", "done", "total", "unit",
+        "updated_at_ms"}``, at most twice a second); every chunk of the column
+        adds to the same count, and ``total`` is left to the caller.
+        """
         _require_feature("tokenization", "tokenize")
         return register_plugin_function(
             plugin_path=PLUGIN_PATH,
@@ -74,6 +82,7 @@ class TextNamespace:
                 "remove_punct": remove_punctuation,
                 "model_id": _model_id(model, required_by="tokenize"),
                 "cache": _cache_path(cache),
+                "progress_path": _cache_path(progress_path),
             },
             is_elementwise=True,
         )
@@ -172,6 +181,7 @@ class TextNamespace:
         tokenizer_model: str | None = None,
         lowercase: bool = True,
         cluster_sample_size: int | None = None,
+        progress_path: str | os.PathLike[str] | None = None,
     ) -> pl.Expr:
         """Cluster a document column and emit one run-level topic struct.
 
@@ -191,6 +201,11 @@ class TextNamespace:
         ``auto_document_share`` (that topic's share of documents before Auto)
         explain the outcome; ``largest_topic_size`` is the segment count of
         the largest topic, the scale a fixed ``max_topic_size`` works on.
+
+        With ``progress_path``, progress is written to that JSON file in five
+        steps: ``segmenting`` (documents), ``embedding`` (segments, cached
+        ones counted first), ``arranging``, ``grouping`` and ``topic_words``
+        (the last three without counts).
 
         Output contains separate document outcomes, complete topic metadata,
         segment counts, and an optional projection context.
@@ -221,6 +236,7 @@ class TextNamespace:
                 "vectorizer_model": _model_id(tokenizer_model),
                 "lowercase": lowercase,
                 "cluster_sample_size": cluster_sample_size,
+                "progress_path": _cache_path(progress_path),
             },
             is_elementwise=False,
             returns_scalar=True,

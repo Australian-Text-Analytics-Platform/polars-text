@@ -107,6 +107,9 @@ struct TokenizeKwargs {
     model_id: String,
     #[serde(default)]
     cache: Option<String>,
+    /// JSON file to report documents tokenised to (Wordflow issue 350).
+    #[serde(default)]
+    progress_path: Option<String>,
 }
 
 #[cfg(feature = "tokenization")]
@@ -288,13 +291,16 @@ fn tokenize_uncached_entries(
     texts: &[String],
     lowercase: bool,
     remove_punct: bool,
+    mut on_text: impl FnMut(),
 ) -> AnyhowResult<Vec<TokenCacheEntry>> {
     texts
         .iter()
         .map(|text| {
-            backend
+            let entry = backend
                 .tokenize_text_with_offsets(text, lowercase, remove_punct)
-                .map(TokenCacheEntry::from_offsets)
+                .map(TokenCacheEntry::from_offsets);
+            on_text();
+            entry
         })
         .collect()
 }
@@ -525,6 +531,17 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
     let ca = inputs[0].str()?;
     let backend = ensure_tokenizer_for_model(&kwargs.model_id)
         .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e}").into()))?;
+    // Every chunk of the column adds to one shared count; the caller knows
+    // the total (Wordflow issue 350).
+    let progress = crate::progress::for_path(kwargs.progress_path.as_deref());
+    if let Some(progress) = &progress {
+        progress.join_step(1, 1, "tokenizing", None, "documents");
+    }
+    let report = |count: usize| {
+        if let Some(progress) = &progress {
+            progress.add(count as u64);
+        }
+    };
 
     if let Some(cache_path) = kwargs.cache.as_deref() {
         let mut texts = Vec::new();
@@ -549,15 +566,25 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
             fingerprint: &fingerprint,
             params_hash: &params_hash,
         };
+        let tokenized = std::cell::Cell::new(0usize);
         let entries = get_or_insert_text_values(Path::new(cache_path), &table, &texts, |misses| {
             tokenize_uncached_entries(
                 backend.as_ref(),
                 misses,
                 kwargs.lowercase,
                 kwargs.remove_punct,
+                || {
+                    tokenized.set(tokenized.get() + 1);
+                    report(1);
+                },
             )
         })
         .map_err(|e| PolarsError::ComputeError(format!("Token cache failed: {e:#}").into()))?;
+        // Cached, repeated and empty rows are done once the lookup returns.
+        report(ca.len().saturating_sub(tokenized.get()));
+        if let Some(progress) = &progress {
+            progress.flush();
+        }
 
         let estimated_tokens = ca.len().saturating_mul(32);
         let mut tok_col = Vec::with_capacity(estimated_tokens);
@@ -610,6 +637,10 @@ pub fn tokenize(inputs: &[Series], kwargs: TokenizeKwargs) -> PolarsResult<Serie
             }
         }
         row_spans.push((span_start, tok_col.len()));
+        report(1);
+    }
+    if let Some(progress) = &progress {
+        progress.flush();
     }
 
     build_token_list_series(
