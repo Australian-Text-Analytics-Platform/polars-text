@@ -64,7 +64,7 @@ pub enum AutoDecision {
     NotNeeded,
     /// The dominant topic was split with a cap (`max_cluster_size`).
     Split,
-    /// Splitting it left most of its segments as outliers, so it was kept.
+    /// A cap found no more topics, so the dominant topic was kept.
     Kept,
 }
 
@@ -156,7 +156,7 @@ pub fn cluster(
             break;
         }
         let capped = run_hdbscan(points, min_cluster_size, Some(cap))?;
-        if !accept_capped(&best, &capped, dominant) {
+        if !accept_capped(&best, &capped) {
             break;
         }
         best = capped;
@@ -246,22 +246,14 @@ fn run_hdbscan(
     })
 }
 
-/// Accepts a capped re-clustering only when it finds more topics and keeps at
-/// least half of the previously dominant topic's points in topics, so a
-/// genuine large theme is never dissolved into outliers.
-fn accept_capped(previous: &ClusterResult, capped: &ClusterResult, dominant: i32) -> bool {
-    if capped.n_topics <= previous.n_topics {
-        return false;
-    }
-    let (members, kept) = previous
-        .labels
-        .iter()
-        .zip(&capped.labels)
-        .filter(|(&before, _)| before == dominant)
-        .fold((0usize, 0usize), |(members, kept), (_, &after)| {
-            (members + 1, kept + usize::from(after != OUTLIER_LABEL))
-        });
-    kept * 2 >= members
+/// Accepts a capped re-clustering when it finds more topics. Segments that
+/// leave the dominant topic may become outliers: Wordflow shows them as
+/// Ungrouped, with a bubble and a count, while one topic covering most of the
+/// documents says nothing about them (Wordflow issue 361). Before 0.6.7 a
+/// split also had to keep half of the dominant topic in topics, which refused
+/// the split in exactly the uniform corpora that produce a giant topic.
+fn accept_capped(previous: &ClusterResult, capped: &ClusterResult) -> bool {
+    capped.n_topics > previous.n_topics
 }
 
 #[cfg(test)]
@@ -371,21 +363,22 @@ mod tests {
     fn accepts_a_split_that_keeps_the_dominant_topic_in_topics() {
         let previous = result(&[0, 0, 0, 0, 0, 0, 1, 1]);
         let capped = result(&[0, 0, 0, 2, 2, -1, 1, 1]);
-        assert!(accept_capped(&previous, &capped, 0));
+        assert!(accept_capped(&previous, &capped));
     }
 
     #[test]
-    fn rejects_a_split_that_turns_the_dominant_topic_into_outliers() {
+    fn accepts_a_split_that_leaves_much_of_the_dominant_topic_ungrouped() {
+        // Wordflow issue 361: Ungrouped is shown, a giant topic says nothing.
         let previous = result(&[0, 0, 0, 0, 0, 0, 1, 1]);
         let capped = result(&[2, 3, -1, -1, -1, -1, 1, 1]);
-        assert!(!accept_capped(&previous, &capped, 0));
+        assert!(accept_capped(&previous, &capped));
     }
 
     #[test]
     fn rejects_a_cap_that_finds_no_more_topics() {
         let previous = result(&[0, 0, 0, 0, 1, 1]);
         let capped = result(&[0, 0, 0, -1, 1, 1]);
-        assert!(!accept_capped(&previous, &capped, 0));
+        assert!(!accept_capped(&previous, &capped));
     }
 
     #[test]
