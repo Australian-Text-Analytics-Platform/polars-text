@@ -23,9 +23,9 @@ use crate::list_output::list_from_spans;
 #[cfg(feature = "tokenization")]
 use crate::tokenizer::{ensure_tokenizer_for_model, tokenizer_cache_fingerprint, TokenizerBackend};
 #[cfg(feature = "embedding")]
-use crate::topic_modeling::embedding::{ensure_embedder, Embedder};
-#[cfg(feature = "embedding")]
 use crate::topic_modeling::embedding_cache::{get_or_insert_embeddings, CacheScope};
+#[cfg(feature = "embedding")]
+use crate::topic_modeling::encoder::{ensure_text_encoder, TextEncoder};
 
 fn int_output(input_fields: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(input_fields[0].name().clone(), DataType::Int64))
@@ -389,10 +389,11 @@ pub fn segment_token_counts(
 ) -> PolarsResult<Series> {
     use rayon::prelude::*;
 
-    let tokenizer = crate::topic_modeling::embedding::ensure_sizing_tokenizer(
-        kwargs.embedder_model.as_deref(),
-    )
-    .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e:#}").into()))?;
+    let tokenizer =
+        crate::topic_modeling::embedding::ensure_sizing_tokenizer(kwargs.embedder_model.as_deref())
+            .map_err(|e| {
+                PolarsError::ComputeError(format!("Tokenizer init failed: {e:#}").into())
+            })?;
     let ca = inputs[0].str()?;
     let texts = ca.iter().collect::<Vec<_>>();
     let counts = texts
@@ -425,12 +426,19 @@ struct EmbeddingKwargs {
     cache: Option<String>,
     #[serde(default)]
     batch_size: Option<usize>,
+    /// Remote embedding settings; all absent means the local model.
+    #[serde(flatten)]
+    remote: crate::topic_modeling::remote_embedding::RemoteEmbeddingKwargs,
 }
 
 #[cfg(feature = "embedding")]
 #[polars_expr(output_type_func=embedding_output)]
 pub fn embedding(inputs: &[Series], kwargs: EmbeddingKwargs) -> PolarsResult<Series> {
-    let embedder = ensure_embedder(kwargs.embedder_model.as_deref())
+    let remote = kwargs
+        .remote
+        .into_options()
+        .map_err(|e| PolarsError::ComputeError(format!("Embedder init failed: {e:#}").into()))?;
+    let embedder = ensure_text_encoder(kwargs.embedder_model.as_deref(), remote.as_ref())
         .map_err(|e| PolarsError::ComputeError(format!("Embedder init failed: {e:#}").into()))?;
     // Texts handed to the embedder at a time; it sorts them by length and
     // runs batches of 32, so a larger default pads less (polars-text 0.6.8).
@@ -451,7 +459,7 @@ pub fn embedding(inputs: &[Series], kwargs: EmbeddingKwargs) -> PolarsResult<Ser
 
 #[cfg(feature = "embedding")]
 fn encode_embedding_batches(
-    embedder: &Embedder,
+    embedder: &TextEncoder,
     texts: &[String],
     batch_size: usize,
     cache_path: Option<&str>,
@@ -480,18 +488,13 @@ fn encode_embedding_batches(
 
 #[cfg(feature = "embedding")]
 fn encode_uncached_embedding_batches(
-    embedder: &Embedder,
+    embedder: &TextEncoder,
     texts: &[String],
     batch_size: usize,
 ) -> PolarsResult<Vec<Vec<f32>>> {
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(batch_size) {
-        let encoded = embedder
-            .encode(chunk)
-            .map_err(|e| PolarsError::ComputeError(format!("Embedding failed: {e:#}").into()))?;
-        vectors.extend(encoded);
-    }
-    Ok(vectors)
+    embedder
+        .encode_batched(texts, batch_size, &mut |_| {})
+        .map_err(|e| PolarsError::ComputeError(format!("Embedding failed: {e:#}").into()))
 }
 
 #[cfg(feature = "embedding")]
@@ -506,7 +509,7 @@ fn build_embedding_vector_list(
 #[cfg(feature = "embedding")]
 fn embed_string_series(
     input: &Series,
-    embedder: &Embedder,
+    embedder: &TextEncoder,
     batch_size: usize,
     cache_path: Option<&str>,
 ) -> PolarsResult<Series> {
@@ -542,7 +545,7 @@ fn embed_string_series(
 #[cfg(feature = "embedding")]
 fn embed_list_string_series(
     input: &Series,
-    embedder: &Embedder,
+    embedder: &TextEncoder,
     batch_size: usize,
     cache_path: Option<&str>,
 ) -> PolarsResult<Series> {

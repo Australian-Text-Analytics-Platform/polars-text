@@ -37,7 +37,7 @@ All expression operations are available through the `text` namespace.
 ### Tokenization
 
 - `pl.col("text").text.tokenize(model="native:plain_words_en", lowercase=True, remove_punctuation=True, cache=None)`
-- `pl.col("text").text.embedding(model=None, cache=None, batch_size=None)`
+- `pl.col("text").text.embedding(model=None, cache=None, batch_size=None, embedding_endpoint=None, ...)` (see Remote embeddings)
 - `pl.col("text").text.segment_token_counts(unit="automatic", model=None)`
 - `pl.col("text").text.clean_text()`
 - `pl.col("text").text.word_count()`
@@ -262,6 +262,73 @@ paragraphs Automatic packs; `line`; `sentence`), counted with the embedding
 model's tokenizer including its special tokens, without splitting anything. It
 loads only the tokenizer. It is meant for choosing a segment token cap from a
 sample.
+
+## Remote embeddings
+
+`embedding` and `topic_modeling` can take their sentence embeddings from an
+OpenAI-compatible `/v1/embeddings` endpoint instead of the local ONNX model:
+for example vLLM on a GPU, usually behind a LiteLLM gateway, from a server pod
+or from a desktop without a GPU. Segmentation, clustering, topic words,
+coverage and the embedding cache stay local. Without `embedding_endpoint`
+nothing changes. Published wheels include it (Cargo feature
+`remote-embedding`); minimal builds without it stay network-free.
+
+```python
+pl.col("text").text.topic_modeling(
+    embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+    embedding_endpoint="https://gateway.example/v1",
+    embedding_api_key_env="GATEWAY_API_KEY",
+    embedding_user="person@example.org",
+)
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `embedding_endpoint` | none (local) | API root including `/v1`; `POST {endpoint}/embeddings` is called. http or https, no credentials, query or fragment. |
+| `embedding_api_key_env` | none | Name of an environment variable holding the key, sent as `Authorization: Bearer`. |
+| `embedding_api_key_file` | none | Path of a file holding the key or token, read before every request, so a host can keep a short-lived SSO access token fresh during a long run. A 401 or 403 is retried once when the file has changed. Only one of the two key options. |
+| `embedding_remote_model` | the local model id | The model name the server knows. |
+| `embedding_user` | none | Sent as the OpenAI `user` field, so a gateway such as LiteLLM records each person's use. |
+| `embedding_batch_size` | 128 | Texts per request (1 to 2048). |
+| `embedding_concurrency` | 4 | Requests in flight (1 to 32); results come back in input order. |
+| `embedding_timeout_s` | 120 | Seconds one request may take. |
+
+The key itself is never an option: Polars plans are serialised and logged, so
+a key in the plan would leak. Only the variable's name or the file's path is in
+the plan.
+
+The local model id (`model` / `embedding_model`) still names the model: its
+Sentence Transformers metadata gives the tokenizer used for segmentation, the
+length limit (sent as `truncate_prompt_tokens`, which vLLM supports; dropped
+for the rest of the run if a server refuses it), the vector width every
+response is checked against, and whether vectors are normalised. Normalisation
+is applied again on the client, which is harmless and protects against servers
+that don't. Only the small metadata files are downloaded; the ONNX graph is not.
+
+Requests are retried with exponential backoff and jitter on connection errors,
+`429` (honouring `Retry-After`) and `5xx`, five tries in all; other `4xx` fail
+at once. Errors name the host, the HTTP status and the server's message
+(shortened), never the key or the input text. A failed remote embedding fails
+the run: there is no fallback to the local model, which would mix two embedding
+spaces in one run. HTTPS trusts the computer's own certificates, so it works on
+networks that inspect TLS.
+
+Remote vectors have their own cache scope (`remote:<host>/<served model>` plus
+the normalisation and truncation settings): they are never mixed with local
+vectors, even for the same model, since tiny numeric differences can change
+clusters. A server for testing:
+
+```bash
+vllm serve sentence-transformers/all-MiniLM-L6-v2 --runner pooling --port 8010
+vllm serve sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --runner pooling --port 8011
+```
+
+With `POLARS_TEXT_TEST_EMBEDDING_ENDPOINT` (and
+`POLARS_TEXT_TEST_EMBEDDING_ENDPOINT_MULTILINGUAL` when the multilingual model
+is served elsewhere; `POLARS_TEXT_TEST_EMBEDDING_API_KEY_ENV` names a key
+variable if needed), `cargo test parity_with_a_real_server -- --nocapture`
+compares local and remote vectors for both models and reports topic
+differences.
 
 ## Development
 

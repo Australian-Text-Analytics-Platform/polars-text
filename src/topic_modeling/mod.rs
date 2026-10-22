@@ -19,12 +19,16 @@ pub mod ctfidf;
 pub mod embedding;
 #[cfg(feature = "embedding")]
 pub mod embedding_cache;
+#[cfg(feature = "embedding")]
+pub mod encoder;
 #[cfg(feature = "topic-modeling")]
 pub mod plugin;
 #[cfg(feature = "topic-modeling")]
 pub mod projection;
 #[cfg(feature = "topic-modeling")]
 pub mod reduce;
+#[cfg(feature = "embedding")]
+pub mod remote_embedding;
 #[cfg(feature = "topic-modeling")]
 pub mod rollup;
 #[cfg(feature = "topic-modeling")]
@@ -77,6 +81,9 @@ pub struct RunConfig {
     pub cluster_sample_size: Option<usize>,
     /// JSON file to report progress to (Wordflow issue 350); see `crate::progress`.
     pub progress_path: Option<String>,
+    /// Embed on an OpenAI-compatible endpoint instead of the local model;
+    /// `None` embeds locally. Everything else stays local.
+    pub remote_embedding: Option<remote_embedding::RemoteEmbeddingOptions>,
 }
 
 /// One Topic for the bubble chart and Topic table.
@@ -147,10 +154,31 @@ fn encode_topic_embedding_batches(
     Ok(vectors)
 }
 
+/// Topic Segment embeddings from either backend: the local model in chunks
+/// of `TOPIC_EMBEDDING_BATCH_SIZE`, a remote endpoint in its own batches.
+/// Each finished batch is reported for progress.
+#[cfg(feature = "topic-modeling")]
+fn encode_with(
+    encoder: &encoder::TextEncoder,
+    texts: &[String],
+    #[cfg_attr(not(feature = "remote-embedding"), allow(unused_mut))] mut on_batch: impl FnMut(usize),
+) -> Result<Vec<Vec<f32>>> {
+    match encoder {
+        encoder::TextEncoder::Local(embedder) => {
+            encode_topic_embedding_batches(texts, |batch| embedder.encode(batch), on_batch)
+        }
+        #[cfg(feature = "remote-embedding")]
+        encoder::TextEncoder::Remote(remote) => remote.encode_reporting(texts, &mut on_batch),
+    }
+}
+
 /// Run the full pipeline on `documents`.
 #[cfg(feature = "topic-modeling")]
 pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
-    let embedder = embedding::ensure_embedder(cfg.embedder_repo_id.as_deref())?;
+    let embedder = encoder::ensure_text_encoder(
+        cfg.embedder_repo_id.as_deref(),
+        cfg.remote_embedding.as_ref(),
+    )?;
     if cfg.segmentation.max_tokens > embedder.max_length() {
         anyhow::bail!(
             "segmentation max_tokens {} exceeds model {} maximum length {}",
@@ -240,11 +268,11 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                     if let Some(progress) = &progress {
                         progress.set_done((texts.len() - misses.len()) as u64);
                     }
-                    encode_topic_embedding_batches(misses, |batch| embedder.encode(batch), add)
+                    encode_with(&embedder, misses, add)
                 },
             )?
         } else {
-            encode_topic_embedding_batches(&texts, |batch| embedder.encode(batch), add)?
+            encode_with(&embedder, &texts, add)?
                 .into_iter()
                 .map(std::sync::Arc::new)
                 .collect()

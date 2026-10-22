@@ -1,6 +1,6 @@
 [package]
 name = "polars_text"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
 
 [lib]
@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["full"]
-full = ["topic-modeling"]
+full = ["topic-modeling", "remote-embedding"]
 cache = ["dep:duckdb", "dep:fs2", "dep:serde_json", "dep:sha2", "dep:tempfile"]
 tokenization = [
     "dep:hf-hub",
@@ -28,6 +28,9 @@ embedding = [
     "dep:polars-arrow",
     "cache",
 ]
+# OpenAI-compatible /v1/embeddings client (src/topic_modeling/remote_embedding.rs):
+# embeddings from a remote GPU (vLLM, LiteLLM) instead of the local ONNX model.
+remote-embedding = ["embedding", "dep:ureq"]
 topic-modeling = [
     "embedding",
     "tokenization",
@@ -44,8 +47,11 @@ duckdb = { version = "1.10504.0", features = ["bundled", "json"], optional = tru
 fs2 = { version = "0.4", optional = true }
 hf-hub = { version = "0.5", optional = true }
 # Lindera dict download support: fetch official GitHub release zips on first use.
+# `platform-verifier`: remote embedding trusts the computer's certificates, so
+# it works on networks that inspect TLS (Zscaler), as Wordflow does (#391).
 ureq = { version = "3", default-features = false, features = [
     "rustls",
+    "platform-verifier",
 ], optional = true }
 zip = { version = "7", default-features = false, features = [
     "deflate-flate2-zlib-rs",

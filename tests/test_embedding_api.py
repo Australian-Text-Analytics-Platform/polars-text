@@ -49,7 +49,15 @@ def test_namespace_signatures_match_the_public_contract() -> None:
         "min_topic_size: 'int' = 10, max_topic_size: 'int | None' = None, "
         "tokenizer_model: 'str | None' = None, "
         "lowercase: 'bool' = True, cluster_sample_size: 'int | None' = None, "
-        "progress_path: 'str | os.PathLike[str] | None' = None) -> 'pl.Expr'"
+        "progress_path: 'str | os.PathLike[str] | None' = None, "
+        "embedding_endpoint: 'str | None' = None, "
+        "embedding_api_key_env: 'str | None' = None, "
+        "embedding_api_key_file: 'str | os.PathLike[str] | None' = None, "
+        "embedding_remote_model: 'str | None' = None, "
+        "embedding_user: 'str | None' = None, "
+        "embedding_batch_size: 'int | None' = None, "
+        "embedding_concurrency: 'int | None' = None, "
+        "embedding_timeout_s: 'float | None' = None) -> 'pl.Expr'"
     )
 
 

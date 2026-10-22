@@ -31,6 +31,9 @@ struct TopicModelingKwargs {
     /// JSON file to report progress to (Wordflow issue 350).
     #[serde(default)]
     progress_path: Option<String>,
+    /// Remote embedding settings; all absent means local embedding.
+    #[serde(flatten)]
+    remote: super::remote_embedding::RemoteEmbeddingKwargs,
 }
 
 fn coverage_struct_type() -> DataType {
@@ -103,6 +106,10 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         .map(|value| value.unwrap_or(""))
         .collect::<Vec<_>>();
 
+    let remote_embedding = kwargs
+        .remote
+        .into_options()
+        .map_err(|error| PolarsError::ComputeError(format!("topic_modeling: {error:#}").into()))?;
     let cfg = RunConfig {
         embedder_repo_id: kwargs.embedder_model,
         embedding_cache_path: kwargs.cache,
@@ -117,6 +124,7 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         lowercase: kwargs.lowercase,
         cluster_sample_size: kwargs.cluster_sample_size,
         progress_path: kwargs.progress_path,
+        remote_embedding,
     };
 
     let result = run(&documents, &cfg).map_err(|error| {

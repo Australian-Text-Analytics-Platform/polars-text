@@ -65,6 +65,9 @@ fn compiled_feature_names() -> Vec<&'static str> {
     if cfg!(feature = "topic-modeling") {
         features.push("topic-modeling");
     }
+    if cfg!(feature = "remote-embedding") {
+        features.push("remote-embedding");
+    }
     features
 }
 
@@ -155,6 +158,10 @@ mod tests {
         assert_eq!(
             features.contains(&"topic-modeling"),
             cfg!(feature = "topic-modeling")
+        );
+        assert_eq!(
+            features.contains(&"remote-embedding"),
+            cfg!(feature = "remote-embedding")
         );
     }
 }

@@ -303,9 +303,7 @@ impl Embedder {
                         .collect::<Vec<_>>(),
                     longest,
                 )
-                .with_context(|| {
-                    format!("no static embedding bucket holds {longest} tokens")
-                })?;
+                .with_context(|| format!("no static embedding bucket holds {longest} tokens"))?;
                 match sessions.bucket_session(bucket) {
                     Ok(session) => self.run_session(
                         session,
@@ -448,7 +446,9 @@ fn static_buckets(max_length: usize) -> Vec<usize> {
 /// fp32 `model.onnx` export (not the quantized artifacts).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn static_shape_validated(model_id: &str, artifact: &Path) -> bool {
-    artifact.file_name().is_some_and(|name| name == "model.onnx")
+    artifact
+        .file_name()
+        .is_some_and(|name| name == "model.onnx")
         && matches!(
             model_id,
             DEFAULT_EMBEDDER_REPO_ID | MULTILINGUAL_EMBEDDER_REPO_ID
@@ -526,9 +526,12 @@ impl StaticSessions {
 
     /// Any prepared session, for reading the graph's inputs and outputs.
     fn metadata_session(&self) -> Option<&Mutex<Session>> {
-        self.buckets
-            .iter()
-            .find_map(|bucket| bucket.session.get().and_then(|session| session.as_ref().ok()))
+        self.buckets.iter().find_map(|bucket| {
+            bucket
+                .session
+                .get()
+                .and_then(|session| session.as_ref().ok())
+        })
     }
 }
 
@@ -543,7 +546,7 @@ impl Backend {
     }
 }
 
-fn tokenizer_for_sizing(tokenizer: &Tokenizer) -> Tokenizer {
+pub(crate) fn tokenizer_for_sizing(tokenizer: &Tokenizer) -> Tokenizer {
     let mut tok = tokenizer.clone();
     let _ = tok.with_truncation(None);
     tok.with_padding(None);
@@ -709,7 +712,7 @@ fn pool_token_embeddings(
     Ok(rows)
 }
 
-fn normalize_nested_rows(rows: &mut [Vec<f32>]) {
+pub(crate) fn normalize_nested_rows(rows: &mut [Vec<f32>]) {
     for row in rows {
         let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
         if norm > 0.0 {
@@ -750,6 +753,69 @@ pub fn ensure_embedder(repo_id: Option<&str>) -> Result<Arc<Embedder>> {
     let embedder = Arc::new(load_embedder(&key)?);
     map.insert(key, Arc::clone(&embedder));
     Ok(embedder)
+}
+
+/// What a model's Sentence Transformers metadata says about its embeddings,
+/// without the ONNX graph: what a remote encoder needs to size, check and
+/// normalise the vectors a server returns for that model.
+#[cfg_attr(not(feature = "remote-embedding"), allow(dead_code))]
+pub(crate) struct ModelProfile {
+    pub model_id: String,
+    /// Hugging Face snapshot the metadata came from.
+    pub revision: String,
+    /// Truncates at `max_length`; never pads.
+    pub tokenizer: Tokenizer,
+    pub max_length: usize,
+    /// The model ends in a Normalize module (unit-length vectors).
+    pub normalize: bool,
+    pub embedding_dim: usize,
+}
+
+type ModelProfiles = RwLock<HashMap<String, Arc<ModelProfile>>>;
+static MODEL_PROFILES: OnceLock<ModelProfiles> = OnceLock::new();
+
+/// The model's profile, loaded once per process (small metadata files only).
+#[cfg_attr(not(feature = "remote-embedding"), allow(dead_code))]
+pub(crate) fn ensure_model_profile(repo_id: Option<&str>) -> Result<Arc<ModelProfile>> {
+    let key = repo_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_EMBEDDER_REPO_ID)
+        .to_string();
+    let profiles = MODEL_PROFILES.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(profile) = profiles
+        .read()
+        .map_err(|_| anyhow::anyhow!("model profile registry lock poisoned"))?
+        .get(&key)
+    {
+        return Ok(Arc::clone(profile));
+    }
+    let ModelMetadata {
+        revision,
+        normalize,
+        hidden_size,
+        mode_count,
+        max_length,
+        mut tokenizer,
+        ..
+    } = load_model_metadata(&key)?;
+    tokenizer.with_padding(None);
+    let embedding_dim = hidden_size
+        .checked_mul(mode_count)
+        .ok_or_else(|| anyhow::anyhow!("embedding dimension overflow for {key}"))?;
+    let profile = Arc::new(ModelProfile {
+        model_id: key.clone(),
+        revision,
+        tokenizer,
+        max_length,
+        normalize,
+        embedding_dim,
+    });
+    profiles
+        .write()
+        .map_err(|_| anyhow::anyhow!("model profile registry lock poisoned"))?
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&profile));
+    Ok(profile)
 }
 
 type SizingTokenizers = RwLock<HashMap<String, Arc<Tokenizer>>>;
@@ -801,8 +867,7 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
 }
 
 fn provider_override_is_cpu() -> bool {
-    env::var(EMBEDDING_PROVIDER_ENV)
-        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("cpu"))
+    env::var(EMBEDDING_PROVIDER_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("cpu"))
 }
 
 /// Compiled Core ML models live next to the downloaded models, in the same
@@ -917,7 +982,9 @@ fn load_embedder_with(repo_id: &str, plan: &SessionPlan) -> Result<Embedder> {
         fallback_reason,
     } = prepare_backend(&onnx_path, repo_id, max_length, plan)?;
     if let Some(reason) = &fallback_reason {
-        eprintln!("polars-text: Core ML embedding unavailable for {repo_id}, using the CPU: {reason}");
+        eprintln!(
+            "polars-text: Core ML embedding unavailable for {repo_id}, using the CPU: {reason}"
+        );
     }
     let embedding_dim = hidden_size
         .checked_mul(mode_count)
@@ -932,7 +999,10 @@ fn load_embedder_with(repo_id: &str, plan: &SessionPlan) -> Result<Embedder> {
             .iter()
             .map(|input| input.name().to_string())
             .collect::<Vec<_>>();
-        (input_names, select_embedding_output(&session, embedding_dim)?)
+        (
+            input_names,
+            select_embedding_output(&session, embedding_dim)?,
+        )
     };
     let cache_fingerprint = embedding_fingerprint(
         &revision,
@@ -1322,9 +1392,8 @@ fn build_static_session(
         .with_compute_units(ep::coreml::ComputeUnits::All);
     if let Some(root) = cache_root {
         let cache = root.join(coreml_cache_key(onnx_path, &policy, ort::info()));
-        std::fs::create_dir_all(&cache).with_context(|| {
-            format!("prepare the compiled CoreML cache {}", cache.display())
-        })?;
+        std::fs::create_dir_all(&cache)
+            .with_context(|| format!("prepare the compiled CoreML cache {}", cache.display()))?;
         provider = provider.with_model_cache_dir(cache.to_string_lossy());
     }
     let mut builder = base_session_builder()?
@@ -1866,10 +1935,15 @@ mod tests {
 
             #[cfg(target_os = "macos")]
             {
-                assert!(preferred.provider_id().starts_with("CoreMLExecutionProvider"));
+                assert!(preferred
+                    .provider_id()
+                    .starts_with("CoreMLExecutionProvider"));
                 assert_eq!(preferred.provider_fallback_reason(), None);
                 assert!(used.contains("CoreMLExecutionProvider"), "{used:?}");
-                assert_eq!(preferred.prepared_buckets().len(), static_buckets(preferred.max_length()).len());
+                assert_eq!(
+                    preferred.prepared_buckets().len(),
+                    static_buckets(preferred.max_length()).len()
+                );
                 assert_ne!(preferred.cache_fingerprint(), cpu.cache_fingerprint());
 
                 let blocked = scratch.path().join(format!("blocked-{index}"));

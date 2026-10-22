@@ -953,9 +953,18 @@ mod tests {
             ("[CLS]".into(), cls),
         )));
         // Each count includes the model's two special tokens.
-        assert_eq!(unit_token_counts(doc, &tokenizer, SegmentUnit::Automatic)?, vec![11]);
-        assert_eq!(unit_token_counts(doc, &tokenizer, SegmentUnit::Paragraph)?, vec![7, 5]);
-        assert_eq!(unit_token_counts(doc, &tokenizer, SegmentUnit::Line)?, vec![7, 4, 3]);
+        assert_eq!(
+            unit_token_counts(doc, &tokenizer, SegmentUnit::Automatic)?,
+            vec![11]
+        );
+        assert_eq!(
+            unit_token_counts(doc, &tokenizer, SegmentUnit::Paragraph)?,
+            vec![7, 5]
+        );
+        assert_eq!(
+            unit_token_counts(doc, &tokenizer, SegmentUnit::Line)?,
+            vec![7, 4, 3]
+        );
         // UAX #29 ends a sentence at a line break; the lone quote mark has no
         // letters or digits, so it is not a unit.
         assert_eq!(
@@ -970,14 +979,15 @@ mod tests {
     fn parallel_documents_keep_order_and_report_progress_on_the_caller() -> Result<()> {
         // More documents than one chunk on any machine, of mixed size and
         // content, including blank and duplicate documents.
-        let sources = (0..(super::super::embedding::computation_threads() * DOCUMENTS_PER_WORKER * 2 + 7))
-            .map(|index| match index % 4 {
-                0 => String::new(),
-                1 => "Café culture. 医生讨论健康。\n\nMore words and sentences.".to_owned(),
-                2 => format!("Document {index}. {}", "Repeated long text. ".repeat(25)),
-                _ => "Duplicates stay.\nEvery source row stays.".to_owned(),
-            })
-            .collect::<Vec<_>>();
+        let sources =
+            (0..(super::super::embedding::computation_threads() * DOCUMENTS_PER_WORKER * 2 + 7))
+                .map(|index| match index % 4 {
+                    0 => String::new(),
+                    1 => "Café culture. 医生讨论健康。\n\nMore words and sentences.".to_owned(),
+                    2 => format!("Document {index}. {}", "Repeated long text. ".repeat(25)),
+                    _ => "Duplicates stay.\nEvery source row stays.".to_owned(),
+                })
+                .collect::<Vec<_>>();
         let docs = sources.iter().map(String::as_str).collect::<Vec<_>>();
         let words = docs
             .iter()
