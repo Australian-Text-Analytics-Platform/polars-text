@@ -363,6 +363,37 @@ fn a_server_that_refuses_truncation_gets_requests_without_it() {
 }
 
 #[test]
+fn refused_keys_and_sign_in_redirects_say_what_they_mean() {
+    let (root, seen) = mock_server(Arc::new(|_, _| status(401, json!({}))));
+    let error = RemoteEmbedder::with_retry(profile(false), &options(&root), FAST)
+        .unwrap()
+        .encode_reporting(&texts(1), &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refused the key (HTTP 401)"), "{error}");
+    assert!(error.contains("single sign-on"), "{error}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    let (root, seen) = mock_server(Arc::new(|_, _| Reply {
+        status: 302,
+        headers: vec![("Location", "https://sso.example/auth".into())],
+        body: String::new(),
+    }));
+    let error = RemoteEmbedder::with_retry(profile(false), &options(&root), FAST)
+        .unwrap()
+        .encode_reporting(&texts(1), &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("redirected the request (HTTP 302)"),
+        "{error}"
+    );
+    assert!(!error.contains("sso.example"), "{error}");
+    // Never followed to the sign-in page.
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn errors_never_contain_the_key_or_the_input() {
     let key = "sk-test-very-secret-key-123";
     std::env::set_var("POLARS_TEXT_TEST_REMOTE_KEY_SCRUB", key);

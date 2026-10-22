@@ -368,6 +368,9 @@ mod client {
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs_f64(options.timeout_s)))
                 .http_status_as_error(false)
+                // A redirect is reported, never followed: behind single
+                // sign-on it leads to a login page, not to embeddings.
+                .max_redirects(0)
                 .tls_config(
                     ureq::tls::TlsConfig::builder()
                         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -633,14 +636,34 @@ mod client {
         }
 
         /// `remote embedding at <host> answered HTTP <status>: <message>`,
-        /// without the key or any input text.
+        /// without the key or any input text. Refused keys and sign-in
+        /// redirects say what they mean.
         fn status_error(&self, reply: &Reply, texts: &[String], key: Option<&str>) -> String {
-            format!(
-                "remote embedding at {} answered HTTP {}: {}",
-                self.host,
-                reply.status,
-                scrubbed_message(&reply.body, texts, key)
-            )
+            let host = &self.host;
+            let status = reply.status;
+            let message = scrubbed_message(&reply.body, texts, key);
+            let said = if message == NO_MESSAGE {
+                String::new()
+            } else {
+                format!(": {message}")
+            };
+            match status {
+                300..=399 => format!(
+                    "remote embedding at {host} redirected the request (HTTP {status}), \
+                     probably to a sign-in page: this endpoint needs single sign-on, \
+                     not an API key"
+                ),
+                401 | 403 => format!(
+                    "remote embedding at {host} refused the key (HTTP {status}){}",
+                    if said.is_empty() {
+                        ". Check the key; an endpoint behind single sign-on doesn't accept API keys"
+                            .to_string()
+                    } else {
+                        said
+                    }
+                ),
+                _ => format!("remote embedding at {host} answered HTTP {status}{said}"),
+            }
         }
     }
 
@@ -672,10 +695,18 @@ mod client {
         )
     }
 
+    const NO_MESSAGE: &str = "(no message)";
+
     /// The server's own message (OpenAI `error.message`, FastAPI `detail`,
     /// or the body), shortened, with the key and quoted input removed.
     pub(super) fn scrubbed_message(body: &str, texts: &[String], key: Option<&str>) -> String {
         let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+        if parsed
+            .as_ref()
+            .is_some_and(|value| value.as_object().is_some_and(serde_json::Map::is_empty))
+        {
+            return NO_MESSAGE.into();
+        }
         let message = parsed
             .as_ref()
             .and_then(|value| {
@@ -705,7 +736,7 @@ mod client {
             }
         }
         if message.is_empty() {
-            return "(no message)".into();
+            return NO_MESSAGE.into();
         }
         if message.chars().count() > MAX_MESSAGE_CHARS {
             message = message.chars().take(MAX_MESSAGE_CHARS).collect::<String>() + "…";
