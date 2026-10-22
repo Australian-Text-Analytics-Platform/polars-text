@@ -119,3 +119,47 @@ def test_topic_modeling_registers_only_the_supported_fit_controls(
     }
     with pytest.raises(ValueError, match="automatic.*line.*sentence"):
         cast(Any, pl.col("text")).text.topic_modeling(segmentation="paragraph")
+
+
+def test_segment_token_counts_registers_validated_plugin_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(namespace_module, "compiled_features", lambda: {"topic-modeling"})
+    monkeypatch.setattr(
+        namespace_module,
+        "register_plugin_function",
+        lambda **kwargs: calls.append(kwargs) or pl.lit([0]),
+    )
+
+    expr = cast(Any, pl.col("text")).text.segment_token_counts(
+        "sentence",
+        model=" sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 ",
+    )
+
+    assert isinstance(expr, pl.Expr)
+    assert calls[0]["function_name"] == "segment_token_counts"
+    assert calls[0]["kwargs"] == {
+        "embedder_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "unit": "sentence",
+    }
+    assert calls[0]["is_elementwise"] is True
+    with pytest.raises(ValueError, match="unit must be"):
+        cast(Any, pl.col("text")).text.segment_token_counts("word")
+
+
+def test_segment_token_counts_measure_units_with_the_model_tokenizer() -> None:
+    frame = pl.DataFrame(
+        {"text": ["Hello world.\n\nSecond paragraph here.", None, "   "]}
+    )
+    counts = {
+        unit: frame.select(
+            cast(Any, pl.col("text")).text.segment_token_counts(unit)
+        )["text"].to_list()
+        for unit in ("automatic", "paragraph", "line", "sentence")
+    }
+    # all-MiniLM-L6-v2 adds [CLS] and [SEP] to every unit.
+    assert counts["automatic"] == [[9], None, []]
+    assert counts["paragraph"] == [[5, 6], None, []]
+    assert counts["line"] == [[5, 6], None, []]
+    assert counts["sentence"] == [[5, 6], None, []]

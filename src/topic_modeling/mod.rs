@@ -49,9 +49,12 @@ use embedding_cache::{get_or_insert_embeddings, CacheScope};
 #[cfg(feature = "topic-modeling")]
 use segmentation::SegmentationConfig;
 
-/// ORT inference batch size for Topic Segments.
+/// Topic Segments handed to the embedder at a time. The embedder sorts each
+/// chunk by length and runs it in batches of 32, so a larger chunk pads less
+/// (and fills the Core ML length buckets better); progress is reported per
+/// chunk, about every 1 to 3 seconds.
 #[cfg(feature = "topic-modeling")]
-const TOPIC_EMBEDDING_BATCH_SIZE: usize = 32;
+const TOPIC_EMBEDDING_BATCH_SIZE: usize = 512;
 /// Progress steps of one run: segmenting, embedding, arranging, grouping, topic words.
 #[cfg(feature = "topic-modeling")]
 const TOPIC_STEPS: u32 = 5;
@@ -404,7 +407,7 @@ mod tests {
 
     #[test]
     fn topic_embedding_batches_are_bounded_and_ordered() -> Result<()> {
-        let texts = (0..70)
+        let texts = (0..1100)
             .map(|index| format!("text-{index}"))
             .collect::<Vec<_>>();
         let mut batch_lengths = Vec::new();
@@ -429,11 +432,11 @@ mod tests {
             |count| reported.push(count),
         )?;
 
-        assert_eq!(batch_lengths, vec![32, 32, 6]);
+        assert_eq!(batch_lengths, vec![512, 512, 76]);
         // Each finished batch is reported for progress (Wordflow issue 350).
-        assert_eq!(reported, vec![32, 32, 6]);
+        assert_eq!(reported, vec![512, 512, 76]);
         assert_eq!(vectors.first(), Some(&vec![0.0]));
-        assert_eq!(vectors.last(), Some(&vec![69.0]));
+        assert_eq!(vectors.last(), Some(&vec![1099.0]));
         Ok(())
     }
 

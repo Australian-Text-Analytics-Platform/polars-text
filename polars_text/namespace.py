@@ -168,6 +168,34 @@ class TextNamespace:
             is_elementwise=True,
         )
 
+    def segment_token_counts(
+        self,
+        unit: Literal["automatic", "paragraph", "line", "sentence"] = "automatic",
+        *,
+        model: str | None = None,
+    ) -> pl.Expr:
+        """Token counts of each row's units, as Topic Segments are sized.
+
+        ``unit`` follows the segmentation modes: ``automatic`` measures the
+        whole text, ``paragraph`` the paragraphs Automatic packs, ``line``
+        non-empty lines and ``sentence`` UAX #29 sentences. Counts use the
+        embedding model's tokenizer, include its special tokens and never
+        split a unit; units without letters or digits are skipped. Returns
+        ``List(UInt32)``; null rows stay null. Loads only the tokenizer.
+        """
+        _require_feature("topic-modeling", "segment_token_counts")
+        if unit not in {"automatic", "paragraph", "line", "sentence"}:
+            raise ValueError(
+                "unit must be 'automatic', 'paragraph', 'line' or 'sentence'"
+            )
+        return register_plugin_function(
+            plugin_path=PLUGIN_PATH,
+            function_name="segment_token_counts",
+            args=self._expr,
+            kwargs={"embedder_model": _model_id(model), "unit": unit},
+            is_elementwise=True,
+        )
+
     def topic_modeling(
         self,
         *,

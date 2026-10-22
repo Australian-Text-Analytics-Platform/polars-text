@@ -38,6 +38,7 @@ All expression operations are available through the `text` namespace.
 
 - `pl.col("text").text.tokenize(model="native:plain_words_en", lowercase=True, remove_punctuation=True, cache=None)`
 - `pl.col("text").text.embedding(model=None, cache=None, batch_size=None)`
+- `pl.col("text").text.segment_token_counts(unit="automatic", model=None)`
 - `pl.col("text").text.clean_text()`
 - `pl.col("text").text.word_count()`
 - `pl.col("text").text.char_count()`
@@ -237,10 +238,30 @@ The initial call may take longer while models download and cache.
 
 Embedding features download ONNX artifacts on first use. Some ONNX repositories
 store tensor data in sidecar files such as `onnx/model.onnx_data`; those files
-are fetched automatically when present. Embeddings run on ONNX Runtime's CPU
-provider with every core on all platforms (Core ML was several times slower for
-the default sentence model). Set `POLARS_TEXT_EMBEDDING_THREADS` to cap the
-threads each embedding job uses, for example on a shared server.
+are fetched automatically when present.
+
+Embedding sorts the texts of each call by token count and runs them in batches
+of 32, so each batch pads only to its own longest text. On macOS the two
+curated models (`sentence-transformers/all-MiniLM-L6-v2` and
+`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`) run on Core ML
+(GPU and Neural Engine) through fixed-shape sessions, one per length bucket of
+32, 64, 128 and 256 tokens up to the model's limit; a batch runs in the
+smallest bucket that holds it. Each bucket is compiled on first use and kept in
+`coreml/` inside the Hugging Face cache (`HF_HOME`), so only the first run after
+an install or upgrade pays the compile. Core ML vectors agree with the CPU's to
+about 1e-4. When Core ML cannot be prepared the CPU is used and the reason is
+printed once to standard error. Set `POLARS_TEXT_EMBEDDING_PROVIDER=cpu` to keep
+a Mac on the CPU. Other models, Linux and Windows embed on ONNX Runtime's CPU
+provider with every core. Set `POLARS_TEXT_EMBEDDING_THREADS` to cap the
+threads each embedding job (and topic segmentation) uses, for example on a
+shared server.
+
+`segment_token_counts` returns, per row, the token counts of the row's units
+for a segmentation mode (`automatic`: the whole text; `paragraph`: the
+paragraphs Automatic packs; `line`; `sentence`), counted with the embedding
+model's tokenizer including its special tokens, without splitting anything. It
+loads only the tokenizer. It is meant for choosing a segment token cap from a
+sample.
 
 ## Development
 

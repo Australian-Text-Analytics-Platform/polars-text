@@ -33,6 +33,7 @@
 //! Called by: `topic_modeling::run` (orchestrator) before embedding.
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 use unicode_segmentation::UnicodeSegmentation;
@@ -130,8 +131,17 @@ pub fn segment_documents(
     segment_documents_reporting(docs, tokenizer, cfg, || {})
 }
 
+/// Documents per worker in one ordered chunk: enough that a long document
+/// rarely leaves the other workers idle, few enough that progress stays live.
+const DOCUMENTS_PER_WORKER: usize = 8;
+
 /// `segment_documents`, calling `on_document` after each document so a long
 /// run can report progress (Wordflow issue 350).
+///
+/// Documents are segmented in parallel (Wordflow issue 412), each by one
+/// worker, in ordered chunks: results, errors and `on_document` calls keep
+/// document order and stay on the caller's thread. Workers are capped like
+/// embedding threads (`POLARS_TEXT_EMBEDDING_THREADS`).
 pub fn segment_documents_reporting(
     docs: &[&str],
     tokenizer: &Tokenizer,
@@ -141,44 +151,118 @@ pub fn segment_documents_reporting(
     if cfg.max_tokens == 0 {
         bail!("segmentation max_tokens must be > 0");
     }
-
+    if docs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = super::embedding::computation_threads().min(docs.len());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .context("start the segmentation workers")?;
+    let chunk = workers * DOCUMENTS_PER_WORKER;
     let mut segments = Vec::with_capacity(docs.len());
-    for (doc_index, &doc) in docs.iter().enumerate() {
-        let (tokens, special_token_count) = token_spans(doc, tokenizer)?;
-        let content_token_budget = cfg
-            .max_tokens
-            .checked_sub(special_token_count)
-            .filter(|budget| *budget > 0)
-            .with_context(|| {
-                format!(
-                    "segmentation max_tokens {} cannot fit the model's {special_token_count} special tokens",
-                    cfg.max_tokens
-                )
-            })?;
-        let splitter = DocumentSplitter {
-            doc_index,
-            doc,
-            tokens: &tokens,
-            max_tokens: content_token_budget,
-        };
-        match cfg.method {
-            SegmentationMethod::Automatic => {
-                splitter.pack_paragraphs(&paragraph_ranges(doc), &mut segments)?;
-            }
-            SegmentationMethod::Line => {
-                for (start, end) in line_ranges(doc) {
-                    splitter.split_block(start, end, &mut segments)?;
-                }
-            }
-            SegmentationMethod::Sentence => {
-                for (start, sentence) in doc.split_sentence_bound_indices() {
-                    splitter.split_unit(start, start + sentence.len(), &mut segments)?;
-                }
-            }
+    for (chunk_index, batch) in docs.chunks(chunk).enumerate() {
+        let start = chunk_index * chunk;
+        let results: Vec<Result<Vec<TopicSegment>>> = pool.install(|| {
+            batch
+                .par_iter()
+                .enumerate()
+                .map(|(offset, doc)| segment_document(start + offset, doc, tokenizer, cfg))
+                .collect()
+        });
+        for result in results {
+            segments.extend(result?);
+            on_document();
         }
-        on_document();
     }
     Ok(segments)
+}
+
+/// One document's Topic Segments.
+fn segment_document(
+    doc_index: usize,
+    doc: &str,
+    tokenizer: &Tokenizer,
+    cfg: &SegmentationConfig,
+) -> Result<Vec<TopicSegment>> {
+    let (tokens, special_token_count) = token_spans(doc, tokenizer)?;
+    let content_token_budget = cfg
+        .max_tokens
+        .checked_sub(special_token_count)
+        .filter(|budget| *budget > 0)
+        .with_context(|| {
+            format!(
+                "segmentation max_tokens {} cannot fit the model's {special_token_count} special tokens",
+                cfg.max_tokens
+            )
+        })?;
+    let splitter = DocumentSplitter {
+        doc_index,
+        doc,
+        tokens: &tokens,
+        max_tokens: content_token_budget,
+    };
+    let mut segments = Vec::new();
+    match cfg.method {
+        SegmentationMethod::Automatic => {
+            splitter.pack_paragraphs(&paragraph_ranges(doc), &mut segments)?;
+        }
+        SegmentationMethod::Line => {
+            for (start, end) in line_ranges(doc) {
+                splitter.split_block(start, end, &mut segments)?;
+            }
+        }
+        SegmentationMethod::Sentence => {
+            for (start, sentence) in doc.split_sentence_bound_indices() {
+                splitter.split_unit(start, start + sentence.len(), &mut segments)?;
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Semantic units measured by `unit_token_counts` (`.text.segment_token_counts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentUnit {
+    /// The whole text, as Automatic segmentation first sees it.
+    #[default]
+    Automatic,
+    /// Paragraphs as Automatic segmentation packs them: blank-line blocks, or
+    /// every non-empty line when the text has no blank line.
+    Paragraph,
+    /// Every non-empty line (Line segmentation).
+    Line,
+    /// Every Unicode UAX #29 sentence (Sentence segmentation).
+    Sentence,
+}
+
+/// Token counts of one document's units, as the segmenter would size them
+/// (special tokens included, as `max_tokens` counts them) and without
+/// splitting anything, for choosing a segment token cap (Wordflow issue 414).
+/// Units with no letters or digits are skipped, as segmentation drops them.
+///
+/// The `tokenizer` must have truncation and padding disabled (see
+/// `Embedder::sizing_tokenizer`).
+pub fn unit_token_counts(doc: &str, tokenizer: &Tokenizer, unit: SegmentUnit) -> Result<Vec<u32>> {
+    let (tokens, special_token_count) = token_spans(doc, tokenizer)?;
+    let ranges = match unit {
+        SegmentUnit::Automatic => vec![(0, doc.len())],
+        SegmentUnit::Paragraph => paragraph_ranges(doc),
+        SegmentUnit::Line => line_ranges(doc),
+        SegmentUnit::Sentence => doc
+            .split_sentence_bound_indices()
+            .map(|(start, sentence)| (start, start + sentence.len()))
+            .collect(),
+    };
+    ranges
+        .into_iter()
+        .filter(|&(start, end)| doc[start..end].chars().any(char::is_alphanumeric))
+        .map(|(start, end)| {
+            let count = tokens_in_range(&tokens, start, end).len() + special_token_count;
+            u32::try_from(count).context("unit token count overflow")
+        })
+        .collect()
 }
 
 fn token_spans(text: &str, tokenizer: &Tokenizer) -> Result<(Vec<TokenSpan>, usize)> {
@@ -852,6 +936,101 @@ mod tests {
     /// the budget, and together covering every word, packed or not.
     /// (No comma-free run here is longer than a budget, so the documented
     /// tiny-leftover drop never applies.)
+    #[test]
+    fn unit_token_counts_measure_each_mode_without_splitting() -> Result<()> {
+        let doc = "One two three. Four five.\n\nSix seven\neight.\n\n\"\n";
+        let words = doc.split_whitespace().collect::<Vec<_>>();
+        let mut tokenizer = whitespace_tokenizer(
+            &["[CLS]", "[SEP]"]
+                .into_iter()
+                .chain(words.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        let cls = tokenizer.token_to_id("[CLS]").unwrap();
+        let sep = tokenizer.token_to_id("[SEP]").unwrap();
+        tokenizer.with_post_processor(Some(BertProcessing::new(
+            ("[SEP]".into(), sep),
+            ("[CLS]".into(), cls),
+        )));
+        // Each count includes the model's two special tokens.
+        assert_eq!(unit_token_counts(doc, &tokenizer, SegmentUnit::Automatic)?, vec![11]);
+        assert_eq!(unit_token_counts(doc, &tokenizer, SegmentUnit::Paragraph)?, vec![7, 5]);
+        assert_eq!(unit_token_counts(doc, &tokenizer, SegmentUnit::Line)?, vec![7, 4, 3]);
+        // UAX #29 ends a sentence at a line break; the lone quote mark has no
+        // letters or digits, so it is not a unit.
+        assert_eq!(
+            unit_token_counts(doc, &tokenizer, SegmentUnit::Sentence)?,
+            vec![5, 4, 4, 3]
+        );
+        assert!(unit_token_counts("  \n ", &tokenizer, SegmentUnit::Automatic)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_documents_keep_order_and_report_progress_on_the_caller() -> Result<()> {
+        // More documents than one chunk on any machine, of mixed size and
+        // content, including blank and duplicate documents.
+        let sources = (0..(super::super::embedding::computation_threads() * DOCUMENTS_PER_WORKER * 2 + 7))
+            .map(|index| match index % 4 {
+                0 => String::new(),
+                1 => "Café culture. 医生讨论健康。\n\nMore words and sentences.".to_owned(),
+                2 => format!("Document {index}. {}", "Repeated long text. ".repeat(25)),
+                _ => "Duplicates stay.\nEvery source row stays.".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let docs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+        let words = docs
+            .iter()
+            .flat_map(|doc| doc.split_whitespace())
+            .collect::<Vec<_>>();
+        let tokenizer = whitespace_tokenizer(&words);
+        for method in [
+            SegmentationMethod::Automatic,
+            SegmentationMethod::Line,
+            SegmentationMethod::Sentence,
+        ] {
+            let cfg = SegmentationConfig {
+                method,
+                max_tokens: 16,
+            };
+            let expected = docs
+                .iter()
+                .enumerate()
+                .map(|(index, doc)| segment_document(index, doc, &tokenizer, &cfg))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let caller = std::thread::current().id();
+            let mut reported = 0;
+            let actual = segment_documents_reporting(&docs, &tokenizer, &cfg, || {
+                assert_eq!(std::thread::current().id(), caller);
+                reported += 1;
+            })?;
+            assert_eq!(actual, expected);
+            assert_eq!(reported, docs.len());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_documents_report_the_first_failing_document() {
+        // A 1-token budget cannot hold the two special tokens of any document.
+        let docs = vec!["one two"; 40];
+        let mut tokenizer = whitespace_tokenizer(&["[CLS]", "[SEP]", "one", "two"]);
+        let cls = tokenizer.token_to_id("[CLS]").unwrap();
+        let sep = tokenizer.token_to_id("[SEP]").unwrap();
+        tokenizer.with_post_processor(Some(BertProcessing::new(
+            ("[SEP]".into(), sep),
+            ("[CLS]".into(), cls),
+        )));
+        let mut reported = 0;
+        let error = segment_documents_reporting(&docs, &tokenizer, &cfg_with(1), || reported += 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("special tokens"));
+        assert_eq!(reported, 0);
+    }
+
     #[test]
     fn segment_spans_stay_ordered_disjoint_in_budget_and_complete() {
         let doc = "Title line\n\nShort one. Short two.\n\nA long paragraph begins here, \

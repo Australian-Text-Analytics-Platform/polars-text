@@ -361,6 +361,62 @@ fn build_token_list_series(
     list_from_spans(name, &inner, &row_spans)
 }
 
+#[cfg(feature = "topic-modeling")]
+#[derive(serde::Deserialize)]
+struct SegmentTokenCountsKwargs {
+    embedder_model: Option<String>,
+    #[serde(default)]
+    unit: crate::topic_modeling::segmentation::SegmentUnit,
+}
+
+#[cfg(feature = "topic-modeling")]
+fn segment_token_counts_output(input_fields: &[Field]) -> PolarsResult<Field> {
+    Ok(Field::new(
+        input_fields[0].name().clone(),
+        DataType::List(Box::new(DataType::UInt32)),
+    ))
+}
+
+/// Per row, the token counts of the row's semantic units for a segmentation
+/// mode, counted with the embedding model's tokenizer (special tokens
+/// included) and never split: the numbers a segment-cap suggestion needs,
+/// without the text (Wordflow issue 414). Null rows stay null.
+#[cfg(feature = "topic-modeling")]
+#[polars_expr(output_type_func=segment_token_counts_output)]
+pub fn segment_token_counts(
+    inputs: &[Series],
+    kwargs: SegmentTokenCountsKwargs,
+) -> PolarsResult<Series> {
+    use rayon::prelude::*;
+
+    let tokenizer = crate::topic_modeling::embedding::ensure_sizing_tokenizer(
+        kwargs.embedder_model.as_deref(),
+    )
+    .map_err(|e| PolarsError::ComputeError(format!("Tokenizer init failed: {e:#}").into()))?;
+    let ca = inputs[0].str()?;
+    let texts = ca.iter().collect::<Vec<_>>();
+    let counts = texts
+        .par_iter()
+        .map(|text| {
+            text.map(|text| {
+                crate::topic_modeling::segmentation::unit_token_counts(
+                    text,
+                    &tokenizer,
+                    kwargs.unit,
+                )
+            })
+            .transpose()
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|e| PolarsError::ComputeError(format!("Token counting failed: {e:#}").into()))?;
+    let mut out: ListChunked = counts
+        .into_iter()
+        .map(|row| row.map(|values| Series::new(PlSmallStr::EMPTY, values)))
+        .collect();
+    out.rename(ca.name().clone());
+    Ok(out.into_series())
+}
+
 #[cfg(feature = "embedding")]
 #[derive(serde::Deserialize)]
 struct EmbeddingKwargs {
@@ -376,7 +432,9 @@ struct EmbeddingKwargs {
 pub fn embedding(inputs: &[Series], kwargs: EmbeddingKwargs) -> PolarsResult<Series> {
     let embedder = ensure_embedder(kwargs.embedder_model.as_deref())
         .map_err(|e| PolarsError::ComputeError(format!("Embedder init failed: {e:#}").into()))?;
-    let batch_size = kwargs.batch_size.filter(|value| *value > 0).unwrap_or(32);
+    // Texts handed to the embedder at a time; it sorts them by length and
+    // runs batches of 32, so a larger default pads less (polars-text 0.6.8).
+    let batch_size = kwargs.batch_size.filter(|value| *value > 0).unwrap_or(512);
 
     let cache_path = kwargs.cache.as_deref();
 

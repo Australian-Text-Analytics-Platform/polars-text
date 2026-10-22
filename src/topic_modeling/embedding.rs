@@ -12,6 +12,20 @@
 //!
 //! Called by: `topic_modeling::run` for Topic Segment embeddings and, through
 //! the expression plugin, `.text.embedding`.
+//!
+//! Execution (polars-text 0.6.8, Wordflow issue 412): every call sorts its
+//! texts by token count and runs batches of 32 rows, so a batch holds texts of
+//! similar length and pads little. On macOS the two curated models run on Core
+//! ML (GPU and Neural Engine) through static-shape sessions: one compiled
+//! session per length bucket (32, 64, 128 and 256 tokens, capped by the
+//! model's limit), each created on first use and compiled once into a cache
+//! next to the Hugging Face cache. A batch goes to the smallest bucket that
+//! holds its longest text. Dynamic-shape Core ML was 5x slower than the CPU
+//! (2026-10-07: 50 partitions, re-planned per batch shape); a fixed shape runs
+//! the whole graph on Core ML, about 3x faster than all CPU cores on an M5 Pro.
+//! Other models, Linux and Windows embed on the CPU with dynamic padding. When
+//! Core ML cannot be prepared the model falls back to the CPU and keeps the
+//! reason (`provider_fallback_reason`).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -22,25 +36,42 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use anyhow::{Context, Result};
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use hf_hub::{Repo, RepoType};
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::{Session, SessionInputValue};
 use ort::value::{Tensor, ValueType};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 /// Canonical Sentence Transformers default with a published ONNX artifact.
 pub const DEFAULT_EMBEDDER_REPO_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
-const EMBEDDING_PIPELINE_VERSION: &str = "sentence-transformers-v2";
+/// Multilingual model offered beside the default (Wordflow issue 413); its
+/// limit is 128 tokens.
+pub const MULTILINGUAL_EMBEDDER_REPO_ID: &str =
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
+/// v3 (0.6.8): length-sorted batches and static Core ML sessions on macOS.
+const EMBEDDING_PIPELINE_VERSION: &str = "sentence-transformers-v3";
 
 const EMBEDDING_THREADS_ENV: &str = "POLARS_TEXT_EMBEDDING_THREADS";
+/// `cpu` keeps a Mac on the CPU (for comparisons and troubleshooting).
+const EMBEDDING_PROVIDER_ENV: &str = "POLARS_TEXT_EMBEDDING_PROVIDER";
 
-/// A loaded ONNX sentence encoder. `Session::run` requires `&mut self`, so the
+/// Rows per ONNX run; static sessions are compiled for exactly this many rows.
+const ENCODE_BATCH_ROWS: usize = 32;
+/// Token lengths of the static sessions, capped by the model's limit.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const STATIC_TOKEN_BUCKETS: [usize; 4] = [32, 64, 128, 256];
+const CPU_PROVIDER_ID: &str = "CPUExecutionProvider";
+
+/// A loaded ONNX sentence encoder. `Session::run` requires `&mut self`, so each
 /// session sits behind a mutex while cheap tokenizer work remains lock-free.
 pub struct Embedder {
-    session: Mutex<Session>,
+    backend: Backend,
+    /// Truncates at `max_length`; never pads (rows are padded per batch).
     tokenizer: Tokenizer,
+    pad_id: i64,
+    pad_type_id: i64,
     input_names: Vec<String>,
     output: EmbeddingOutput,
     pooling: PoolingConfig,
@@ -49,7 +80,50 @@ pub struct Embedder {
     max_length: usize,
     model_id: String,
     provider_id: String,
+    provider_fallback_reason: Mutex<Option<String>>,
     cache_fingerprint: String,
+}
+
+/// How batches run: one dynamic-shape CPU session, or static Core ML buckets.
+enum Backend {
+    Dynamic(Mutex<Session>),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Static(StaticSessions),
+}
+
+/// Static-shape sessions for one model, one per length bucket, created lazily.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct StaticSessions {
+    onnx_path: PathBuf,
+    cache_root: Option<PathBuf>,
+    profile: Option<PathBuf>,
+    buckets: Vec<StaticBucket>,
+    /// CPU session for a bucket whose static session could not be prepared.
+    cpu: OnceLock<std::result::Result<Mutex<Session>, String>>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct StaticBucket {
+    tokens: usize,
+    session: OnceLock<std::result::Result<Mutex<Session>, String>>,
+}
+
+/// Which sessions `load_embedder_with` prepares.
+#[derive(Debug, Clone)]
+enum SessionPlan {
+    /// Static Core ML buckets where validated, otherwise the CPU.
+    Preferred {
+        cache_root: Option<PathBuf>,
+        profile: Option<PathBuf>,
+    },
+    /// The CPU only, with dynamic padding.
+    Cpu { profile: Option<PathBuf> },
+}
+
+struct PreparedBackend {
+    backend: Backend,
+    provider_id: String,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,9 +213,17 @@ impl Embedder {
         &self.model_id
     }
 
-    /// Execution-provider label used for cache keys and diagnostics.
+    /// Configured execution policy, used for cache keys and diagnostics.
     pub fn provider_id(&self) -> &str {
         &self.provider_id
+    }
+
+    /// Why Core ML could not be prepared and the CPU was used instead, if so.
+    pub fn provider_fallback_reason(&self) -> Option<String> {
+        self.provider_fallback_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
     }
 
     /// Immutable Hugging Face snapshot used for every model artifact.
@@ -160,39 +242,131 @@ impl Embedder {
         tokenizer_for_sizing(&self.tokenizer)
     }
 
-    /// Encode `texts` into mean-pooled, L2-normalized row vectors.
+    /// Encode `texts` into row vectors (the model's pooling and normalization),
+    /// in input order.
+    ///
+    /// Texts are tokenized once, sorted by token count and run in batches of
+    /// `ENCODE_BATCH_ROWS`, so each batch pads only to its own longest text
+    /// (or, on Core ML, to the smallest bucket that holds it).
     pub fn encode(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut tokenizer = self.tokenizer.clone();
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let encodings = tokenizer
+        let encodings = self
+            .tokenizer
             .encode_batch(refs, true)
             .map_err(|e| anyhow::anyhow!("tokenizer encode_batch failed: {e}"))?;
-
-        let batch = encodings.len();
-        let seq = encodings
+        let lengths = encodings
             .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0);
-        if seq == 0 {
-            return Ok(vec![vec![0.0; self.embedding_dim]; batch]);
-        }
+            .map(|encoding| encoding.get_ids().len())
+            .collect::<Vec<_>>();
 
+        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for batch in length_sorted_batches(&lengths, ENCODE_BATCH_ROWS) {
+            let rows = batch
+                .iter()
+                .map(|&index| &encodings[index])
+                .collect::<Vec<_>>();
+            let longest = batch.iter().map(|&index| lengths[index]).max().unwrap_or(0);
+            let encoded = if longest == 0 {
+                vec![vec![0.0; self.embedding_dim]; rows.len()]
+            } else {
+                self.encode_rows(&rows, longest)?
+            };
+            anyhow::ensure!(
+                encoded.len() == rows.len(),
+                "embedding batch returned {} vectors for {} texts",
+                encoded.len(),
+                rows.len()
+            );
+            for (&index, vector) in batch.iter().zip(encoded) {
+                vectors[index] = Some(vector);
+            }
+        }
+        vectors
+            .into_iter()
+            .map(|vector| vector.context("embedding batch left a text without a vector"))
+            .collect()
+    }
+
+    /// Run one batch of tokenized rows on the session its length belongs to.
+    fn encode_rows(&self, rows: &[&Encoding], longest: usize) -> Result<Vec<Vec<f32>>> {
+        match &self.backend {
+            Backend::Dynamic(session) => self.run_session(session, rows, rows.len(), longest),
+            Backend::Static(sessions) => {
+                let bucket = bucket_index(
+                    &sessions
+                        .buckets
+                        .iter()
+                        .map(|bucket| bucket.tokens)
+                        .collect::<Vec<_>>(),
+                    longest,
+                )
+                .with_context(|| {
+                    format!("no static embedding bucket holds {longest} tokens")
+                })?;
+                match sessions.bucket_session(bucket) {
+                    Ok(session) => self.run_session(
+                        session,
+                        rows,
+                        ENCODE_BATCH_ROWS,
+                        sessions.buckets[bucket].tokens,
+                    ),
+                    Err(reason) => {
+                        self.record_fallback(&reason);
+                        let session = sessions.cpu_session()?;
+                        self.run_session(session, rows, rows.len(), longest)
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_fallback(&self, reason: &str) {
+        if let Ok(mut recorded) = self.provider_fallback_reason.lock() {
+            if recorded.is_none() {
+                eprintln!(
+                    "polars-text: Core ML embedding unavailable for {}, using the CPU: {reason}",
+                    self.model_id
+                );
+                *recorded = Some(reason.to_owned());
+            }
+        }
+    }
+
+    /// Pad `rows` to `batch` rows of `seq` tokens and run them. Padding rows
+    /// repeat the first row and are dropped from the result.
+    fn run_session(
+        &self,
+        session: &Mutex<Session>,
+        rows: &[&Encoding],
+        batch: usize,
+        seq: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let first = rows.first().context("embedding batch has no rows")?;
+        anyhow::ensure!(
+            rows.len() <= batch,
+            "embedding batch of {} rows exceeds {batch}",
+            rows.len()
+        );
         let mut ids = Vec::with_capacity(batch * seq);
         let mut mask = Vec::with_capacity(batch * seq);
         let mut token_types = Vec::with_capacity(batch * seq);
-        for enc in &encodings {
+        for row in 0..batch {
+            let enc = rows.get(row).unwrap_or(first);
+            let length = enc.get_ids().len();
+            anyhow::ensure!(
+                length <= seq,
+                "embedding row of {length} tokens exceeds the batch width {seq}"
+            );
+            let padding = seq - length;
             ids.extend(enc.get_ids().iter().map(|id| i64::from(*id)));
+            ids.extend(std::iter::repeat_n(self.pad_id, padding));
             mask.extend(enc.get_attention_mask().iter().map(|id| i64::from(*id)));
+            mask.extend(std::iter::repeat_n(0, padding));
             token_types.extend(enc.get_type_ids().iter().map(|id| i64::from(*id)));
+            token_types.extend(std::iter::repeat_n(self.pad_type_id, padding));
         }
 
         let shape = [batch, seq];
@@ -213,8 +387,7 @@ impl Embedder {
             ));
         }
 
-        let mut session = self
-            .session
+        let mut session = session
             .lock()
             .map_err(|_| anyhow::anyhow!("embedder session lock poisoned"))?;
         let outputs = session
@@ -230,7 +403,7 @@ impl Embedder {
             .try_extract_tensor::<f32>()
             .context("extract ONNX embedding tensor")?;
         let dims: Vec<usize> = shape.iter().map(|dim| *dim as usize).collect();
-        embeddings_from_output(
+        let mut vectors = embeddings_from_output(
             &self.output,
             &self.pooling,
             self.normalize,
@@ -241,7 +414,132 @@ impl Embedder {
                 sequence_length: seq,
                 attention_mask: &mask,
             },
+        )?;
+        vectors.truncate(rows.len());
+        Ok(vectors)
+    }
+}
+
+/// Input positions sorted by token count (ties keep input order), in batches.
+fn length_sorted_batches(lengths: &[usize], rows: usize) -> Vec<Vec<usize>> {
+    let mut order = (0..lengths.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| lengths[index]);
+    order.chunks(rows.max(1)).map(<[usize]>::to_vec).collect()
+}
+
+/// The smallest bucket that holds `tokens` (buckets ascend).
+fn bucket_index(buckets: &[usize], tokens: usize) -> Option<usize> {
+    buckets.iter().position(|&bucket| bucket >= tokens)
+}
+
+/// Static bucket lengths for a model: the standard buckets below its limit,
+/// plus the limit itself so the longest texts always have a bucket.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn static_buckets(max_length: usize) -> Vec<usize> {
+    let mut buckets = STATIC_TOKEN_BUCKETS
+        .into_iter()
+        .filter(|&tokens| tokens < max_length)
+        .collect::<Vec<_>>();
+    buckets.push(max_length);
+    buckets
+}
+
+/// Static Core ML is validated only for the two curated models in their plain
+/// fp32 `model.onnx` export (not the quantized artifacts).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn static_shape_validated(model_id: &str, artifact: &Path) -> bool {
+    artifact.file_name().is_some_and(|name| name == "model.onnx")
+        && matches!(
+            model_id,
+            DEFAULT_EMBEDDER_REPO_ID | MULTILINGUAL_EMBEDDER_REPO_ID
         )
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn static_provider_id(buckets: &[usize]) -> String {
+    let tokens = buckets
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("CoreMLExecutionProvider:MLProgram:ALL:{ENCODE_BATCH_ROWS}x{tokens}+{CPU_PROVIDER_ID}")
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl StaticSessions {
+    fn new(
+        onnx_path: &Path,
+        cache_root: Option<PathBuf>,
+        profile: Option<PathBuf>,
+        buckets: &[usize],
+    ) -> Self {
+        Self {
+            onnx_path: onnx_path.to_path_buf(),
+            cache_root,
+            profile,
+            buckets: buckets
+                .iter()
+                .map(|&tokens| StaticBucket {
+                    tokens,
+                    session: OnceLock::new(),
+                })
+                .collect(),
+            cpu: OnceLock::new(),
+        }
+    }
+
+    /// The bucket's session, compiled (or loaded from the cache) on first use.
+    fn bucket_session(&self, index: usize) -> std::result::Result<&Mutex<Session>, String> {
+        let bucket = &self.buckets[index];
+        bucket
+            .session
+            .get_or_init(|| {
+                build_static_session(
+                    &self.onnx_path,
+                    bucket.tokens,
+                    self.cache_root.as_deref(),
+                    self.profile
+                        .as_ref()
+                        .map(|dir| dir.join(format!("static-{}", bucket.tokens)))
+                        .as_deref(),
+                )
+                .map(Mutex::new)
+                .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    fn cpu_session(&self) -> Result<&Mutex<Session>> {
+        self.cpu
+            .get_or_init(|| {
+                build_cpu_session(
+                    &self.onnx_path,
+                    self.profile.as_ref().map(|dir| dir.join("cpu")).as_deref(),
+                )
+                .map(Mutex::new)
+                .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("CPU fallback session failed: {error}"))
+    }
+
+    /// Any prepared session, for reading the graph's inputs and outputs.
+    fn metadata_session(&self) -> Option<&Mutex<Session>> {
+        self.buckets
+            .iter()
+            .find_map(|bucket| bucket.session.get().and_then(|session| session.as_ref().ok()))
+    }
+}
+
+impl Backend {
+    fn metadata_session(&self) -> Result<&Mutex<Session>> {
+        match self {
+            Self::Dynamic(session) => Ok(session),
+            Self::Static(sessions) => sessions
+                .metadata_session()
+                .context("no static embedding session was prepared"),
+        }
     }
 }
 
@@ -454,7 +752,80 @@ pub fn ensure_embedder(repo_id: Option<&str>) -> Result<Arc<Embedder>> {
     Ok(embedder)
 }
 
+type SizingTokenizers = RwLock<HashMap<String, Arc<Tokenizer>>>;
+static SIZING_TOKENIZERS: OnceLock<SizingTokenizers> = OnceLock::new();
+
+/// The model's tokenizer for measuring text (no truncation, no padding),
+/// loaded without the ONNX graph, so measuring never compiles a Core ML model.
+/// Reuses an embedder that is already loaded.
+#[cfg_attr(not(feature = "topic-modeling"), allow(dead_code))]
+pub fn ensure_sizing_tokenizer(repo_id: Option<&str>) -> Result<Arc<Tokenizer>> {
+    let key = repo_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_EMBEDDER_REPO_ID)
+        .to_string();
+    if let Some(embedder) = registry()
+        .read()
+        .map_err(|_| anyhow::anyhow!("embedder registry lock poisoned"))?
+        .get(&key)
+    {
+        return Ok(Arc::new(embedder.sizing_tokenizer()));
+    }
+    let tokenizers = SIZING_TOKENIZERS.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(tokenizer) = tokenizers
+        .read()
+        .map_err(|_| anyhow::anyhow!("sizing tokenizer registry lock poisoned"))?
+        .get(&key)
+    {
+        return Ok(Arc::clone(tokenizer));
+    }
+    let tokenizer = Arc::new(tokenizer_for_sizing(&load_model_metadata(&key)?.tokenizer));
+    tokenizers
+        .write()
+        .map_err(|_| anyhow::anyhow!("sizing tokenizer registry lock poisoned"))?
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&tokenizer));
+    Ok(tokenizer)
+}
+
 fn load_embedder(repo_id: &str) -> Result<Embedder> {
+    let plan = if provider_override_is_cpu() {
+        SessionPlan::Cpu { profile: None }
+    } else {
+        SessionPlan::Preferred {
+            cache_root: Some(coreml_cache_root()),
+            profile: None,
+        }
+    };
+    load_embedder_with(repo_id, &plan)
+}
+
+fn provider_override_is_cpu() -> bool {
+    env::var(EMBEDDING_PROVIDER_ENV)
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("cpu"))
+}
+
+/// Compiled Core ML models live next to the downloaded models, in the same
+/// Hugging Face cache (`HF_HOME`), so clearing that cache clears them too.
+fn coreml_cache_root() -> PathBuf {
+    hf_hub::Cache::from_env().path().join("coreml")
+}
+
+/// A model's Sentence Transformers metadata and tokenizer, without the ONNX
+/// graph: enough to size text with the model's tokenizer.
+struct ModelMetadata {
+    repo: PinnedRepo,
+    revision: String,
+    pooling: PoolingConfig,
+    normalize: bool,
+    hidden_size: usize,
+    mode_count: usize,
+    max_length: usize,
+    /// Truncates at `max_length`; padding as the repository declares it.
+    tokenizer: Tokenizer,
+}
+
+fn load_model_metadata(repo_id: &str) -> Result<ModelMetadata> {
     let api = ApiBuilder::from_env()
         .build()
         .context("failed to init hf-hub api for embedder")?;
@@ -502,8 +873,6 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
         &module_file(transformer_path, "tokenizer_config.json"),
         &config_path,
     )?;
-    let (onnx_path, onnx_artifact) = resolve_onnx_artifact(&repo, repo_id)?;
-
     let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("load tokenizer for {repo_id}: {e}"))?;
     tokenizer
@@ -512,17 +881,59 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
             ..Default::default()
         }))
         .map_err(|e| anyhow::anyhow!("configure truncation: {e}"))?;
+    Ok(ModelMetadata {
+        repo,
+        revision,
+        pooling,
+        normalize,
+        hidden_size,
+        mode_count,
+        max_length,
+        tokenizer,
+    })
+}
 
-    let (session, provider_id) = build_session(&onnx_path)?;
-    let input_names = session
-        .inputs()
-        .iter()
-        .map(|input| input.name().to_string())
-        .collect::<Vec<_>>();
+fn load_embedder_with(repo_id: &str, plan: &SessionPlan) -> Result<Embedder> {
+    let ModelMetadata {
+        repo,
+        revision,
+        pooling,
+        normalize,
+        hidden_size,
+        mode_count,
+        max_length,
+        mut tokenizer,
+    } = load_model_metadata(repo_id)?;
+    let (onnx_path, onnx_artifact) = resolve_onnx_artifact(&repo, repo_id)?;
+
+    // Batches are padded by `run_session` (to the batch's longest row or the
+    // static bucket), with the tokenizer's own pad token when it declares one.
+    let (pad_id, pad_type_id) = pad_ids(&tokenizer);
+    tokenizer.with_padding(None);
+
+    let PreparedBackend {
+        backend,
+        provider_id,
+        fallback_reason,
+    } = prepare_backend(&onnx_path, repo_id, max_length, plan)?;
+    if let Some(reason) = &fallback_reason {
+        eprintln!("polars-text: Core ML embedding unavailable for {repo_id}, using the CPU: {reason}");
+    }
     let embedding_dim = hidden_size
         .checked_mul(mode_count)
         .ok_or_else(|| anyhow::anyhow!("embedding dimension overflow for {repo_id}"))?;
-    let output = select_embedding_output(&session, embedding_dim)?;
+    let (input_names, output) = {
+        let session = backend
+            .metadata_session()?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("embedder session lock poisoned"))?;
+        let input_names = session
+            .inputs()
+            .iter()
+            .map(|input| input.name().to_string())
+            .collect::<Vec<_>>();
+        (input_names, select_embedding_output(&session, embedding_dim)?)
+    };
     let cache_fingerprint = embedding_fingerprint(
         &revision,
         &onnx_artifact,
@@ -534,8 +945,10 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
     );
 
     Ok(Embedder {
-        session: Mutex::new(session),
+        backend,
         tokenizer,
+        pad_id,
+        pad_type_id,
         input_names,
         output,
         pooling,
@@ -544,6 +957,7 @@ fn load_embedder(repo_id: &str) -> Result<Embedder> {
         max_length,
         model_id: repo_id.to_string(),
         provider_id,
+        provider_fallback_reason: Mutex::new(fallback_reason),
         cache_fingerprint,
     })
 }
@@ -787,8 +1201,73 @@ fn ensure_external_onnx_data(repo: &PinnedRepo, onnx_file: &str) {
     let _ = repo.get(&companion);
 }
 
-fn build_session(onnx_path: &Path) -> Result<(Session, String)> {
-    let provider_id = planned_provider_id();
+/// Prepare the sessions `plan` asks for. On macOS a validated model gets
+/// static Core ML buckets; the smallest bucket is compiled straight away so a
+/// Mac that cannot run Core ML falls back to the CPU here, with the reason,
+/// rather than in the middle of a run.
+fn prepare_backend(
+    onnx_path: &Path,
+    model_id: &str,
+    max_length: usize,
+    plan: &SessionPlan,
+) -> Result<PreparedBackend> {
+    let (cache_root, profile) = match plan {
+        SessionPlan::Cpu { profile } => {
+            return Ok(PreparedBackend {
+                backend: Backend::Dynamic(Mutex::new(build_cpu_session(
+                    onnx_path,
+                    profile.as_ref().map(|dir| dir.join("cpu")).as_deref(),
+                )?)),
+                provider_id: CPU_PROVIDER_ID.to_owned(),
+                fallback_reason: None,
+            })
+        }
+        SessionPlan::Preferred {
+            cache_root,
+            profile,
+        } => (cache_root, profile),
+    };
+    #[cfg(target_os = "macos")]
+    if static_shape_validated(model_id, onnx_path) {
+        let buckets = static_buckets(max_length);
+        let sessions =
+            StaticSessions::new(onnx_path, cache_root.clone(), profile.clone(), &buckets);
+        return match sessions.bucket_session(0) {
+            Ok(_) => Ok(PreparedBackend {
+                backend: Backend::Static(sessions),
+                provider_id: static_provider_id(&buckets),
+                fallback_reason: None,
+            }),
+            Err(reason) => Ok(PreparedBackend {
+                backend: Backend::Dynamic(Mutex::new(
+                    build_cpu_session(
+                        onnx_path,
+                        profile.as_ref().map(|dir| dir.join("cpu")).as_deref(),
+                    )
+                    .with_context(|| {
+                        format!("Core ML preparation failed ({reason}); CPU fallback failed")
+                    })?,
+                )),
+                provider_id: CPU_PROVIDER_ID.to_owned(),
+                fallback_reason: Some(reason),
+            }),
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (model_id, max_length, cache_root);
+    Ok(PreparedBackend {
+        backend: Backend::Dynamic(Mutex::new(build_cpu_session(
+            onnx_path,
+            profile.as_ref().map(|dir| dir.join("cpu")).as_deref(),
+        )?)),
+        provider_id: CPU_PROVIDER_ID.to_owned(),
+        fallback_reason: None,
+    })
+}
+
+/// Session options shared by every session: full graph optimization, no
+/// memory-pattern planning, and the thread cap when one is set.
+fn base_session_builder() -> Result<SessionBuilder> {
     let mut builder = Session::builder()
         .context("create ONNX Runtime session builder")?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -806,21 +1285,107 @@ fn build_session(onnx_path: &Path) -> Result<(Session, String)> {
             .with_inter_threads(1)
             .map_err(|err| anyhow::anyhow!("configure ONNX inter-op threads: {err:?}"))?;
     }
-
-    let session = builder
-        .commit_from_file(onnx_path)
-        .with_context(|| format!("load ONNX model {}", onnx_path.display()))?;
-    Ok((session, provider_id))
+    Ok(builder)
 }
 
-/// Every platform embeds on the CPU with all cores (ONNX Runtime's CPU
-/// provider). Core ML on macOS ran only 294 of the model's 418 nodes, in 50
-/// partitions, and re-planned for every batch shape: about 73 segments/s
-/// against 364 on the CPU on an M5 Pro (2026-10-07; the same finding as the
-/// May 2026 tm-optimisation log, 21 min against 3.3 min for 26k documents).
-/// DirectML on Windows is dropped with it until it is measured.
-fn planned_provider_id() -> String {
-    "CPUExecutionProvider".to_owned()
+fn profiled(builder: SessionBuilder, profile: Option<&Path>) -> Result<SessionBuilder> {
+    match profile {
+        Some(path) => builder
+            .with_profiling(path)
+            .map_err(|err| anyhow::anyhow!("configure ONNX profiling: {err:?}")),
+        None => Ok(builder),
+    }
+}
+
+/// Dynamic-shape session on ONNX Runtime's CPU provider (all platforms).
+fn build_cpu_session(onnx_path: &Path, profile: Option<&Path>) -> Result<Session> {
+    profiled(base_session_builder()?, profile)?
+        .commit_from_file(onnx_path)
+        .with_context(|| format!("load ONNX model {}", onnx_path.display()))
+}
+
+/// Static-shape Core ML session for `ENCODE_BATCH_ROWS` x `tokens`, compiled
+/// as an ML Program for every compute unit (CPU, GPU, Neural Engine) and
+/// cached under `cache_root`, one directory per artifact, shape and runtime.
+#[cfg(target_os = "macos")]
+fn build_static_session(
+    onnx_path: &Path,
+    tokens: usize,
+    cache_root: Option<&Path>,
+    profile: Option<&Path>,
+) -> Result<Session> {
+    use ort::ep;
+
+    let policy = format!("CoreMLExecutionProvider:MLProgram:ALL:{ENCODE_BATCH_ROWS}x{tokens}");
+    let mut provider = ep::CoreML::default()
+        .with_model_format(ep::coreml::ModelFormat::MLProgram)
+        .with_compute_units(ep::coreml::ComputeUnits::All);
+    if let Some(root) = cache_root {
+        let cache = root.join(coreml_cache_key(onnx_path, &policy, ort::info()));
+        std::fs::create_dir_all(&cache).with_context(|| {
+            format!("prepare the compiled CoreML cache {}", cache.display())
+        })?;
+        provider = provider.with_model_cache_dir(cache.to_string_lossy());
+    }
+    let mut builder = base_session_builder()?
+        .with_execution_providers([provider.build().error_on_failure()])
+        .map_err(|err| anyhow::anyhow!("configure the Core ML execution provider: {err:?}"))?;
+    for (name, value) in [
+        ("batch_size", ENCODE_BATCH_ROWS),
+        ("sequence_length", tokens),
+    ] {
+        builder = builder
+            .with_dimension_override(name, value as i64)
+            .map_err(|err| anyhow::anyhow!("fix the embedding input {name}: {err:?}"))?;
+    }
+    let session = profiled(builder, profile)?
+        .commit_from_file(onnx_path)
+        .with_context(|| format!("compile {} for Core ML at {policy}", onnx_path.display()))?;
+    let expected = [ENCODE_BATCH_ROWS as i64, tokens as i64];
+    anyhow::ensure!(
+        session.inputs().iter().all(|input| matches!(
+            input.dtype(),
+            ValueType::Tensor { shape, .. } if shape.as_ref() == expected
+        )),
+        "ONNX inputs do not take the fixed shape {ENCODE_BATCH_ROWS}x{tokens}"
+    );
+    Ok(session)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_static_session(
+    _onnx_path: &Path,
+    _tokens: usize,
+    _cache_root: Option<&Path>,
+    _profile: Option<&Path>,
+) -> Result<Session> {
+    anyhow::bail!("static Core ML sessions exist only on macOS")
+}
+
+/// Cache directory name for one compiled model: artifact path (which carries
+/// the snapshot revision), execution policy with shape, and ONNX Runtime build.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn coreml_cache_key(path: &Path, policy: &str, runtime: &str) -> String {
+    let mut hash = Sha256::new();
+    for part in ["coreml-cache-v1", &path.to_string_lossy(), policy, runtime] {
+        hash.update(part.as_bytes());
+        hash.update([0]);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// Pad token and type ids: the tokenizer's own padding settings when it has
+/// them, else its `[PAD]`/`<pad>` token, else 0. Padded positions are masked,
+/// so the value only matters to models that derive positions from it.
+fn pad_ids(tokenizer: &Tokenizer) -> (i64, i64) {
+    if let Some(padding) = tokenizer.get_padding() {
+        return (i64::from(padding.pad_id), i64::from(padding.pad_type_id));
+    }
+    let pad_id = ["[PAD]", "<pad>"]
+        .into_iter()
+        .find_map(|token| tokenizer.token_to_id(token))
+        .unwrap_or(0);
+    (i64::from(pad_id), 0)
 }
 
 fn embedding_threads() -> Option<usize> {
@@ -830,12 +1395,28 @@ fn embedding_threads() -> Option<usize> {
         .filter(|threads| *threads > 0)
 }
 
+/// Worker threads for native CPU work beside ONNX Runtime (segmentation):
+/// every available CPU, capped by `POLARS_TEXT_EMBEDDING_THREADS` when set.
+#[cfg_attr(not(feature = "topic-modeling"), allow(dead_code))]
+pub(crate) fn computation_threads() -> usize {
+    bounded_threads(
+        std::thread::available_parallelism().map_or(1, usize::from),
+        embedding_threads(),
+    )
+}
+
+#[cfg_attr(not(feature = "topic-modeling"), allow(dead_code))]
+fn bounded_threads(available: usize, cap: Option<usize>) -> usize {
+    cap.map_or(available, |cap| cap.min(available)).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
     use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::{PaddingParams, PaddingStrategy};
 
     fn mean_pooling() -> PoolingConfig {
         PoolingConfig {
@@ -1026,5 +1607,293 @@ mod tests {
             embedding_fingerprint("sha-a", "onnx/model.onnx", &pooling, true, 256, 2, "coreml");
         assert_ne!(first, revision);
         assert_ne!(first, provider);
+    }
+
+    #[test]
+    fn worker_threads_obey_available_processors_and_explicit_caps() {
+        assert_eq!(bounded_threads(8, None), 8);
+        assert_eq!(bounded_threads(8, Some(2)), 2);
+        assert_eq!(bounded_threads(2, Some(32)), 2);
+        assert_eq!(bounded_threads(0, None), 1);
+    }
+
+    #[test]
+    fn batches_sort_by_token_count_and_keep_input_order_for_ties() {
+        assert_eq!(
+            length_sorted_batches(&[5, 1, 3, 1, 9], 2),
+            vec![vec![1, 3], vec![2, 0], vec![4]]
+        );
+        assert!(length_sorted_batches(&[], 32).is_empty());
+        let lengths = (0..70).map(|index| 70 - index).collect::<Vec<_>>();
+        let batches = length_sorted_batches(&lengths, ENCODE_BATCH_ROWS);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![32, 32, 6]
+        );
+        let mut every = batches.concat();
+        every.sort_unstable();
+        assert_eq!(every, (0..70).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_batch_goes_to_the_smallest_bucket_that_holds_it() {
+        let buckets = static_buckets(256);
+        assert_eq!(buckets, vec![32, 64, 128, 256]);
+        assert_eq!(bucket_index(&buckets, 1), Some(0));
+        assert_eq!(bucket_index(&buckets, 32), Some(0));
+        assert_eq!(bucket_index(&buckets, 33), Some(1));
+        assert_eq!(bucket_index(&buckets, 129), Some(3));
+        assert_eq!(bucket_index(&buckets, 256), Some(3));
+        assert_eq!(bucket_index(&buckets, 257), None);
+    }
+
+    #[test]
+    fn buckets_stop_at_the_model_limit() {
+        assert_eq!(static_buckets(128), vec![32, 64, 128]);
+        assert_eq!(static_buckets(100), vec![32, 64, 100]);
+        assert_eq!(static_buckets(512), vec![32, 64, 128, 256, 512]);
+        assert_eq!(static_buckets(16), vec![16]);
+    }
+
+    #[test]
+    fn static_core_ml_is_limited_to_the_curated_fp32_models() {
+        let artifact = Path::new("/models/onnx/model.onnx");
+        assert!(static_shape_validated(DEFAULT_EMBEDDER_REPO_ID, artifact));
+        assert!(static_shape_validated(
+            MULTILINGUAL_EMBEDDER_REPO_ID,
+            Path::new("/models/model.onnx")
+        ));
+        assert!(!static_shape_validated("unvalidated/model", artifact));
+        assert!(!static_shape_validated(
+            DEFAULT_EMBEDDER_REPO_ID,
+            Path::new("/models/onnx/model_quantized.onnx")
+        ));
+        assert_eq!(
+            static_provider_id(&[32, 64, 128]),
+            "CoreMLExecutionProvider:MLProgram:ALL:32x32/64/128+CPUExecutionProvider"
+        );
+    }
+
+    #[test]
+    fn compiled_model_cache_separates_artifacts_policies_and_runtime_builds() {
+        let key = coreml_cache_key(
+            Path::new("/models/snapshots/sha-a/model.onnx"),
+            "all:32x256",
+            "ort-a",
+        );
+        assert_eq!(
+            key,
+            coreml_cache_key(
+                Path::new("/models/snapshots/sha-a/model.onnx"),
+                "all:32x256",
+                "ort-a"
+            )
+        );
+        for (path, policy, runtime) in [
+            ("/models/snapshots/sha-b/model.onnx", "all:32x256", "ort-a"),
+            ("/models/snapshots/sha-a/model.onnx", "gpu:32x256", "ort-a"),
+            ("/models/snapshots/sha-a/model.onnx", "all:32x64", "ort-a"),
+            ("/models/snapshots/sha-a/model.onnx", "all:32x256", "ort-b"),
+        ] {
+            assert_ne!(key, coreml_cache_key(Path::new(path), policy, runtime));
+        }
+    }
+
+    #[test]
+    fn pad_ids_prefer_the_tokenizers_own_padding() {
+        let mut vocab = HashMap::new();
+        vocab.insert("[UNK]".to_string(), 0);
+        vocab.insert("hello".to_string(), 1);
+        vocab.insert("[PAD]".to_string(), 3);
+        let model = WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        assert_eq!(pad_ids(&tokenizer), (3, 0));
+        tokenizer.with_padding(Some(PaddingParams {
+            pad_id: 7,
+            pad_type_id: 1,
+            ..Default::default()
+        }));
+        assert_eq!(pad_ids(&tokenizer), (7, 1));
+    }
+
+    impl Embedder {
+        /// End profiling on every prepared session and return the execution
+        /// providers its nodes ran on.
+        fn executed_providers(&self) -> Result<std::collections::BTreeSet<String>> {
+            let sessions: Vec<&Mutex<Session>> = match &self.backend {
+                Backend::Dynamic(session) => vec![session],
+                Backend::Static(sessions) => sessions
+                    .buckets
+                    .iter()
+                    .filter_map(|bucket| bucket.session.get())
+                    .chain(sessions.cpu.get())
+                    .filter_map(|session| session.as_ref().ok())
+                    .collect(),
+            };
+            let mut used = std::collections::BTreeSet::new();
+            for session in sessions {
+                let profile = session
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session lock poisoned"))?
+                    .end_profiling()?;
+                let events: Vec<serde_json::Value> =
+                    serde_json::from_slice(&std::fs::read(profile)?)?;
+                used.extend(
+                    events
+                        .iter()
+                        .filter_map(|event| event["args"]["provider"].as_str().map(str::to_owned)),
+                );
+            }
+            Ok(used)
+        }
+
+        /// Token lengths of the static buckets compiled so far.
+        fn prepared_buckets(&self) -> Vec<usize> {
+            match &self.backend {
+                Backend::Dynamic(_) => Vec::new(),
+                Backend::Static(sessions) => sessions
+                    .buckets
+                    .iter()
+                    .filter(|bucket| bucket.session.get().is_some_and(|session| session.is_ok()))
+                    .map(|bucket| bucket.tokens)
+                    .collect(),
+            }
+        }
+    }
+
+    fn assert_vectors_agree(expected: &[Vec<f32>], actual: &[Vec<f32>]) {
+        assert_eq!(expected.len(), actual.len());
+        for (left, right) in expected.iter().zip(actual) {
+            assert_eq!(left.len(), right.len());
+            assert!(right.iter().all(|value| value.is_finite()));
+            let dot = left
+                .iter()
+                .zip(right)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum::<f64>();
+            let norm = |values: &[f32]| {
+                values
+                    .iter()
+                    .map(|x| f64::from(*x).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            let cosine = dot / (norm(left) * norm(right));
+            assert!(cosine > 0.9999, "cosine {cosine}");
+            let largest = left
+                .iter()
+                .zip(right)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(largest < 1e-3, "largest difference {largest}");
+        }
+    }
+
+    /// Acceptance for Wordflow issue 412 on a real Mac: static Core ML runs
+    /// the graph on Core ML, agrees with the CPU on blank, Unicode, long,
+    /// duplicate and partial-batch input in any order, and falls back to the
+    /// CPU when the compiled-model cache is unusable. Elsewhere it checks that
+    /// the preferred plan is the CPU. Downloads both curated models.
+    #[test]
+    #[ignore = "downloads both curated models; run on an Apple Silicon Mac to accept Core ML"]
+    fn preferred_sessions_agree_with_the_cpu_and_fall_back() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let texts = (0..73)
+            .map(|index| match index % 6 {
+                0 => String::new(),
+                1 | 4 => "Affordable homes and lower rent.".to_string(),
+                2 => "医生讨论健康。 Café culture and Unicode text.".to_string(),
+                3 => format!(
+                    "Record {index}. {}",
+                    "Doctors treat patients in hospitals. ".repeat(50)
+                ),
+                _ => format!(
+                    "Record {index}. {}",
+                    "Reliable public transport runs on time. ".repeat(index % 9 + 1)
+                ),
+            })
+            .collect::<Vec<_>>();
+        let reversed = texts.iter().rev().cloned().collect::<Vec<_>>();
+        for (index, model) in [DEFAULT_EMBEDDER_REPO_ID, MULTILINGUAL_EMBEDDER_REPO_ID]
+            .into_iter()
+            .enumerate()
+        {
+            let profiles = scratch.path().join(format!("profiles-{index}"));
+            for plan in ["plain", "preferred"] {
+                std::fs::create_dir_all(profiles.join(plan))?;
+            }
+            let cpu = load_embedder_with(
+                model,
+                &SessionPlan::Cpu {
+                    profile: Some(profiles.join("plain")),
+                },
+            )?;
+            let expected = cpu.encode(&texts)?;
+            assert_eq!(cpu.provider_id(), CPU_PROVIDER_ID);
+
+            let preferred = load_embedder_with(
+                model,
+                &SessionPlan::Preferred {
+                    cache_root: Some(scratch.path().join("coreml")),
+                    profile: Some(profiles.join("preferred")),
+                },
+            )?;
+            for count in [0, 1, 31, 32, 33, 65, 73] {
+                assert_vectors_agree(&expected[..count], &preferred.encode(&texts[..count])?);
+            }
+            let mut expected_reversed = expected.clone();
+            expected_reversed.reverse();
+            assert_vectors_agree(&expected_reversed, &preferred.encode(&reversed)?);
+            // One small batch sized for each bucket, so every bucket compiles.
+            for tokens in static_buckets(cpu.max_length()) {
+                let sized = vec!["house ".repeat(tokens.saturating_sub(4).max(1)); 3];
+                assert_vectors_agree(&cpu.encode(&sized)?, &preferred.encode(&sized)?);
+            }
+            assert_eq!(
+                cpu.executed_providers()?,
+                [CPU_PROVIDER_ID.to_string()].into()
+            );
+            let used = preferred.executed_providers()?;
+            eprintln!(
+                "EMBEDDING {model}: policy={} buckets={:?} providers={used:?}",
+                preferred.provider_id(),
+                preferred.prepared_buckets()
+            );
+
+            #[cfg(target_os = "macos")]
+            {
+                assert!(preferred.provider_id().starts_with("CoreMLExecutionProvider"));
+                assert_eq!(preferred.provider_fallback_reason(), None);
+                assert!(used.contains("CoreMLExecutionProvider"), "{used:?}");
+                assert_eq!(preferred.prepared_buckets().len(), static_buckets(preferred.max_length()).len());
+                assert_ne!(preferred.cache_fingerprint(), cpu.cache_fingerprint());
+
+                let blocked = scratch.path().join(format!("blocked-{index}"));
+                std::fs::write(&blocked, "not a directory")?;
+                let fallback = load_embedder_with(
+                    model,
+                    &SessionPlan::Preferred {
+                        cache_root: Some(blocked),
+                        profile: None,
+                    },
+                )?;
+                assert_eq!(fallback.provider_id(), CPU_PROVIDER_ID);
+                assert!(fallback
+                    .provider_fallback_reason()
+                    .is_some_and(|reason| reason.contains("compiled CoreML cache")));
+                assert_eq!(fallback.cache_fingerprint(), cpu.cache_fingerprint());
+                assert_vectors_agree(&expected, &fallback.encode(&texts)?);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(preferred.provider_id(), CPU_PROVIDER_ID);
+                assert_eq!(used, [CPU_PROVIDER_ID.to_string()].into());
+            }
+        }
+        Ok(())
     }
 }
