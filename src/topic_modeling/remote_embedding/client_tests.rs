@@ -201,7 +201,7 @@ fn batches_run_concurrently_and_come_back_in_input_order() {
     for request in seen.iter() {
         assert_eq!(request.body["model"], "served/minilm");
         assert_eq!(request.body["user"], "person-7");
-        assert_eq!(request.body["encoding_format"], "float");
+        assert_eq!(request.body["encoding_format"], "base64");
         assert_eq!(request.body["truncate_prompt_tokens"], 8);
         assert!(request.body["input"].as_array().unwrap().len() <= 3);
         assert_eq!(request.authorization, None);
@@ -360,6 +360,87 @@ fn a_server_that_refuses_truncation_gets_requests_without_it() {
         .filter(|request| request.body.get("truncate_prompt_tokens").is_some())
         .count();
     assert_eq!((seen.len(), with_field), (3, 1));
+}
+
+/// `vector` as the base64 of its little-endian float32 bytes.
+fn base64_of(vector: &[f32]) -> String {
+    use base64::Engine as _;
+    let bytes = vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Embeddings in the form the request asked for.
+fn embeddings_as_asked(request: &Seen) -> Value {
+    let mut reply = reversed_embeddings(request, numbered);
+    if request.body["encoding_format"] == "base64" {
+        for datum in reply["data"].as_array_mut().unwrap() {
+            let values = datum["embedding"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>();
+            datum["embedding"] = Value::from(base64_of(&values));
+        }
+    }
+    reply
+}
+
+#[test]
+fn base64_replies_give_the_same_vectors_as_numbers() {
+    let (root, seen) = mock_server(Arc::new(|_, request| ok(embeddings_as_asked(request))));
+    let vectors = RemoteEmbedder::with_retry(profile(false), &options(&root), FAST)
+        .unwrap()
+        .encode_reporting(&texts(5), &mut |_| {})
+        .unwrap();
+    for (index, vector) in vectors.iter().enumerate() {
+        assert_eq!(vector, &numbered(&format!("text {index}")));
+    }
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.body["encoding_format"] == "base64"));
+}
+
+#[test]
+fn a_server_that_refuses_base64_gets_requests_for_numbers() {
+    let (root, seen) = mock_server(Arc::new(|_, request| {
+        if request.body["encoding_format"] == "base64" {
+            status(
+                400,
+                json!({"error": {"message": "encoding_format 'base64' is not supported"}}),
+            )
+        } else {
+            ok(reversed_embeddings(request, numbered))
+        }
+    }));
+    let remote = RemoteEmbedder::with_retry(profile(false), &options(&root), FAST).unwrap();
+    let vectors = remote.encode_reporting(&texts(2), &mut |_| {}).unwrap();
+    assert_eq!(vectors[1], numbered("text 1"));
+    remote.encode_reporting(&texts(2), &mut |_| {}).unwrap();
+    let seen = seen.lock().unwrap();
+    let asked_base64 = seen
+        .iter()
+        .filter(|request| request.body["encoding_format"] == "base64")
+        .count();
+    assert_eq!((seen.len(), asked_base64), (3, 1));
+}
+
+#[test]
+fn base64_that_isnt_whole_float32_values_fails_the_run() {
+    let (root, _) = mock_server(Arc::new(|_, _| {
+        ok(json!({"data": [{"index": 0, "embedding": "AAECAwQ="}]}))
+    }));
+    let error = RemoteEmbedder::with_retry(profile(false), &options(&root), FAST)
+        .unwrap()
+        .encode_reporting(&texts(1), &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("isn't float32 values"), "{error}");
 }
 
 #[test]

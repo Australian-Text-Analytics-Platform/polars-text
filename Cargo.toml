@@ -1,6 +1,6 @@
 [package]
 name = "polars_text"
-version = "0.6.9"
+version = "0.7.0"
 edition = "2021"
 
 [lib]
@@ -30,7 +30,7 @@ embedding = [
 ]
 # OpenAI-compatible /v1/embeddings client (src/topic_modeling/remote_embedding.rs):
 # embeddings from a remote GPU (vLLM, LiteLLM) instead of the local ONNX model.
-remote-embedding = ["embedding", "dep:ureq"]
+remote-embedding = ["embedding", "dep:base64", "dep:ureq"]
 topic-modeling = [
     "embedding",
     "tokenization",
@@ -43,6 +43,8 @@ topic-modeling = [
 
 [dependencies]
 anyhow = "1.0"
+# Remote embedding asks for base64 vectors: about a quarter of the JSON size.
+base64 = { version = "0.22", optional = true }
 duckdb = { version = "1.10504.0", features = ["bundled", "json"], optional = true }
 fs2 = { version = "0.4", optional = true }
 hf-hub = { version = "0.5", optional = true }

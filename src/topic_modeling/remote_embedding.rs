@@ -19,6 +19,11 @@
 //! the file during a long run. Errors name the host, the HTTP status and the
 //! server's message, never the key or the input text.
 //!
+//! Vectors are requested as base64 (little-endian float32), about a quarter
+//! of the size of JSON numbers and without parsing them. A reply in numbers
+//! is accepted too, since a gateway may convert it, and a server that refuses
+//! base64 gets numbers for the rest of the run.
+//!
 //! There is no fallback to the local model: one run must use one embedding
 //! space, so a failed remote run fails.
 
@@ -262,6 +267,7 @@ mod client {
     /// text is withheld: it quotes the input.
     const QUOTED_INPUT_CHARS: usize = 24;
     const TRUNCATION_FIELD: &str = "truncate_prompt_tokens";
+    const ENCODING_FIELD: &str = "encoding_format";
 
     #[derive(Debug, Clone, Copy)]
     pub(super) struct RetryPolicy {
@@ -324,6 +330,8 @@ mod client {
         retry: RetryPolicy,
         /// Cleared for the rest of the run when the server refuses the field.
         send_truncation: AtomicBool,
+        /// Cleared for the rest of the run when the server refuses base64.
+        ask_base64: AtomicBool,
         provider_id: String,
         cache_fingerprint: String,
     }
@@ -342,7 +350,35 @@ mod client {
     #[derive(Deserialize)]
     struct EmbeddingDatum {
         index: usize,
-        embedding: Vec<f32>,
+        embedding: Embedding,
+    }
+
+    /// A vector as base64 float32 bytes (asked for) or as JSON numbers.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Embedding {
+        Numbers(Vec<f32>),
+        Base64(String),
+    }
+
+    impl Embedding {
+        /// The values, or `None` when the base64 isn't whole float32s.
+        fn into_values(self) -> Option<Vec<f32>> {
+            match self {
+                Self::Numbers(values) => Some(values),
+                Self::Base64(text) => {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(text.as_bytes())
+                        .ok()?;
+                    let (words, rest) = bytes.as_chunks::<4>();
+                    if !rest.is_empty() {
+                        return None;
+                    }
+                    Some(words.iter().map(|word| f32::from_le_bytes(*word)).collect())
+                }
+            }
+        }
     }
 
     impl RemoteEmbedder {
@@ -392,6 +428,7 @@ mod client {
                 agent,
                 retry,
                 send_truncation: AtomicBool::new(true),
+                ask_base64: AtomicBool::new(true),
                 provider_id,
                 cache_fingerprint,
                 profile,
@@ -492,7 +529,8 @@ mod client {
             let mut refreshed_credential = false;
             loop {
                 let truncate = self.send_truncation.load(Ordering::Relaxed);
-                let body = self.request_body(texts, truncate)?;
+                let base64 = self.ask_base64.load(Ordering::Relaxed);
+                let body = self.request_body(texts, truncate, base64)?;
                 let key = self.credential.read()?;
                 let (message, retry_after) = match self.post(&body, key.as_deref()) {
                     Err(error) => {
@@ -516,6 +554,16 @@ mod client {
                         {
                             // The server doesn't know the field: send without it.
                             self.send_truncation.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+                        if base64
+                            && (400..500).contains(&reply.status)
+                            && reply.status != 429
+                            && (reply.body.contains(ENCODING_FIELD)
+                                || reply.body.contains("base64"))
+                        {
+                            // The server can't send base64: ask for numbers.
+                            self.ask_base64.store(false, Ordering::Relaxed);
                             continue;
                         }
                         if matches!(reply.status, 401 | 403)
@@ -544,11 +592,11 @@ mod client {
             }
         }
 
-        fn request_body(&self, texts: &[String], truncate: bool) -> Result<String> {
+        fn request_body(&self, texts: &[String], truncate: bool, base64: bool) -> Result<String> {
             let mut body = serde_json::json!({
                 "model": self.served_model,
                 "input": texts,
-                "encoding_format": "float",
+                "encoding_format": if base64 { "base64" } else { "float" },
             });
             if let Some(user) = &self.user {
                 body["user"] = serde_json::Value::from(user.as_str());
@@ -615,17 +663,22 @@ mod client {
                     slot.is_none(),
                     "remote embedding at {host} returned the same index twice"
                 );
+                let embedding = datum.embedding.into_values().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "remote embedding at {host} returned a base64 vector that isn't float32 values"
+                    )
+                })?;
                 anyhow::ensure!(
-                    datum.embedding.len() == dimension,
+                    embedding.len() == dimension,
                     "remote embedding at {host} returned {}-dimensional vectors, but {} has {dimension}; check embedding_remote_model",
-                    datum.embedding.len(),
+                    embedding.len(),
                     self.profile.model_id
                 );
                 anyhow::ensure!(
-                    datum.embedding.iter().all(|value| value.is_finite()),
+                    embedding.iter().all(|value| value.is_finite()),
                     "remote embedding at {host} returned a vector with non-finite values"
                 );
-                *slot = Some(datum.embedding);
+                *slot = Some(embedding);
             }
             let mut rows = ordered.into_iter().flatten().collect::<Vec<_>>();
             if self.profile.normalize {

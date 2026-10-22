@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0
+
+The release line for Wordflow 0.7.x (polars-based); 0.8 is the Rust-core line
+for Wordflow 0.8.
+
+- Remote embeddings ask for base64 vectors (little-endian float32): about a
+  quarter of the size of JSON numbers and nothing to parse, so each batch
+  comes back faster. Replies in numbers are still accepted, and a server that
+  refuses base64 is asked for numbers for the rest of the run. Vectors that
+  aren't whole float32 values fail the run.
+
 ## 0.6.9
 
 - Remote embeddings: `embedding` and `topic_modeling` take

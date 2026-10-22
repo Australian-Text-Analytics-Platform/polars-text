@@ -3491,10 +3491,11 @@ dependencies = [
 
 [[package]]
 name = "polars_text"
-version = "0.6.9"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "anyhow",
+ "base64 0.22.1",
  "duckdb",
  "fs2",
  "hdbscan",
