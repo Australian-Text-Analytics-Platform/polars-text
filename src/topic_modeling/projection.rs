@@ -148,6 +148,7 @@ pub struct TopicProjectionBasis {
     pub has_outlier: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ActiveNode {
     minimum_leaf_id: usize,
@@ -460,6 +461,7 @@ fn cosine_distance(left: &[f64], right: &[f64]) -> Result<f64> {
     Ok(1.0 - (dot / (left_norm * right_norm)).clamp(-1.0, 1.0))
 }
 
+#[cfg(test)]
 fn pair_key(left: usize, right: usize) -> (usize, usize) {
     if left < right {
         (left, right)
@@ -472,96 +474,180 @@ fn pair_key(left: usize, right: usize) -> (usize, usize) {
 /// centroids using cosine distance. Every natural Topic has equal weight;
 /// segment population affects coverage, not semantic merge priority.
 fn build_average_linkage_tree(leaves: &[Leaf]) -> Result<Vec<Merge>> {
-    let mut active = leaves
+    // The same greedy merges as a full scan of every active pair before each
+    // merge (kept in the tests as the reference), in the same order with the
+    // same tie-breaking, but each node remembers its nearest partner, so a run
+    // costs about n^2 instead of n^3 steps: about 280 million pair checks for
+    // 1,197 natural topics before (Wordflow issue 431).
+    use rayon::prelude::*;
+
+    let n = leaves.len();
+    if n < 2 {
+        return Ok(Vec::new());
+    }
+    for leaf in leaves {
+        validate_nonzero_vector(&leaf.embedding_sum, "left embedding")?;
+    }
+    let width = leaves[0].embedding_sum.len();
+    if width == 0 || leaves.iter().any(|leaf| leaf.embedding_sum.len() != width) {
+        bail!("Topic projection embedding dimensions differ");
+    }
+    // Norms and distances exactly as cosine_distance computes them.
+    let norms = leaves
         .iter()
         .map(|leaf| {
-            (
-                leaf.id,
-                ActiveNode {
-                    minimum_leaf_id: leaf.id,
-                    leaf_count: 1,
-                },
-            )
+            leaf.embedding_sum
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt()
         })
-        .collect::<BTreeMap<_, _>>();
-    let mut distances = HashMap::<(usize, usize), f64>::new();
-    for left in 0..leaves.len() {
-        for right in left + 1..leaves.len() {
-            distances.insert(
-                (left, right),
-                cosine_distance(&leaves[left].embedding_sum, &leaves[right].embedding_sum)?,
-            );
+        .collect::<Vec<_>>();
+    let upper = (0..n)
+        .into_par_iter()
+        .map(|left| {
+            (left + 1..n)
+                .map(|right| {
+                    let dot = leaves[left]
+                        .embedding_sum
+                        .iter()
+                        .zip(&leaves[right].embedding_sum)
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                    1.0 - (dot / (norms[left] * norms[right])).clamp(-1.0, 1.0)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // Distances by slot; a merged node takes the slot of its lower-id child.
+    let mut distance = vec![0.0f64; n * n];
+    for (left, row) in upper.into_iter().enumerate() {
+        for (offset, value) in row.into_iter().enumerate() {
+            let right = left + 1 + offset;
+            distance[left * n + right] = value;
+            distance[right * n + left] = value;
         }
     }
+    let mut node_id = (0..n).collect::<Vec<_>>();
+    let mut minimum_leaf = (0..n).collect::<Vec<_>>();
+    let mut leaf_count = vec![1usize; n];
+    let mut active = vec![true; n];
 
-    let mut merges = Vec::with_capacity(leaves.len().saturating_sub(1));
-    while active.len() > 1 {
-        let active_ids = active.keys().copied().collect::<Vec<_>>();
-        let mut best: Option<(f64, usize, usize, usize, usize)> = None;
-        for (position, &left_id) in active_ids.iter().enumerate() {
-            for &right_id in &active_ids[position + 1..] {
-                let left = &active[&left_id];
-                let right = &active[&right_id];
-                let minimum_ids = if left.minimum_leaf_id <= right.minimum_leaf_id {
-                    (left.minimum_leaf_id, right.minimum_leaf_id)
-                } else {
-                    (right.minimum_leaf_id, left.minimum_leaf_id)
-                };
-                let distance = *distances
-                    .get(&pair_key(left_id, right_id))
-                    .context("Topic projection linkage distance is missing")?;
-                let candidate = (distance, minimum_ids.0, minimum_ids.1, left_id, right_id);
-                if best.as_ref().is_none_or(|current| {
-                    candidate.0.total_cmp(&current.0).is_lt()
-                        || (candidate.0.total_cmp(&current.0).is_eq()
-                            && (candidate.1, candidate.2, candidate.3, candidate.4)
-                                < (current.1, current.2, current.3, current.4))
-                }) {
-                    best = Some(candidate);
+    // The reference's ordering of a candidate pair: distance, then the two
+    // minimum leaf ids (smaller first), then the two node ids (smaller first).
+    type Key = (f64, usize, usize, usize, usize);
+    let key =
+        |node_id: &[usize], minimum_leaf: &[usize], distance: &[f64], a: usize, b: usize| -> Key {
+            let (low, high) = if node_id[a] < node_id[b] {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let (first, second) = if minimum_leaf[low] <= minimum_leaf[high] {
+                (minimum_leaf[low], minimum_leaf[high])
+            } else {
+                (minimum_leaf[high], minimum_leaf[low])
+            };
+            (
+                distance[a * n + b],
+                first,
+                second,
+                node_id[low],
+                node_id[high],
+            )
+        };
+    let less = |left: &Key, right: &Key| {
+        left.0.total_cmp(&right.0).is_lt()
+            || (left.0.total_cmp(&right.0).is_eq()
+                && (left.1, left.2, left.3, left.4) < (right.1, right.2, right.3, right.4))
+    };
+    let nearest =
+        |node_id: &[usize], minimum_leaf: &[usize], distance: &[f64], active: &[bool], a: usize| {
+            let mut best: Option<(Key, usize)> = None;
+            for (b, &is_active) in active.iter().enumerate() {
+                if b == a || !is_active {
+                    continue;
+                }
+                let candidate = key(node_id, minimum_leaf, distance, a, b);
+                if best
+                    .as_ref()
+                    .is_none_or(|(current, _)| less(&candidate, current))
+                {
+                    best = Some((candidate, b));
+                }
+            }
+            best
+        };
+    let mut partner = (0..n)
+        .into_par_iter()
+        .map(|a| nearest(&node_id, &minimum_leaf, &distance, &active, a))
+        .collect::<Vec<_>>();
+
+    let mut merges = Vec::with_capacity(n - 1);
+    for _ in 1..n {
+        let mut best: Option<(Key, usize, usize)> = None;
+        for a in 0..n {
+            if !active[a] {
+                continue;
+            }
+            if let Some((candidate, b)) = partner[a] {
+                if best
+                    .as_ref()
+                    .is_none_or(|(current, _, _)| less(&candidate, current))
+                {
+                    best = Some((candidate, a, b));
                 }
             }
         }
-
-        let (_, _, _, left_id, right_id) =
-            best.context("Topic projection linkage tree has no merge pair")?;
-        let left = active
-            .remove(&left_id)
-            .context("Topic projection left merge node is missing")?;
-        let right = active
-            .remove(&right_id)
-            .context("Topic projection right merge node is missing")?;
-        let new_id = leaves.len() + merges.len();
-        let leaf_count = left
-            .leaf_count
-            .checked_add(right.leaf_count)
+        let (_, a, b) = best.context("Topic projection linkage tree has no merge pair")?;
+        let (left, right) = if node_id[a] < node_id[b] {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let (left_id, right_id) = (node_id[left], node_id[right]);
+        let count = leaf_count[left]
+            .checked_add(leaf_count[right])
             .context("Topic projection leaf count overflow")?;
-
-        for &other_id in active.keys() {
-            let left_distance = *distances
-                .get(&pair_key(left_id, other_id))
-                .context("Topic projection left linkage distance is missing")?;
-            let right_distance = *distances
-                .get(&pair_key(right_id, other_id))
-                .context("Topic projection right linkage distance is missing")?;
-            let distance = (left_distance * left.leaf_count as f64
-                + right_distance * right.leaf_count as f64)
-                / leaf_count as f64;
-            distances.insert(pair_key(new_id, other_id), distance);
+        for other in 0..n {
+            if !active[other] || other == left || other == right {
+                continue;
+            }
+            let merged = (distance[left * n + other] * leaf_count[left] as f64
+                + distance[right * n + other] * leaf_count[right] as f64)
+                / count as f64;
+            distance[left * n + other] = merged;
+            distance[other * n + left] = merged;
         }
-
-        let minimum_leaf_id = left.minimum_leaf_id.min(right.minimum_leaf_id);
+        let minimum_leaf_id = minimum_leaf[left].min(minimum_leaf[right]);
         merges.push(Merge {
             left: left_id,
             right: right_id,
             minimum_leaf_id,
         });
-        active.insert(
-            new_id,
-            ActiveNode {
-                minimum_leaf_id,
-                leaf_count,
-            },
-        );
+        active[right] = false;
+        partner[right] = None;
+        node_id[left] = n + merges.len() - 1;
+        minimum_leaf[left] = minimum_leaf_id;
+        leaf_count[left] = count;
+        partner[left] = nearest(&node_id, &minimum_leaf, &distance, &active, left);
+        for other in 0..n {
+            if !active[other] || other == left {
+                continue;
+            }
+            match partner[other] {
+                Some((_, b)) if b == left || b == right => {
+                    partner[other] = nearest(&node_id, &minimum_leaf, &distance, &active, other);
+                }
+                Some((current, _)) => {
+                    let candidate = key(&node_id, &minimum_leaf, &distance, other, left);
+                    if less(&candidate, &current) {
+                        partner[other] = Some((candidate, left));
+                    }
+                }
+                None => {}
+            }
+        }
     }
     Ok(merges)
 }
@@ -1032,6 +1118,143 @@ pub fn project_serialized_context_basis(
 
 #[cfg(test)]
 mod tests {
+    /// The nearest-partner tree gives exactly the reference's merges, ties
+    /// included (duplicate centroids), for small and large leaf counts.
+    #[test]
+    fn linkage_tree_matches_the_full_scan() {
+        let mut state = 7u64;
+        for &(count, width, distinct) in &[
+            (2, 3, 2),
+            (3, 3, 3),
+            (9, 4, 3),
+            (40, 8, 12),
+            (180, 16, 60),
+            (400, 6, 25),
+        ] {
+            let base = (0..distinct)
+                .map(|_| {
+                    (0..width)
+                        .map(|_| (split_mix(&mut state) % 7) as f64 + 1.0)
+                        .collect::<Vec<f64>>()
+                })
+                .collect::<Vec<_>>();
+            let leaves = (0..count)
+                .map(|id| Leaf {
+                    id,
+                    segment_count: 1,
+                    embedding_sum: base[(split_mix(&mut state) as usize) % distinct].clone(),
+                    term_counts: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let fast = build_average_linkage_tree(&leaves).unwrap();
+            let slow = reference_average_linkage_tree(&leaves).unwrap();
+            let pairs = |m: &[Merge]| {
+                m.iter()
+                    .map(|x| (x.left, x.right, x.minimum_leaf_id))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(pairs(&fast), pairs(&slow), "{count} leaves");
+        }
+        assert!(build_average_linkage_tree(&[]).unwrap().is_empty());
+    }
+
+    /// The full-scan average linkage that build_average_linkage_tree replaced
+    /// (Wordflow issue 431): the new one must give exactly these merges.
+    fn reference_average_linkage_tree(leaves: &[Leaf]) -> Result<Vec<Merge>> {
+        let mut active = leaves
+            .iter()
+            .map(|leaf| {
+                (
+                    leaf.id,
+                    ActiveNode {
+                        minimum_leaf_id: leaf.id,
+                        leaf_count: 1,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut distances = HashMap::<(usize, usize), f64>::new();
+        for left in 0..leaves.len() {
+            for right in left + 1..leaves.len() {
+                distances.insert(
+                    (left, right),
+                    cosine_distance(&leaves[left].embedding_sum, &leaves[right].embedding_sum)?,
+                );
+            }
+        }
+
+        let mut merges = Vec::with_capacity(leaves.len().saturating_sub(1));
+        while active.len() > 1 {
+            let active_ids = active.keys().copied().collect::<Vec<_>>();
+            let mut best: Option<(f64, usize, usize, usize, usize)> = None;
+            for (position, &left_id) in active_ids.iter().enumerate() {
+                for &right_id in &active_ids[position + 1..] {
+                    let left = &active[&left_id];
+                    let right = &active[&right_id];
+                    let minimum_ids = if left.minimum_leaf_id <= right.minimum_leaf_id {
+                        (left.minimum_leaf_id, right.minimum_leaf_id)
+                    } else {
+                        (right.minimum_leaf_id, left.minimum_leaf_id)
+                    };
+                    let distance = *distances
+                        .get(&pair_key(left_id, right_id))
+                        .context("Topic projection linkage distance is missing")?;
+                    let candidate = (distance, minimum_ids.0, minimum_ids.1, left_id, right_id);
+                    if best.as_ref().is_none_or(|current| {
+                        candidate.0.total_cmp(&current.0).is_lt()
+                            || (candidate.0.total_cmp(&current.0).is_eq()
+                                && (candidate.1, candidate.2, candidate.3, candidate.4)
+                                    < (current.1, current.2, current.3, current.4))
+                    }) {
+                        best = Some(candidate);
+                    }
+                }
+            }
+
+            let (_, _, _, left_id, right_id) =
+                best.context("Topic projection linkage tree has no merge pair")?;
+            let left = active
+                .remove(&left_id)
+                .context("Topic projection left merge node is missing")?;
+            let right = active
+                .remove(&right_id)
+                .context("Topic projection right merge node is missing")?;
+            let new_id = leaves.len() + merges.len();
+            let leaf_count = left
+                .leaf_count
+                .checked_add(right.leaf_count)
+                .context("Topic projection leaf count overflow")?;
+
+            for &other_id in active.keys() {
+                let left_distance = *distances
+                    .get(&pair_key(left_id, other_id))
+                    .context("Topic projection left linkage distance is missing")?;
+                let right_distance = *distances
+                    .get(&pair_key(right_id, other_id))
+                    .context("Topic projection right linkage distance is missing")?;
+                let distance = (left_distance * left.leaf_count as f64
+                    + right_distance * right.leaf_count as f64)
+                    / leaf_count as f64;
+                distances.insert(pair_key(new_id, other_id), distance);
+            }
+
+            let minimum_leaf_id = left.minimum_leaf_id.min(right.minimum_leaf_id);
+            merges.push(Merge {
+                left: left_id,
+                right: right_id,
+                minimum_leaf_id,
+            });
+            active.insert(
+                new_id,
+                ActiveNode {
+                    minimum_leaf_id,
+                    leaf_count,
+                },
+            );
+        }
+        Ok(merges)
+    }
+
     use super::*;
 
     fn fixture() -> TopicProjectionContext {

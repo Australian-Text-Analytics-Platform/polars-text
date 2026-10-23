@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::tokenizer::{ensure_tokenizer_for_model, TokenizerBackend};
@@ -125,19 +125,54 @@ pub fn count_topic_terms<'a>(
     model_id: &str,
     lowercase: bool,
 ) -> Result<Vec<HashMap<String, usize>>> {
+    use rayon::prelude::*;
+
     let backend: Arc<TokenizerBackend> = ensure_tokenizer_for_model(model_id)?;
-    let mut per_topic = vec![HashMap::new(); topic_count];
+    let mut segments = Vec::new();
     for (label, text) in assigned_segments {
         if label < 0 {
             continue;
         }
         let topic = usize::try_from(label)
             .map_err(|_| anyhow::anyhow!("Topic label {label} is invalid"))?;
-        let counts = per_topic
-            .get_mut(topic)
-            .ok_or_else(|| anyhow::anyhow!("Topic label {label} is outside the topic count"))?;
-        for token in backend.tokenize_text(text, lowercase, true)? {
-            *counts.entry(token).or_insert(0) += 1;
+        anyhow::ensure!(
+            topic < topic_count,
+            "Topic label {label} is outside the topic count"
+        );
+        segments.push((topic, text));
+    }
+    // Tokenising every segment is most of this step, so it runs on the same
+    // processors as segmentation; counts are summed, so the order of the
+    // parts doesn't change the result (Wordflow issue 431).
+    let workers = super::embedding::computation_threads()
+        .min(segments.len())
+        .max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .context("start the topic word workers")?;
+    let part_size = segments.len().div_ceil(workers * 4).max(1);
+    let parts: Vec<Result<Vec<HashMap<String, usize>>>> = pool.install(|| {
+        segments
+            .par_chunks(part_size)
+            .map(|part| {
+                let mut per_topic = vec![HashMap::new(); topic_count];
+                for &(topic, text) in part {
+                    let counts: &mut HashMap<String, usize> = &mut per_topic[topic];
+                    for token in backend.tokenize_text(text, lowercase, true)? {
+                        *counts.entry(token).or_insert(0) += 1;
+                    }
+                }
+                Ok(per_topic)
+            })
+            .collect()
+    });
+    let mut per_topic = vec![HashMap::new(); topic_count];
+    for part in parts {
+        for (total, counts) in per_topic.iter_mut().zip(part?) {
+            for (token, count) in counts {
+                *total.entry(token).or_insert(0) += count;
+            }
         }
     }
     Ok(per_topic)
@@ -201,6 +236,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta"]
         );
+    }
+
+    /// The parallel count (Wordflow issue 431) equals one sequential pass,
+    /// including outliers skipped and words repeated across parts.
+    #[test]
+    fn parallel_counts_match_a_single_pass() {
+        use crate::tokenizer::{ensure_tokenizer_for_model, PLAIN_WORDS_EN_MODEL_ID};
+
+        let words = [
+            "housing", "budget", "cricket", "reef", "the", "council", "final",
+        ];
+        let texts: Vec<String> = (0..2_000)
+            .map(|i| {
+                (0..(i % 9 + 1))
+                    .map(|j| words[(i * 7 + j * 3) % words.len()])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let labels: Vec<i32> = (0..texts.len()).map(|i| (i % 5) as i32 - 1).collect();
+        let got = count_topic_terms(
+            4,
+            labels.iter().copied().zip(texts.iter().map(String::as_str)),
+            PLAIN_WORDS_EN_MODEL_ID,
+            true,
+        )
+        .unwrap();
+        let backend = ensure_tokenizer_for_model(PLAIN_WORDS_EN_MODEL_ID).unwrap();
+        let mut want = vec![HashMap::new(); 4];
+        for (label, text) in labels.iter().zip(&texts) {
+            if *label < 0 {
+                continue;
+            }
+            for token in backend.tokenize_text(text, true, true).unwrap() {
+                *want[*label as usize].entry(token).or_insert(0usize) += 1;
+            }
+        }
+        assert_eq!(got, want);
+        assert!(count_topic_terms(2, [(3, "reef")], PLAIN_WORDS_EN_MODEL_ID, true).is_err());
     }
 
     #[test]

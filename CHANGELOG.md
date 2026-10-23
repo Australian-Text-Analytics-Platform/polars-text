@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.1
+
+- Topic modelling, last step (topic words and the topic map), Wordflow issue 431:
+  - The tree that merges natural topics builds in about n^2 instead of n^3
+    steps: each node keeps its nearest partner instead of a full scan of
+    every pair before each merge. The merges, their order and the
+    tie-breaking are unchanged. 1,197 topics: 18 s before, 38 ms now on an
+    M5 Pro.
+  - Counting each topic's words runs on the same processors as
+    segmentation instead of one (200,000 segments: 2.6 s before, 0.6 s now).
+    Counts are summed, so topic words are unchanged.
+
 ## 0.7.0
 
 The release line for Wordflow 0.7.x (polars-based); 0.8 is the Rust-core line
