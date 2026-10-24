@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Topic modelling gives the same topics for the same text, settings and seed
+  on every run and with any number of threads (Wordflow issue 437). Before,
+  runs with several threads on more than 8,000 segments differed (for example
+  308, 305 and 313 topics for the same input). The cause was in pacmap 0.2.6,
+  now patched in `vendor/pacmap` (see `POLARS_TEXT_CHANGES.md` there):
+  - its approximate-neighbour index was filled from several threads, so the
+    neighbours found depended on thread timing. It is now built as 4 fixed
+    shards, each filled in row order, and every shard is searched;
+  - its gradient sums were combined in whatever order threads finished. They
+    are now added in chunk order.
+  Results change once, compared with 0.7.1. The arranging step is about 1.5 s
+  slower on 81,000 segments (6.0 s instead of 4.5 s with 8 threads).
+
 ## 0.7.1
 
 - Topic modelling, last step (topic words and the topic map), Wordflow issue 431:

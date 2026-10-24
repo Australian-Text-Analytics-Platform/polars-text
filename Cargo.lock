@@ -2844,8 +2844,6 @@ dependencies = [
 [[package]]
 name = "pacmap"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2087d9f5761fe699e78b572f5850d01a28bfa32c84c616dd4a8c4ed0827b6a88"
 dependencies = [
  "bon",
  "ndarray 0.16.1",

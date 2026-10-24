@@ -13,6 +13,9 @@ build-backend = "maturin"
 [tool.maturin]
 python-source = "."
 module-name = "polars_text._internal"
+# The patched pacmap (Cargo [patch.crates-io], Wordflow issue 437) must ship in
+# the sdist, or a source build would fail or use the unpatched crate.
+include = [{ path = "vendor/**/*", format = "sdist" }]
 
 [dependency-groups]
 dev = ["maturin==1.15.0", "pytest==9.1.1"]

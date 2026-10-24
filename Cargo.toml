@@ -161,3 +161,9 @@ debug = 0
 
 [profile.release]
 strip = "symbols"
+
+# pacmap with reproducible runs: ordered index inserts and ordered gradient
+# sums (Wordflow issue 437). See vendor/pacmap/POLARS_TEXT_CHANGES.md.
+[patch.crates-io]
+pacmap = { path = "vendor/pacmap" }
+

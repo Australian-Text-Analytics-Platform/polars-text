@@ -146,6 +146,30 @@ mod tests {
     }
 
     #[test]
+    fn reduce_gives_the_same_embedding_with_any_thread_count() {
+        // Above pacmap's approximate-neighbour threshold (8,000 rows), where
+        // the index and the gradient sums used to depend on thread timing, so
+        // the same text and seed gave different topics (Wordflow issue 437).
+        let points = (0..8_200)
+            .map(|i: usize| {
+                (0..16)
+                    .map(|j: usize| ((i * 31 + j * 17) % 97) as f32 / 97.0 + (i % 7) as f32)
+                    .collect::<Vec<f32>>()
+            })
+            .collect::<Vec<_>>();
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| reduce(&points, 5, 3).unwrap())
+        };
+        let single = run(1);
+        assert_eq!(run(4), single);
+        assert_eq!(run(4), single);
+    }
+
+    #[test]
     fn reduce_rejects_single_output_dimension() {
         let pts = vec![vec![0.0f32, 1.0]; 12];
         let err = reduce(&pts, 1, 42).unwrap_err();
