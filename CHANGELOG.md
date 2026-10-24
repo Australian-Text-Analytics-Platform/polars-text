@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.2
 
 - Topic modelling gives the same topics for the same text, settings and seed
   on every run and with any number of threads (Wordflow issue 437). Before,
