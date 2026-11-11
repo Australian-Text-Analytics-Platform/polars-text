@@ -36,7 +36,7 @@ jobs:
                       manylinux: "2_28"
                       before-script-linux: dnf install -y openssl-devel && dnf clean all
                     - name: macos-arm64
-                      os: macos-14
+                      os: macos-15
                       target: aarch64-apple-darwin
                     - name: windows-x86_64
                       os: windows-latest
