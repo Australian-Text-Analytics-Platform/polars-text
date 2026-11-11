@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.3
 
 - Topic modelling can give outlier segments a topic after clustering
   (Wordflow, 2026-11: more than half of the text of a corpus was often left
