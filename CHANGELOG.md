@@ -10,6 +10,12 @@
   uses one cosine similarity for every topic. Topics are found first, so no
   topic is added, and topic words come from the clustered members. The result
   gains `outlier_segments` and `assigned_segments`.
+- A topic's centre is that of the segments clustering put in it. Segments that
+  joined afterwards are stored with a `joined` mark (left out when false, so
+  other contexts are byte-for-byte as before and stay version 4), count in
+  the topic's coverage, and do not move the centre used for the merge tree,
+  the map and `topic_segment_similarities`, which now returns the mark as a
+  sixth field.
 - `min_samples` sets HDBSCAN's density requirement apart from
   `min_topic_size`. The default, tied to `min_topic_size`, is unchanged.
 

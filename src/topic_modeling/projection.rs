@@ -6,6 +6,12 @@
 //! text, full segment embeddings, or HDBSCAN. Version 4 also keeps a compact
 //! 64-dimension code of every segment's embedding, so a Topic's segments can
 //! be ranked by how typical they are of it (Wordflow issue 353).
+//!
+//! A segment that was an outlier and was given a topic afterwards
+//! (`assign`) is marked `joined`. A topic's centre is always that of the
+//! segments clustering put in it: joined segments are counted in a topic's
+//! coverage, but they do not move its centre, so the merge tree, the map and
+//! how typical a segment is are the same whether or not any segment joined.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
@@ -94,6 +100,11 @@ struct SegmentFact {
     /// Absent in version 2 contexts.
     #[serde(default)]
     span: Option<(usize, usize)>,
+    /// An outlier given this topic after clustering (`assign`). Left out of
+    /// the stored context when false, so contexts with no such segment are
+    /// unchanged and earlier readers still read them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    joined: bool,
 }
 
 /// One Topic Segment's source span and its Topic at a projected Topic count.
@@ -127,6 +138,8 @@ pub struct TopicProjectionContext {
 pub struct ProjectionInput<'a> {
     pub document_count: usize,
     pub labels: &'a [i32],
+    /// Per segment: an outlier that was given its label after clustering.
+    pub joined: &'a [bool],
     pub embedding_points: &'a [&'a [f32]],
     pub document_indices: &'a [usize],
     pub owned_character_weights: &'a [usize],
@@ -159,6 +172,7 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
     let ProjectionInput {
         document_count,
         labels,
+        joined,
         embedding_points,
         document_indices,
         owned_character_weights,
@@ -168,6 +182,7 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
     } = input;
     let segment_count = labels.len();
     if embedding_points.len() != segment_count
+        || joined.len() != segment_count
         || document_indices.len() != segment_count
         || owned_character_weights.len() != segment_count
         || character_spans.len() != segment_count
@@ -224,8 +239,11 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
 
     let mut embedding_sums = vec![vec![0.0f64; embedding_width]; natural_cluster_count];
     let mut segment_counts = vec![0usize; natural_cluster_count];
-    for (&label, point) in labels.iter().zip(embedding_points) {
+    for ((&label, &joined), point) in labels.iter().zip(joined).zip(embedding_points) {
         if label == OUTLIER_LABEL {
+            if joined {
+                bail!("Topic projection outlier is marked as joined");
+            }
             continue;
         }
         let leaf = usize::try_from(label).context("Topic projection label is invalid")?;
@@ -233,6 +251,10 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
             .get_mut(leaf)
             .context("Topic projection label is outside the natural Topic count")?;
         *count += 1;
+        // A topic's centre is that of the segments clustering put in it.
+        if joined {
+            continue;
+        }
         for (sum, &value) in embedding_sums[leaf].iter_mut().zip(*point) {
             *sum += f64::from(value);
         }
@@ -265,15 +287,19 @@ pub fn prepare_context(input: ProjectionInput<'_>) -> Result<TopicProjectionCont
 
     let segments = labels
         .iter()
+        .zip(joined)
         .zip(document_indices)
         .zip(owned_character_weights)
         .zip(character_spans)
         .map(
-            |(((&leaf_id, &document_index), &owned_character_weight), &span)| SegmentFact {
-                document_index,
-                leaf_id,
-                owned_character_weight,
-                span: Some(span),
+            |((((&leaf_id, &joined), &document_index), &owned_character_weight), &span)| {
+                SegmentFact {
+                    document_index,
+                    leaf_id,
+                    owned_character_weight,
+                    span: Some(span),
+                    joined,
+                }
             },
         )
         .collect();
@@ -944,15 +970,24 @@ pub fn project_serialized_context_segments(
 }
 
 /// One segment of a Topic with its similarity to the Topic's centre:
-/// `[segment_index, document_index, start_char, end_char, similarity]`;
-/// the similarity is null for contexts before version 4.
+/// `[segment_index, document_index, start_char, end_char, similarity, joined]`;
+/// the similarity is null for contexts before version 4, and `joined` marks
+/// an outlier that was given the topic after clustering.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct TopicSegmentSimilarity(pub usize, pub usize, pub usize, pub usize, pub Option<f32>);
+pub struct TopicSegmentSimilarity(
+    pub usize,
+    pub usize,
+    pub usize,
+    pub usize,
+    pub Option<f32>,
+    pub bool,
+);
 
 /// Every segment of `topic_id` at `topic_count`, with its cosine similarity
-/// to the Topic's centre (the mean of its segments' compact embeddings), so
-/// examples can be ranked by how typical they are (Wordflow issue 353).
-/// Segments come in segment order.
+/// to the Topic's centre, so examples can be ranked by how typical they are
+/// (Wordflow issue 353). The centre is the mean of the compact embeddings of
+/// the segments clustering put in the Topic: joined segments are measured
+/// against it and do not move it. Segments come in segment order.
 pub fn topic_segment_similarities(
     context: &TopicProjectionContext,
     topic_count: usize,
@@ -981,7 +1016,10 @@ pub fn topic_segment_similarities(
             };
             let vectors: Vec<Vec<f64>> = members.iter().map(|&index| decode(index)).collect();
             let mut centre = vec![0.0f64; dimensions];
-            for vector in &vectors {
+            for (vector, &index) in vectors.iter().zip(&members) {
+                if context.segments[index].joined {
+                    continue;
+                }
                 for (total, value) in centre.iter_mut().zip(vector) {
                     *total += value;
                 }
@@ -1009,7 +1047,14 @@ pub fn topic_segment_similarities(
         .zip(similarities)
         .map(|(&index, similarity)| {
             let SegmentTopicAssignment(document, start, end, _) = assignments[index];
-            TopicSegmentSimilarity(index, document, start, end, similarity)
+            TopicSegmentSimilarity(
+                index,
+                document,
+                start,
+                end,
+                similarity,
+                context.segments[index].joined,
+            )
         })
         .collect())
 }
@@ -1260,7 +1305,12 @@ mod tests {
     use super::*;
 
     fn fixture() -> TopicProjectionContext {
-        let labels = vec![0, 0, 1, 1, 2, 2, OUTLIER_LABEL];
+        fixture_with(vec![0, 0, 1, 1, 2, 2, OUTLIER_LABEL], [false; 7])
+    }
+
+    /// The fixture with its last segment, an outlier at (0, 1), labelled and
+    /// marked as the caller says.
+    fn fixture_with(labels: Vec<i32>, joined: [bool; 7]) -> TopicProjectionContext {
         let embeddings = [
             vec![1.0, 0.0],
             vec![0.9, 0.1],
@@ -1279,6 +1329,7 @@ mod tests {
         prepare_context(ProjectionInput {
             document_count: 2,
             labels: &labels,
+            joined: &joined,
             embedding_points: &embedding_points,
             document_indices: &[0, 0, 0, 0, 1, 1, 1],
             owned_character_weights: &[1, 1, 1, 1, 2, 2, 4],
@@ -1436,6 +1487,91 @@ mod tests {
             vec![0, 1, 2, 3]
         );
         assert!(topic_segment_similarities(&context, 2, OUTLIER_LABEL).is_err());
+    }
+
+    #[test]
+    fn a_joined_segment_counts_in_its_topic_without_moving_its_centre() {
+        let kept = fixture();
+        // The outlier at (0, 1) joins Topic 1, whose members sit near (0.9, 0.1).
+        let joined = fixture_with(
+            vec![0, 0, 1, 1, 2, 2, 1],
+            [false, false, false, false, false, false, true],
+        );
+        // Same centres, so the same merge tree and the same map.
+        for (before, after) in kept.leaves.iter().zip(&joined.leaves) {
+            assert_eq!(before.embedding_sum, after.embedding_sum);
+        }
+        assert_eq!(
+            kept.merges
+                .iter()
+                .map(|merge| (merge.left, merge.right))
+                .collect::<Vec<_>>(),
+            joined
+                .merges
+                .iter()
+                .map(|merge| (merge.left, merge.right))
+                .collect::<Vec<_>>()
+        );
+        // It is counted in the topic: document 1 now has coverage of Topic 1.
+        let result = project(&joined, 3).unwrap();
+        assert!(result.documents[1]
+            .topic_coverage
+            .iter()
+            .any(|&(topic, coverage)| topic == 1 && coverage > 0.0));
+        // And it is measured against the grouped segments' centre, marked.
+        let ranked = topic_segment_similarities(&joined, 3, 1).unwrap();
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|item| (item.0, item.5))
+                .collect::<Vec<_>>(),
+            vec![(2, false), (3, false), (6, true)]
+        );
+        let before = topic_segment_similarities(&kept, 3, 1).unwrap();
+        assert_eq!(ranked[0].4, before[0].4);
+        assert_eq!(ranked[1].4, before[1].4);
+        assert!(ranked[2].4.unwrap() < ranked[1].4.unwrap());
+    }
+
+    #[test]
+    fn joined_marks_are_stored_only_when_set_and_default_to_false() {
+        let kept = serialize_context(&fixture()).unwrap();
+        let joined = serialize_context(&fixture_with(
+            vec![0, 0, 1, 1, 2, 2, 1],
+            [false, false, false, false, false, false, true],
+        ))
+        .unwrap();
+        let restored = deserialize_context(&joined).unwrap();
+        assert!(restored.segments[6].joined);
+        assert!(!restored.segments[5].joined);
+        // A context in which nothing joined carries no mark at all, as before.
+        let plain = zstd::stream::decode_all(Cursor::new(&kept)).unwrap();
+        assert!(!plain.windows(6).any(|window| window == b"joined"));
+        assert!(deserialize_context(&kept)
+            .unwrap()
+            .segments
+            .iter()
+            .all(|segment| !segment.joined));
+    }
+
+    #[test]
+    fn an_outlier_cannot_be_marked_as_joined() {
+        let embeddings = [vec![1.0f32, 0.0], vec![0.0, 1.0]];
+        let embedding_points = embeddings.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let counts = vec![HashMap::from([("alpha".to_string(), 1)])];
+        let error = prepare_context(ProjectionInput {
+            document_count: 1,
+            labels: &[0, OUTLIER_LABEL],
+            joined: &[false, true],
+            embedding_points: &embedding_points,
+            document_indices: &[0, 0],
+            owned_character_weights: &[1, 1],
+            character_spans: &[(0, 1), (1, 2)],
+            per_leaf_term_counts: &counts,
+            seed: 0,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("marked as joined"));
     }
 
     #[test]

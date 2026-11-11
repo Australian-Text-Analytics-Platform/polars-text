@@ -59,16 +59,19 @@ def topic_segment_similarities(
     projection_context: bytes,
     topic_count: int,
     topic_id: int,
-) -> list[tuple[int, int, int, int, float | None]]:
+) -> list[tuple[int, int, int, int, float | None, bool]]:
     """Every segment of one Topic with its similarity to the Topic's centre.
 
     Returns ``(segment_index, document_index, start_char, end_char,
-    similarity)`` in segment order, for ``topic_id`` at ``topic_count`` (the
-    same merge cut as ``project_topics``). The similarity is the cosine
-    between the segment's compact embedding and the Topic's centre (the mean
-    of its segments), for ranking how typical a segment is; it is ``None`` for
-    runs before compact embeddings were stored. Raises ``ValueError`` for
-    ``topic_id`` -1 (No topic) or contexts without segment spans.
+    similarity, joined)`` in segment order, for ``topic_id`` at
+    ``topic_count`` (the same merge cut as ``project_topics``). ``joined``
+    marks an outlier that was given the Topic after clustering. The similarity
+    is the cosine between the segment's compact embedding and the Topic's
+    centre, for ranking how typical a segment is; it is ``None`` for runs
+    before compact embeddings were stored. The centre is the mean of the
+    segments clustering put in the Topic, so joined segments are measured
+    against it and do not move it. Raises ``ValueError`` for ``topic_id`` -1
+    (No topic) or contexts without segment spans.
     """
     _require_feature("topic-modeling", "topic_segment_similarities")
     _positive(topic_count, "topic_count")
@@ -79,8 +82,9 @@ def topic_segment_similarities(
             int(start),
             int(end),
             None if similarity is None else float(similarity),
+            bool(joined),
         )
-        for segment, document, start, end, similarity in json.loads(
+        for segment, document, start, end, similarity, joined in json.loads(
             _topic_segment_similarities(projection_context, topic_count, topic_id)
         )
     ]

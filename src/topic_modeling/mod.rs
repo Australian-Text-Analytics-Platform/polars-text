@@ -411,9 +411,16 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         .iter()
         .map(|embedding| embedding.as_slice())
         .collect::<Vec<_>>();
+    // Outliers that were given a topic: counted in it, but not in its centre.
+    let joined = core_labels
+        .iter()
+        .zip(&clustered.labels)
+        .map(|(&core, &label)| core == cluster::OUTLIER_LABEL && label != cluster::OUTLIER_LABEL)
+        .collect::<Vec<_>>();
     let context = projection::prepare_context(projection::ProjectionInput {
         document_count: documents.len(),
         labels: &clustered.labels,
+        joined: &joined,
         embedding_points: &embedding_points,
         document_indices: &segment_doc_indices,
         owned_character_weights: &segment_weights,
