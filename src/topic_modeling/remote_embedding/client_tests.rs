@@ -719,6 +719,9 @@ fn parity_with_a_real_server() -> anyhow::Result<()> {
             vectorizer_model_id: None,
             lowercase: true,
             cluster_sample_size: None,
+            min_samples: None,
+            outlier_similarity: None,
+            outlier_member_quantile: None,
             progress_path: None,
             remote_embedding,
         };

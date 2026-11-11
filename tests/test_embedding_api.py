@@ -49,6 +49,9 @@ def test_namespace_signatures_match_the_public_contract() -> None:
         "min_topic_size: 'int' = 10, max_topic_size: 'int | None' = None, "
         "tokenizer_model: 'str | None' = None, "
         "lowercase: 'bool' = True, cluster_sample_size: 'int | None' = None, "
+        "min_samples: 'int | None' = None, "
+        "outlier_similarity: 'float | None' = None, "
+        "outlier_member_quantile: 'float | None' = None, "
         "progress_path: 'str | os.PathLike[str] | None' = None, "
         "embedding_endpoint: 'str | None' = None, "
         "embedding_api_key_env: 'str | None' = None, "
@@ -123,10 +126,31 @@ def test_topic_modeling_registers_only_the_supported_fit_controls(
         "vectorizer_model": None,
         "lowercase": True,
         "cluster_sample_size": None,
+        "min_samples": None,
+        "outlier_similarity": None,
+        "outlier_member_quantile": None,
         "progress_path": None,
     }
     with pytest.raises(ValueError, match="automatic.*line.*sentence"):
         cast(Any, pl.col("text")).text.topic_modeling(segmentation="paragraph")
+
+    # Outliers can join their most similar topic by one rule, not both.
+    cast(Any, pl.col("text")).text.topic_modeling(
+        min_samples=3, outlier_member_quantile=0.0
+    )
+    assert calls[1]["kwargs"]["min_samples"] == 3
+    assert calls[1]["kwargs"]["outlier_member_quantile"] == 0.0
+    assert calls[1]["kwargs"]["outlier_similarity"] is None
+    with pytest.raises(ValueError, match="not both"):
+        cast(Any, pl.col("text")).text.topic_modeling(
+            outlier_similarity=0.5, outlier_member_quantile=0.1
+        )
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        cast(Any, pl.col("text")).text.topic_modeling(outlier_member_quantile=1.5)
+    with pytest.raises(ValueError, match="between -1 and 1"):
+        cast(Any, pl.col("text")).text.topic_modeling(outlier_similarity=2.0)
+    with pytest.raises(ValueError):
+        cast(Any, pl.col("text")).text.topic_modeling(min_samples=0)
 
 
 def test_segment_token_counts_registers_validated_plugin_kwargs(

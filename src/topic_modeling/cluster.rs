@@ -94,10 +94,16 @@ pub struct AutoOutcome {
 /// when `accept_capped` approves them. Without `documents`, every point counts
 /// as its own document. The crate's labels are already contiguous from zero,
 /// which projection and rollup rely on for indexing.
+///
+/// `min_samples` is how many neighbours a point needs close by to count as
+/// inside a dense region: the strictness of the grouping. `None` ties it to
+/// `min_cluster_size`, as HDBSCAN and BERTopic default; a smaller value leaves
+/// fewer points as outliers without allowing smaller topics.
 pub fn cluster(
     points: &[Vec<f32>],
     min_cluster_size: usize,
     max_cluster_size: Option<usize>,
+    min_samples: Option<usize>,
     documents: Option<PointDocuments<'_>>,
 ) -> Result<ClusterResult> {
     let n = points.len();
@@ -115,6 +121,7 @@ pub fn cluster(
             points,
             min_cluster_size,
             Some(requested.max(min_cluster_size + 1)),
+            min_samples,
         );
     }
 
@@ -131,7 +138,7 @@ pub fn cluster(
             }
         }
     };
-    let mut best = run_hdbscan(points, min_cluster_size, None)?;
+    let mut best = run_hdbscan(points, min_cluster_size, None, min_samples)?;
     let initial_share =
         main_topic_by_documents(&best.labels, documents).map_or(0.0, |(_, share)| share);
     let mut decision = if initial_share > AUTO_DOMINANT_SHARE {
@@ -155,7 +162,7 @@ pub fn cluster(
         if cap >= dominant_size {
             break;
         }
-        let capped = run_hdbscan(points, min_cluster_size, Some(cap))?;
+        let capped = run_hdbscan(points, min_cluster_size, Some(cap), min_samples)?;
         if !accept_capped(&best, &capped) {
             break;
         }
@@ -220,11 +227,16 @@ fn run_hdbscan(
     points: &[Vec<f32>],
     min_cluster_size: usize,
     max_cluster_size: Option<usize>,
+    min_samples: Option<usize>,
 ) -> Result<ClusterResult> {
     let n = points.len();
     let mut builder = HdbscanHyperParams::builder()
         .min_cluster_size(min_cluster_size)
         .dist_metric(DistanceMetric::Euclidean);
+    if let Some(min_samples) = min_samples {
+        // A point's neighbours exclude itself, so at most n - 1 exist.
+        builder = builder.min_samples(min_samples.clamp(1, n - 1));
+    }
     let applied = max_cluster_size.filter(|&cap| cap < n);
     if let Some(cap) = applied {
         builder = builder.max_cluster_size(cap);
@@ -274,7 +286,7 @@ mod tests {
         }
         points.push(vec![100.0, 100.0]); // lone outlier
 
-        let res = cluster(&points, 5, None, None).unwrap();
+        let res = cluster(&points, 5, None, None, None).unwrap();
         assert_eq!(res.n_topics, 2, "labels: {:?}", res.labels);
         assert_eq!(*res.labels.last().unwrap(), OUTLIER_LABEL);
         // Real labels are contiguous from zero.
@@ -286,14 +298,14 @@ mod tests {
 
     #[test]
     fn single_point_is_an_outlier_without_a_fabricated_topic() {
-        let res = cluster(&[vec![1.0, 2.0]], 10, None, None).unwrap();
+        let res = cluster(&[vec![1.0, 2.0]], 10, None, None, None).unwrap();
         assert_eq!(res.n_topics, 0);
         assert_eq!(res.labels, vec![OUTLIER_LABEL]);
     }
 
     #[test]
     fn empty_input_is_no_topics() {
-        let res = cluster(&[], 10, None, None).unwrap();
+        let res = cluster(&[], 10, None, None, None).unwrap();
         assert_eq!(res.n_topics, 0);
         assert!(res.labels.is_empty());
     }
@@ -310,7 +322,7 @@ mod tests {
         for i in 0..30 {
             points.push(vec![0.5 + (i as f32) * 0.001, 0.0]);
         }
-        let capped = cluster(&points, 5, Some(40), None).unwrap();
+        let capped = cluster(&points, 5, Some(40), None, None).unwrap();
         assert!(capped.n_topics >= 2, "labels: {:?}", capped.labels);
         let largest = (0..capped.n_topics as i32)
             .map(|topic| {
@@ -337,7 +349,7 @@ mod tests {
             points.push(vec![10.0 + (i as f32) * 0.01, 10.0]);
         }
         points.push(vec![100.0, 100.0]);
-        let res = cluster(&points, 5, None, None).unwrap();
+        let res = cluster(&points, 5, None, None, None).unwrap();
         assert_eq!(res.n_topics, 2, "labels: {:?}", res.labels);
         assert_eq!(res.max_cluster_size, None);
         assert_eq!(
@@ -420,13 +432,13 @@ mod tests {
             weights: &weights,
         };
 
-        let by_segments = cluster(&points, 5, None, None).unwrap();
+        let by_segments = cluster(&points, 5, None, None, None).unwrap();
         assert_eq!(
             by_segments.auto.map(|auto| auto.decision),
             Some(AutoDecision::NotNeeded)
         );
 
-        let by_documents = cluster(&points, 5, None, Some(documents)).unwrap();
+        let by_documents = cluster(&points, 5, None, None, Some(documents)).unwrap();
         let auto = by_documents.auto.unwrap();
         assert_ne!(auto.decision, AutoDecision::NotNeeded);
         assert!((auto.document_share - 10.0 / 12.0).abs() < 1e-9, "{auto:?}");
@@ -441,6 +453,9 @@ mod tests {
     #[test]
     fn a_fixed_max_topic_size_reports_no_auto_decision() {
         let points: Vec<Vec<f32>> = (0..20).map(|i| vec![(i as f32) * 0.01, 0.0]).collect();
-        assert!(cluster(&points, 5, Some(15), None).unwrap().auto.is_none());
+        assert!(cluster(&points, 5, Some(15), None, None)
+            .unwrap()
+            .auto
+            .is_none());
     }
 }

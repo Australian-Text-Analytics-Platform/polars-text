@@ -12,6 +12,8 @@
 //! the pipeline never fabricates a cluster to keep the result non-empty.
 
 #[cfg(feature = "topic-modeling")]
+pub mod assign;
+#[cfg(feature = "topic-modeling")]
 pub mod cluster;
 #[cfg(feature = "topic-modeling")]
 pub mod ctfidf;
@@ -76,6 +78,17 @@ pub struct RunConfig {
     pub max_cluster_size: Option<usize>,
     pub vectorizer_model_id: Option<String>,
     pub lowercase: bool,
+    /// Neighbours a segment needs close by to count as inside a dense region;
+    /// `None` ties it to `min_cluster_size`. Smaller leaves fewer outliers.
+    pub min_samples: Option<usize>,
+    /// After clustering, give each outlier segment the topic whose centre it
+    /// is most similar to, when that cosine similarity is at least this value
+    /// (0 assigns every one). `None` leaves outliers as HDBSCAN found them.
+    pub outlier_similarity: Option<f32>,
+    /// The same, with the bar set per topic: at least as similar as this
+    /// share of the topic's own members are. Used when `outlier_similarity`
+    /// is `None`.
+    pub outlier_member_quantile: Option<f32>,
     /// Cluster at most this many segments (a seeded sample); every other
     /// segment takes its nearest sampled segment's topic. `None` clusters all.
     pub cluster_sample_size: Option<usize>,
@@ -128,6 +141,10 @@ pub struct TopicModelingResult {
     /// Segments in the largest topic of the clustering (of the sample, with
     /// topic sampling): the scale a fixed Max topic size works on.
     pub largest_topic_size: Option<usize>,
+    /// Segments in no topic once the run finished.
+    pub outlier_segments: Option<usize>,
+    /// Outlier segments given a topic by similarity; `None` when not asked for.
+    pub assigned_segments: Option<usize>,
     #[serde(skip)]
     pub projection_context: Option<Vec<u8>>,
 }
@@ -293,7 +310,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
         .filter(|&limit| limit >= minimum_evidence && segments.len() > limit)
         .map(|limit| sample::sample_indices(segments.len(), limit, cfg.seed));
     let largest_clustered;
-    let clustered = match &sampled {
+    let mut clustered = match &sampled {
         Some(indices) => {
             let sample_embeddings = indices
                 .iter()
@@ -314,6 +331,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                 &reduced,
                 cfg.min_cluster_size,
                 cfg.max_cluster_size,
+                cfg.min_samples,
                 Some(cluster::PointDocuments {
                     doc_indices: &sample_doc_indices,
                     weights: &sample_weights,
@@ -335,6 +353,7 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
                 &reduced,
                 cfg.min_cluster_size,
                 cfg.max_cluster_size,
+                cfg.min_samples,
                 Some(cluster::PointDocuments {
                     doc_indices: &segment_doc_indices,
                     weights: &segment_weights,
@@ -353,14 +372,35 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     }
 
     step(5, "topic_words", None, "");
+    // Topic words come from the passages HDBSCAN put in each topic, so the
+    // description of a topic does not shift with passages assigned afterwards.
+    let core_labels = clustered.labels.clone();
+    let join_rule = cfg
+        .outlier_similarity
+        .map(assign::JoinRule::Similarity)
+        .or(cfg
+            .outlier_member_quantile
+            .map(assign::JoinRule::MemberQuantile));
+    let assigned_segments = join_rule.map(|rule| {
+        assign::assign_outliers_to_nearest_topic(
+            &embeddings,
+            &mut clustered.labels,
+            clustered.n_topics,
+            rule,
+        )
+    });
+    let outlier_segments = clustered
+        .labels
+        .iter()
+        .filter(|&&label| label == cluster::OUTLIER_LABEL)
+        .count();
     let vectorizer = cfg
         .vectorizer_model_id
         .as_deref()
         .unwrap_or(PLAIN_WORDS_EN_MODEL_ID);
     let term_counts = ctfidf::count_topic_terms(
         clustered.n_topics,
-        clustered
-            .labels
+        core_labels
             .iter()
             .copied()
             .zip(texts.iter().map(String::as_str)),
@@ -387,6 +427,8 @@ pub fn run(documents: &[&str], cfg: &RunConfig) -> Result<TopicModelingResult> {
     result.auto_decision = clustered.auto.map(|auto| auto.decision.as_str());
     result.auto_document_share = clustered.auto.map(|auto| auto.document_share);
     result.largest_topic_size = largest_clustered;
+    result.outlier_segments = Some(outlier_segments);
+    result.assigned_segments = assigned_segments;
     result.projection_context = Some(projection::serialize_context(&context)?);
     Ok(result)
 }
@@ -425,6 +467,8 @@ fn no_topic_result(
         auto_decision: None,
         auto_document_share: None,
         largest_topic_size: None,
+        outlier_segments: Some(segment_doc_indices.len()),
+        assigned_segments: None,
         projection_context: None,
     }
 }

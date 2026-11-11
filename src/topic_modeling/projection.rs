@@ -845,6 +845,8 @@ pub fn project(
         auto_decision: None,
         auto_document_share: None,
         largest_topic_size: None,
+        outlier_segments: None,
+        assigned_segments: None,
         projection_context: None,
     })
 }

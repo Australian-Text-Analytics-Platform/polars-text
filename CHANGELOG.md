@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Topic modelling can give outlier segments a topic after clustering
+  (Wordflow, 2026-11: more than half of the text of a corpus was often left
+  out). `outlier_member_quantile` admits a segment to its most similar topic
+  when it is at least as similar to the topic's centre as that share of the
+  topic's own members are (`0`: the least similar member); `outlier_similarity`
+  uses one cosine similarity for every topic. Topics are found first, so no
+  topic is added, and topic words come from the clustered members. The result
+  gains `outlier_segments` and `assigned_segments`.
+- `min_samples` sets HDBSCAN's density requirement apart from
+  `min_topic_size`. The default, tied to `min_topic_size`, is unchanged.
+
 ## 0.7.2
 
 - Topic modelling gives the same topics for the same text, settings and seed

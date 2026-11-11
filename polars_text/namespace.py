@@ -319,6 +319,9 @@ class TextNamespace:
         tokenizer_model: str | None = None,
         lowercase: bool = True,
         cluster_sample_size: int | None = None,
+        min_samples: int | None = None,
+        outlier_similarity: float | None = None,
+        outlier_member_quantile: float | None = None,
         progress_path: str | os.PathLike[str] | None = None,
         embedding_endpoint: str | None = None,
         embedding_api_key_env: str | None = None,
@@ -348,6 +351,19 @@ class TextNamespace:
         explain the outcome; ``largest_topic_size`` is the segment count of
         the largest topic, the scale a fixed ``max_topic_size`` works on.
 
+        ``min_samples`` is how many neighbours a segment needs close by to
+        count as inside a dense region. ``None`` ties it to ``min_topic_size``,
+        as HDBSCAN defaults; a smaller value leaves fewer segments as outliers
+        without allowing smaller topics.
+
+        With ``outlier_similarity``, each outlier segment then takes the topic
+        whose centre (the mean embedding of its members) it is most similar
+        to, when that cosine similarity is at least the value; the rest stay
+        outliers. Topic words still come from the segments clustering put in
+        each topic. The output's ``outlier_segments`` is the number of segments
+        in no topic at the end, and ``assigned_segments`` how many were given
+        one this way (null when not asked for).
+
         With ``progress_path``, progress is written to that JSON file in five
         steps: ``segmenting`` (documents), ``embedding`` (segments, cached
         ones counted first), ``arranging``, ``grouping`` and ``topic_words``
@@ -372,6 +388,15 @@ class TextNamespace:
             _positive(max_topic_size, "max_topic_size", minimum=min_topic_size + 1)
         if cluster_sample_size is not None:
             _positive(cluster_sample_size, "cluster_sample_size", minimum=min_topic_size)
+        if min_samples is not None:
+            _positive(min_samples, "min_samples")
+        if outlier_similarity is not None and not -1.0 <= outlier_similarity <= 1.0:
+            raise ValueError("outlier_similarity must be between -1 and 1")
+        if outlier_member_quantile is not None:
+            if outlier_similarity is not None:
+                raise ValueError("give outlier_similarity or outlier_member_quantile, not both")
+            if not 0.0 <= outlier_member_quantile <= 1.0:
+                raise ValueError("outlier_member_quantile must be between 0 and 1")
         remote = _remote_embedding_kwargs(
             endpoint=embedding_endpoint,
             api_key_env=embedding_api_key_env,
@@ -398,6 +423,9 @@ class TextNamespace:
                 "vectorizer_model": _model_id(tokenizer_model),
                 "lowercase": lowercase,
                 "cluster_sample_size": cluster_sample_size,
+                "min_samples": min_samples,
+                "outlier_similarity": outlier_similarity,
+                "outlier_member_quantile": outlier_member_quantile,
                 "progress_path": _cache_path(progress_path),
                 **remote,
             },

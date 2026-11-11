@@ -25,6 +25,18 @@ struct TopicModelingKwargs {
     max_cluster_size: Option<usize>,
     vectorizer_model: Option<String>,
     lowercase: bool,
+    /// Neighbours a segment needs to count as inside a dense region; `None`
+    /// ties it to `min_cluster_size`.
+    #[serde(default)]
+    min_samples: Option<usize>,
+    /// Give outlier segments their most similar topic at or above this cosine
+    /// similarity; `None` leaves them out.
+    #[serde(default)]
+    outlier_similarity: Option<f32>,
+    /// The same with a per-topic bar: as similar as this share of the
+    /// topic's members.
+    #[serde(default)]
+    outlier_member_quantile: Option<f32>,
     /// Cluster at most this many segments; `None` clusters every segment.
     #[serde(default)]
     cluster_sample_size: Option<usize>,
@@ -89,6 +101,8 @@ fn topic_modeling_output(input_fields: &[Field]) -> PolarsResult<Field> {
         Field::new("auto_decision".into(), DataType::String),
         Field::new("auto_document_share".into(), DataType::Float64),
         Field::new("largest_topic_size".into(), DataType::UInt32),
+        Field::new("outlier_segments".into(), DataType::UInt32),
+        Field::new("assigned_segments".into(), DataType::UInt32),
         Field::new("projection_context".into(), DataType::Binary),
     ]);
     Ok(Field::new(input_fields[0].name().clone(), dtype))
@@ -122,6 +136,9 @@ pub fn topic_modeling(inputs: &[Series], kwargs: TopicModelingKwargs) -> PolarsR
         max_cluster_size: kwargs.max_cluster_size,
         vectorizer_model_id: kwargs.vectorizer_model,
         lowercase: kwargs.lowercase,
+        min_samples: kwargs.min_samples,
+        outlier_similarity: kwargs.outlier_similarity,
+        outlier_member_quantile: kwargs.outlier_member_quantile,
         cluster_sample_size: kwargs.cluster_sample_size,
         progress_path: kwargs.progress_path,
         remote_embedding,
@@ -268,6 +285,16 @@ fn topic_modeling_result_to_series(
         .map(u32::try_from)
         .transpose()
         .map_err(|_| PolarsError::ComputeError("Largest topic size exceeds UInt32".into()))?;
+    let outlier_segments = result
+        .outlier_segments
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PolarsError::ComputeError("Outlier segment count exceeds UInt32".into()))?;
+    let assigned_segments = result
+        .assigned_segments
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PolarsError::ComputeError("Assigned segment count exceeds UInt32".into()))?;
     let fields = [
         document_list,
         topic_list,
@@ -277,6 +304,8 @@ fn topic_modeling_result_to_series(
         Series::new("auto_decision".into(), [result.auto_decision]),
         Series::new("auto_document_share".into(), [result.auto_document_share]),
         Series::new("largest_topic_size".into(), [largest_topic_size]),
+        Series::new("outlier_segments".into(), [outlier_segments]),
+        Series::new("assigned_segments".into(), [assigned_segments]),
         Series::new(
             "projection_context".into(),
             [result.projection_context.as_deref()],
@@ -315,6 +344,8 @@ mod tests {
                 Field::new("auto_decision".into(), DataType::String),
                 Field::new("auto_document_share".into(), DataType::Float64),
                 Field::new("largest_topic_size".into(), DataType::UInt32),
+                Field::new("outlier_segments".into(), DataType::UInt32),
+                Field::new("assigned_segments".into(), DataType::UInt32),
                 Field::new("projection_context".into(), DataType::Binary),
             ]
         );
@@ -352,6 +383,8 @@ mod tests {
             auto_decision: None,
             auto_document_share: None,
             largest_topic_size: None,
+            outlier_segments: None,
+            assigned_segments: None,
             projection_context: Some(vec![1, 2, 3]),
         };
 
